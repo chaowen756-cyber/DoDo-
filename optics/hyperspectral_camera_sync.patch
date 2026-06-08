@@ -1,0 +1,268 @@
+--- /root/autodl-tmp/optics/hyperspectral_camera.py	2025-12-19 10:19:05.414641041 +0800
++++ /root/autodl-tmp/optics/hyperspectral_camera_new.py	2026-03-26 15:08:45.957707906 +0800
+@@ -1,5 +1,6 @@
+ # optics/hyperspectral_camera.py (最终的最终修正版)
+-
++import os
++import tifffile
+ import abc
+ import math
+ from typing import List, Union
+@@ -19,10 +20,31 @@
+     def __init__(self, focal_depth, min_depth, max_depth, n_depths, image_size, mask_size,
+                  focal_length, mask_diameter, camera_pixel_pitch, wavelengths, **kwargs):
+         super().__init__()
+-        scene_distances = ips_to_metric(torch.linspace(0, 1, steps=n_depths), min_depth, max_depth)
++        # ============================================================
++        # 【IPS 迁移】使用逆深度均匀采样，与 Dataset 对齐
++        # ============================================================
++        # Dataset 侧使用 IPS 归一化：d_norm = (1/d - 1/d_max) / (1/d_min - 1/d_max)
++        # 为了对齐，Camera 生成 PSF 时的 scene_distances 也要在 IPS 空间均匀分布
++        # 
++        # 策略：在 IPS 空间 [0, 1] 等间距采样，然后反算到物理深度
++        # ips_coords = [0, 1/(n-1), 2/(n-1), ..., 1]
++        # 物理深度: d = ips_to_metric(ips_coords, min_depth, max_depth)
++        #
++        # 这样确保：Dataset 输出 d_norm=0.5 -> Camera Layer 4 的 PSF 物理对应
++        # ============================================================
++        
++        # 在 IPS 归一化空间 [0, 1] 等间距采样
++        ips_normalized = torch.linspace(0, 1, steps=n_depths)
++        
++        # 反算回物理深度，使用 ips_to_metric 函数
++        # d = (d_max * d_min) / (d_max - (d_max - d_min) * ips_norm)
++        scene_distances = ips_to_metric(ips_normalized, min_depth, max_depth)
+         self._register_wavlength(wavelengths)
+         self.n_depths, self.min_depth, self.max_depth = len(scene_distances), min_depth, max_depth
+         self.focal_depth, self.mask_diameter, self.camera_pixel_pitch, self.focal_length = focal_depth, mask_diameter, camera_pixel_pitch, focal_length
++         # 是否在 pupil 处叠加一个“理想薄透镜”的相位（用于传统成像/对焦建模）。
++        # 对 Baek-like “DOE 充当唯一主透镜”的设定，应关闭此项，否则会出现双重透镜叠加。
++        self.use_virtual_lens_phase = bool(kwargs.get('use_virtual_lens_phase', True))
+         self.f_number = self.focal_length / self.mask_diameter
+         self.image_size = self._normalize_image_size(image_size)
+         self.mask_pitch, self.mask_size = self.mask_diameter / mask_size, mask_size
+@@ -66,20 +88,13 @@
+         return captimg, volume
+ 
+     def _capture_from_rgbd_with_psf_impl(self, img, depthmap, psf, occlusion):
+-        # 生成分层深度表示 (B, 1, n_depths, H, W)
++
++        if depthmap.ndim == 3:
++            depthmap = depthmap.unsqueeze(1) # -> [B, 1, H, W]
++        
+         layered_depth = depthmap_to_layereddepth(depthmap, self.n_depths, binary=True)
+-#         # 将图像转换为 (B, C, 1, H, W) 以便与分层深度广播
+-#         # 这样可以为每个通道和每个深度层生成体积
+-# #         volume = img.unsqueeze(2) * layered_depth
+-#         print(f"layered_depth shape: {layered_depth.unsqueeze(1).shape}")
+-#         print(f"img shape: {img.shape}")
+-#         volume = layered_depth.unsqueeze(1) * img[:, :, None, ...]
+-#         print(f"DEBUG volume shape: {volume.shape}")
+-        # --- 维度修复 (Final Fix) ---
+-        # 1. 修复 layered_depth 的维度问题
+-        # 现在的形状是 [1, 2, 16, 512, 512]，我们需要去掉第一个 1，变成 [2, 16, 512, 512]
+-        if layered_depth.dim() == 5 and layered_depth.shape[0] == 1:
+-            layered_depth = layered_depth.squeeze(0)
++
++
+         
+         # 2. 获取维度信息
+         B, C, H, W = img.shape
+@@ -91,15 +106,10 @@
+         # img: (B, C, H, W) -> (B, C, 1, H, W)
+         img_expanded = img.view(B, C, 1, H, W)
+         
+-        # layered_depth: (B, D, H, W) -> (B, 1, D, H, W)
+-        # 注意：这里假设 layered_depth 的第二个维度是 Depth (16)
+-        B_d, D_d, H_d, W_d = layered_depth.shape
+-        depth_expanded = layered_depth.view(B_d, 1, D_d, H_d, W_d)
+-        
+         # 4. 计算 Volume
+         # (2, 29, 1, 512, 512) * (2, 1, 16, 512, 512) -> (2, 29, 16, 512, 512)
+-        volume = depth_expanded * img_expanded
+-        return self._capture_impl(volume, depth_expanded > 0, psf, occlusion)
++        volume = layered_depth * img_expanded
++        return self._capture_impl(volume, layered_depth > 0, psf, occlusion)
+ 
+     def forward(self, img, depthmap, occlusion, is_training=False):
+         psf = self.psf_at_camera(size=img.shape[-2:], is_training=is_training).unsqueeze(0)
+@@ -152,7 +162,8 @@
+         radius = torch.sqrt(scene_distances ** 2 + r ** 2)
+         amplitude = scene_distances / wavelengths / radius ** 2
+         phase = wave_number * (radius - scene_distances)
+-        if not math.isinf(self.focal_depth):
++#         if not math.isinf(self.focal_depth):
++        if self.use_virtual_lens_phase and (not math.isinf(self.focal_depth)):
+             focal_depth = torch.tensor(self.focal_depth).double().reshape(1, 1, 1).to(r.device)
+             phase -= wave_number * (torch.sqrt(focal_depth ** 2 + r ** 2) - focal_depth)
+         return amplitude / amplitude.max(), phase
+@@ -191,8 +202,97 @@
+ class RotationallySymmetricCamera(BaseRotationallySymmetricCamera):
+     def __init__(self, *args, mask_upsample_factor=1, requires_grad=False, **kwargs):
+         super().__init__(*args, **kwargs)
+-        init_heightmap = torch.zeros(self.mask_size // 2 // mask_upsample_factor)
++#         init_heightmap = torch.zeros(self.mask_size // 2 // mask_upsample_factor)
++         # ============================================================
++        # 菲涅尔透镜初始化 (Fresnel DOE Lens Pattern)
++        # ============================================================
++        # 目标：打破对称性，解决深度反转问题
++        # 方法：使用传统菲涅尔透镜模式初始化 DOE，赋予系统初始光焦度
++        
++        # 1. 计算物理坐标
++        n_samples = self.mask_size // 2 // mask_upsample_factor
++        # 每个可优化参数点对应的物理径向坐标
++        r_indices = torch.arange(n_samples, dtype=torch.float32)
++        r_physical = r_indices * self.mask_pitch * mask_upsample_factor
++        
++        # 2. 设计基准：选取中心波长
++        mid_idx = len(self.wavelengths) // 2
++        design_wavelength = self.wavelengths[mid_idx].item()
++        n_design = refractive_index(torch.tensor(design_wavelength)).item()
++        
++        # 3. 高度与相位公式
++        # 产生 2π 相位延迟的物理高度周期
++        h_max = design_wavelength / (n_design - 1.0)
++        
++        # 4. 透镜参数：使用主透镜焦距
++        f_lens = self.focal_length
++        
++        # 5. 薄透镜的理想抛物面矢高公式
++        # h_ideal(r) = r^2 / (2 * f * (n - 1))
++        h_ideal = (r_physical ** 2) / (2.0 * f_lens * (n_design - 1.0))
++        
++        # 6. 菲涅尔折叠 (Fresnel Wrapping)
++        # 通过取模运算将抛物面折叠为菲涅尔结构
++        # 公式：h_init = h_max - (h_ideal mod h_max)
++        # 目的：生成聚光透镜（中心厚/相位延迟大，边缘薄）
++        h_wrapped = torch.fmod(h_ideal, h_max)
++        init_heightmap = h_max - h_wrapped
++        
++        # 7. 打破对称性：加入极微量的高斯噪声
++        # 防止优化器因数值完全对称而无法启动
++        noise = torch.randn_like(init_heightmap) * 1e-6 * h_max
++        init_heightmap = init_heightmap + noise
++        
++        # 8. 确保非负（物理约束）
++        init_heightmap = torch.clamp(init_heightmap, min=0.0)
++
+         self.heightmap1d_ = nn.Parameter(init_heightmap, requires_grad=requires_grad)
++# ============================================================
++#         # 方案：加载预训练的 TIF DOE 文件 (Pre-trained Loading)
++#         # ============================================================
++#         tif_path = "autodl-tmp/doe_design.tif"  # <---【请修改这里为你的真实路径】
++        
++#         if os.path.exists(tif_path):
++#             print(f">>> Loading DOE from TIF: {tif_path} <<<")
++            
++#             # 1. 读取 TIF 数据
++#             doe_data = tifffile.imread(tif_path).astype(np.float32)
++            
++#             # 2. 提取径向轮廓 (Radial Profile)
++#             # 因为是对称的，直接取中心行的一半即可
++#             h, w = doe_data.shape
++#             cy, cx = h // 2, w // 2
++            
++#             # 从中心向右提取 (Radius)
++#             # 注意：这里假设 TIF 的中心就是图像中心。你的检查结果显示是对称的，所以没问题。
++#             radial_profile_np = doe_data[cy, cx:] 
++            
++#             # 3. 尺寸对齐 (Resampling)
++#             # TIF 的半径像素数可能和你的 mask_size 不一样，需要插值缩放
++#             # 目标尺寸:
++#             n_target = self.mask_size // 2 // mask_upsample_factor
++            
++#             # 转为 Tensor 并增加维度用于 interpolate: [1, 1, Src_Len]
++#             profile_tensor = torch.from_numpy(radial_profile_np).reshape(1, 1, -1)
++            
++#             # 线性插值到目标长度
++#             init_heightmap = F.interpolate(
++#                 profile_tensor, 
++#                 size=n_target, 
++#                 mode='linear', 
++#                 align_corners=False
++#             ).reshape(-1) # 变回 1D 向量
++            
++#             # 4. 强制非负 (物理高度不能为负)
++#             init_heightmap = torch.clamp(init_heightmap, min=0.0)
++            
++#             # 5. 【关键】设置为不可训练 (如果你想“免DOE训练”)
++#             # 如果 requires_grad=False，参数会被固定，网络只学后端重建。
++#             self.heightmap1d_ = nn.Parameter(init_heightmap, requires_grad=requires_grad)
++            
++#         else:
++#             raise FileNotFoundError(f"找不到 DOE 文件: {tif_path}")
++            
+         self.mask_upsample_factor = mask_upsample_factor
+ 
+     def heightmap1d(self):
+@@ -235,22 +335,46 @@
+ 
+     def psf_at_camera(self, size=None, modulate_phase=True, is_training=False):
+         device = self.H.device
++#         if is_training:
++#             sd = ips_to_metric(torch.linspace(0, 1, steps=self.n_depths, device=device) +
++#                                (torch.rand(self.n_depths, device=device) - 0.5) / self.n_depths,
++#                                self.min_depth, self.max_depth)
++#             # ####################################################################
++#             # ## 核心修改点：将 .item() 或 [0] 添加到随机数生成中 ##
++#             # ####################################################################
++#             rand_val = torch.rand(1, device=device).item() * (100.0 - self.max_depth)
++#             sd[-1] += rand_val
++#         else:
++# #             sd = self.scene_distances.to(device)
++#             sd = ips_to_metric(torch.linspace(0, 1, steps=self.n_depths, device=device),
++#                                         self.min_depth, self.max_depth)
++        # 【IPS 迁移】生成与 Dataset 对齐的深度采样点
++        # 在 IPS 归一化空间 [0, 1] 等间距采样，然后反算回物理深度
++        ips_normalized = torch.linspace(0, 1, steps=self.n_depths, device=device)
++        
+         if is_training:
+-            sd = ips_to_metric(torch.linspace(0, 1, steps=self.n_depths, device=device) +
+-                               (torch.rand(self.n_depths, device=device) - 0.5) / self.n_depths,
+-                               self.min_depth, self.max_depth)
+-            # ####################################################################
+-            # ## 核心修改点：将 .item() 或 [0] 添加到随机数生成中 ##
+-            # ####################################################################
+-            rand_val = torch.rand(1, device=device).item() * (100.0 - self.max_depth)
+-            sd[-1] += rand_val
++            # 2. [保留] 随机抖动 (Jitter)
++            # 这有助于网络学会连续的深度，而不是死记硬背几个离散的深度点
++            # 这里的抖动是在 bin 宽度内微调，是好的
++            jitter = 1.0 / self.n_depths * (torch.rand(self.n_depths, device=device) - 0.5)
++            ips_jittered = torch.clamp(ips_normalized + jitter, 0, 1)
++            
++            # 3. 反算到物理深度（使用 IPS 逆函数）
++            scene_distances = ips_to_metric(ips_jittered, self.min_depth, self.max_depth)
++            
++            # ==========================================================
++            # ❌ [删除/注释] 这一行绝对不能要！
++            # 你的 2.0m 是物体，不是无穷远背景。不要把它推到 100米去。
++            # ==========================================================
++            # scene_distances[-1] += torch.rand(1, device=device)[0] * (100.0 - self.max_depth)
++            
+         else:
+-#             sd = self.scene_distances.to(device)
+-            sd = ips_to_metric(torch.linspace(0, 1, steps=self.n_depths, device=device),
+-                                        self.min_depth, self.max_depth)
+-        diff_psf = self._psf_at_camera_impl(self.H, self.rho_grid, self.rho_sampling, self.ind, self.image_size, sd,
++            # 测试时保持稳定的线性采样
++#             scene_distances = self.min_depth + (self.max_depth - self.min_depth) * normalized_depths
++            scene_distances = ips_to_metric(ips_normalized, self.min_depth, self.max_depth)
++        diff_psf = self._psf_at_camera_impl(self.H, self.rho_grid, self.rho_sampling, self.ind, self.image_size, scene_distances,
+                                             modulate_phase)
+-        undiff_psf = self._psf_at_camera_impl(self.H, self.rho_grid, self.rho_sampling, self.ind, self.image_size, sd,
++        undiff_psf = self._psf_at_camera_impl(self.H, self.rho_grid, self.rho_sampling, self.ind, self.image_size, scene_distances,
+                                               False)
+         self.diff_norm = diff_psf.sum(dim=(-1, -2), keepdims=True)
+         self.undiff_norm = undiff_psf.sum(dim=(-1, -2), keepdims=True)
+@@ -264,8 +388,9 @@
+     def psf_out_of_fov_energy(self, psf_size: int):
+         device = self.H.device
+ #         sd = self.scene_distances.to(self.H.device)
++
+         sd = scene_distances = ips_to_metric(torch.linspace(0, 1, steps=self.n_depths, device=device),
+-                                        self.min_depth, self.max_depth)
++                                         self.min_depth, self.max_depth)
+         psf1d = self.psf1d_full(sd)
+         if hasattr(self, 'diff_norm'): psf1d /= self.diff_norm.squeeze(-1)
+         edge = psf_size / 2 * self.camera_pixel_pitch / (

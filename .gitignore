@@ -1,0 +1,77 @@
+# ============================================================
+# macOS / Finder metadata
+# ============================================================
+.DS_Store
+._*
+__MACOSX/
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.ipynb_checkpoints/
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================================
+# AI tools (Codex, Claude)
+# ============================================================
+.codex*
+.claude/
+
+# ============================================================
+# AutoDL cloud platform
+# ============================================================
+.autodl/
+
+# ============================================================
+# Large datasets — raw data, training artifacts, inference outputs
+# ============================================================
+Baek数据集/
+data/
+infer_results/
+result/
+
+# ============================================================
+# Pre-built wheels & environment backups
+# ============================================================
+torch_wheels/
+env_backup/
+
+# ============================================================
+# Large precomputed optical data (.npy Zernike volumes, ~20–25 MB each)
+# These are derived / cached data; keep .mat files (small parameter tables)
+# ============================================================
+optics/*.npy
+torch_optics/assets/*.npy
+
+# ============================================================
+# Duplicate copy of torch_optics + preprocessing under r12 (experiment snapshot)
+# Python source differs slightly but assets are byte-for-byte duplicates.
+# Ignore entirely unless you need the unique pipeline.py / helper.py.
+# ============================================================
+r12_optical_forward/
+
+# ============================================================
+# Data debug dumps (may not exist — kept from old .gitignore)
+# ============================================================
+data_debug_nan/
+data_debug_fastfilter/
+
+# ============================================================
+# Symlink to AutoDL public data
+# ============================================================
+autodl-pub
