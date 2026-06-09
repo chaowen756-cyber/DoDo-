@@ -108,60 +108,6 @@ class SnapshotDepthHS(pl.LightningModule):
                       f'in optics param group (by identity)={in_optics}')
         return optimizer
 
-#     def training_step(self, samples, batch_idx):
-#         target_images = samples['hs_image']
-#         target_depthmaps = samples['depth_map']
-# #         print(f"[原始数据检查]")
-# #         print(f"  target_images:    min={target_images.min():.4f}, max={target_images.max():.4f}")
-# #         print(f"  target_depthmaps: min={target_depthmaps.min():.4f}, max={target_depthmaps.max():.4f}")
-# #         print(f"  target_depthmaps 是否全零: {(target_depthmaps == 0).all()}")
-#         # 修复多余维度
-#         if target_images.ndim == 5:
-#             target_images = target_images.squeeze(1)
-    
-#         if target_depthmaps.ndim == 4:
-#             target_depthmaps = target_depthmaps.squeeze(1)
-    
-#         if batch_idx == 0:
-#             print(f"\n{'='*70}")
-#             print(f"DEBUG training_step - 数据集直接输出:")
-#             print(f"  target_images.shape:    {target_images.shape}")
-#             print(f"  target_depthmaps.shape: {target_depthmaps.shape}")
-#             print(f"  target_images.ndim:     {target_images.ndim}")
-#             print(f"  target_depthmaps.ndim:  {target_depthmaps.ndim}")
-#             print(f"{'='*70}\n")
-
-#         # 在这个版本中，我们假设所有像素都是有效的，创建一个全1的置信度图
-#         depth_conf = torch.ones_like(target_depthmaps)
-#         depth_conf = crop_boundary(depth_conf, self.crop_width * 2)
-
-#         outputs = self.forward(target_images, target_depthmaps, is_testing=torch.tensor(False))
-# #         print(f"[forward 后检查]")
-# #         print(f"  outputs.target_depthmaps: min={outputs.target_depthmaps.min():.4f}, max={outputs.target_depthmaps.max():.4f}")
-# #         print(f"  outputs.target_depthmaps 是否全零: {(outputs.target_depthmaps == 0).all()}")
-        
-#         data_loss, loss_logs = self.__compute_loss(outputs, outputs.target_depthmaps, outputs.target_images, depth_conf)
-#         loss_logs = {f'train_loss/{key}': val for key, val in loss_logs.items()}
-
-#         misc_logs = {
-#             'train_misc/est_depth_max': outputs.est_depthmaps.max(),
-#             'train_misc/est_depth_min': outputs.est_depthmaps.min(),
-#             'train_misc/est_image_max': outputs.est_images.max(),
-#             'train_misc/est_image_min': outputs.est_images.min(),
-#         }
-#         if self.hparams.optimize_optics:
-#             misc_logs.update({
-#                 'optics/heightmap_max': self.camera.heightmap1d().max(),
-#                 'optics/heightmap_min': self.camera.heightmap1d().min(),
-#             })
-
-#         logs = {**loss_logs, **misc_logs}
-
-#         if not self.global_step % self.hparams.summary_track_train_every:
-#             self.__log_images(outputs, outputs.target_images, outputs.target_depthmaps, 'train')
-
-#         self.log_dict(logs)
-#         return data_loss
 
 # 2026.1.22 修改
     def training_step(self, samples, batch_idx):
@@ -355,29 +301,6 @@ class SnapshotDepthHS(pl.LightningModule):
         self._val_steps = 0
         self._val_skipped_steps = 0
 
-#     def validation_step(self, samples, batch_idx):
-#         target_images = samples['hs_image']
-#         target_depthmaps = samples['depth_map']
-#         depth_conf = torch.ones_like(target_depthmaps)
-#         depth_conf = crop_boundary(depth_conf, 2 * self.crop_width)
-
-#         outputs = self.forward(target_images, target_depthmaps, is_testing=torch.tensor(False))
-
-#         est_depthmaps = outputs.est_depthmaps * depth_conf
-#         target_depthmaps_val = outputs.target_depthmaps * depth_conf
-
-#         self.metrics['mae_depthmap'](est_depthmaps, target_depthmaps_val)
-#         self.metrics['mse_depthmap'](est_depthmaps, target_depthmaps_val)
-#         self.metrics['mae_image'](outputs.est_images, outputs.target_images)
-#         self.metrics['mse_image'](outputs.est_images, outputs.target_images)
-
-#         self.log('validation/mse_depthmap', self.metrics['mse_depthmap'], on_step=False, on_epoch=True)
-#         self.log('validation/mae_depthmap', self.metrics['mae_depthmap'], on_step=False, on_epoch=True)
-#         self.log('validation/mse_image', self.metrics['mse_image'], on_step=False, on_epoch=True)
-#         self.log('validation/mae_image', self.metrics['mae_image'], on_step=False, on_epoch=True)
-
-#         if batch_idx == 0:
-#             self.__log_images(outputs, outputs.target_images, outputs.target_depthmaps, 'validation')
     def validation_step(self, samples, batch_idx):
         target_images = samples['hs_image']
         target_depthmaps = samples['depth_map']
@@ -1240,7 +1163,7 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='光学测量输出通道数；None=自动推断')
         parser.add_argument('--dodo_depth_layers', type=int, default=None,
                             help='DoDo 深度分层数；None=使用 n_depths')
-        parser.add_argument('--depth_layering_mode', type=str, default='hard_depth',
+        parser.add_argument('--depth_layering_mode', type=str, default='soft_diopter',
                             choices=['hard_depth', 'hard_meter', 'soft_diopter'],
                             help='DoDo depth layering mode')
         parser.add_argument('--soft_diopter_eps', type=float, default=1e-8,
@@ -1273,10 +1196,30 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='patch 中有效像素占比下限（0~1）')
         parser.add_argument('--min_depth_range_ips', type=float, default=0.10,
                             help='patch 内有效区域 IPS 深度动态范围下限')
+        parser.add_argument('--min_center_valid_ratio', type=float, default=0.0,
+                            help='patch 中心区域有效像素占比下限；0=不启用，加载候选池时默认沿用候选池meta')
         parser.add_argument('--max_crop_retries', type=int, default=8,
                             help='随机裁剪失败后最多重采样次数（轻量判定，开销较小）')
         parser.add_argument('--patch_filter_stride', type=int, default=4,
                             help='patch筛选预检步长(>1更快，=1最严格)')
+        parser.add_argument('--patch_index_path', type=str, nargs='?', const='auto', default='',
+                            help='离线高质量patch候选池 .npz 路径；只写参数不填值时自动使用 data_root/.patch_index 下的默认候选池')
+        parser.add_argument('--patch_index_jitter', type=int, default=16,
+                            help='候选池坐标在线随机扰动像素数；0=不扰动')
+        parser.add_argument('--patch_index_strict', dest='patch_index_strict', action='store_true',
+                            help='候选池坐标/jitter后仍按当前质量阈值复检')
+        parser.add_argument('--no-patch_index_strict', dest='patch_index_strict', action='store_false')
+        parser.set_defaults(patch_index_strict=True)
+        parser.add_argument('--patch_index_weighted', dest='patch_index_weighted', action='store_true',
+                            help='按候选池score加权采样；默认均匀采样')
+        parser.add_argument('--no-patch_index_weighted', dest='patch_index_weighted', action='store_false')
+        parser.set_defaults(patch_index_weighted=False)
+        parser.add_argument('--patch_index_use_meta_thresholds', dest='patch_index_use_meta_thresholds',
+                            action='store_true',
+                            help='加载候选池后使用候选池meta中的质量阈值做在线复检')
+        parser.add_argument('--no-patch_index_use_meta_thresholds', dest='patch_index_use_meta_thresholds',
+                            action='store_false')
+        parser.set_defaults(patch_index_use_meta_thresholds=True)
         parser.add_argument('--depth_loss_weight', type=float, default=1.0)
         parser.add_argument('--image_loss_weight', type=float, default=1.0)
         parser.add_argument('--psf_loss_weight', type=float, default=1.0)

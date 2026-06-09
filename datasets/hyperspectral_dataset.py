@@ -2,10 +2,11 @@ import os
 import re
 import hashlib
 import math
+import json
 import torch
 import numpy as np
 from torch.utils.data import Dataset
-from typing import Tuple, List
+from typing import Tuple, List, Optional, Dict
 from kornia.augmentation import CenterCrop
 # 假设 transform 能够处理多通道输入 (C, H, W)，如果你的 GenericRandomTransform 
 # 内部写死了只处理单通道深度图，可能需要微调，但通常 Kornia/TorchVision 都能处理多通道。
@@ -67,7 +68,11 @@ class HyperspectralDepthDataset(Dataset):
                  use_exr_cache: bool = False, exr_cache_dir: str = '',
                  patch_filter: bool = True, min_valid_ratio: float = 0.12,
                  min_depth_range_ips: float = 0.10, max_crop_retries: int = 8,
-                 patch_filter_stride: int = 4):
+                 patch_filter_stride: int = 4,
+                 patch_index_path: str = '', patch_index_jitter: int = 16,
+                 patch_index_strict: bool = True, patch_index_weighted: bool = False,
+                 patch_index_use_meta_thresholds: bool = True,
+                 min_center_valid_ratio: float = 0.0):
         
         super().__init__()
         self.is_training = is_training
@@ -89,8 +94,16 @@ class HyperspectralDepthDataset(Dataset):
         self.patch_filter = bool(patch_filter and self.is_training and self.randcrop)
         self.min_valid_ratio = float(min_valid_ratio)
         self.min_depth_range_ips = float(min_depth_range_ips)
+        self.min_center_valid_ratio = float(min_center_valid_ratio)
         self.max_crop_retries = max(1, int(max_crop_retries))
         self.patch_filter_stride = max(1, int(patch_filter_stride))
+        self.patch_index_path = str(patch_index_path or '')
+        self.patch_index_jitter = max(0, int(patch_index_jitter))
+        self.patch_index_strict = bool(patch_index_strict)
+        self.patch_index_weighted = bool(patch_index_weighted)
+        self.patch_index_use_meta_thresholds = bool(patch_index_use_meta_thresholds)
+        self.patch_index_by_id: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.patch_index_meta: Dict = {}
 
         self.use_exr_cache = use_exr_cache
         if not exr_cache_dir:
@@ -123,6 +136,9 @@ class HyperspectralDepthDataset(Dataset):
                 # 仅在调试时打印，避免刷屏
                 pass
 
+        if self.patch_filter and self.patch_index_path:
+            self._load_patch_index(self.patch_index_path)
+
     def __len__(self):
         return len(self.sample_pairs)
 
@@ -151,14 +167,90 @@ class HyperspectralDepthDataset(Dataset):
                 os.remove(tmp_path)
         return image_np
 
-    def _patch_quality_stats(self, depth_patch: torch.Tensor, mask_patch: torch.Tensor) -> Tuple[float, float]:
+    def _load_patch_index(self, patch_index_path: str) -> None:
+        if not os.path.exists(patch_index_path):
+            raise FileNotFoundError(f"patch_index_path 不存在: {patch_index_path}")
+
+        data = np.load(patch_index_path, allow_pickle=False)
+        required = {'scene_ids', 'tops', 'lefts'}
+        missing = required - set(data.files)
+        if missing:
+            raise ValueError(f"patch index 缺少字段: {sorted(missing)}")
+
+        scene_ids = data['scene_ids'].astype(str)
+        tops = data['tops'].astype(np.int64)
+        lefts = data['lefts'].astype(np.int64)
+        if not (len(scene_ids) == len(tops) == len(lefts)):
+            raise ValueError("patch index 字段长度不一致")
+
+        if 'scores' in data.files:
+            scores = data['scores'].astype(np.float32)
+        else:
+            scores = np.ones(len(tops), dtype=np.float32)
+
+        if 'meta_json' in data.files:
+            try:
+                self.patch_index_meta = json.loads(str(data['meta_json'].item()))
+            except Exception:
+                self.patch_index_meta = {}
+
+        # 默认沿用候选池生成时的阈值，保证“填入候选池路径即可使用”的复检口径一致。
+        if self.patch_index_use_meta_thresholds:
+            meta_valid_ratio = float(self.patch_index_meta.get('min_valid_ratio', 0.0) or 0.0)
+            meta_depth_range = float(self.patch_index_meta.get('min_depth_range_ips', 0.0) or 0.0)
+            meta_center_ratio = float(self.patch_index_meta.get('min_center_valid_ratio', 0.0) or 0.0)
+            if meta_valid_ratio > 0.0:
+                self.min_valid_ratio = meta_valid_ratio
+            if meta_depth_range > 0.0:
+                self.min_depth_range_ips = meta_depth_range
+            if meta_center_ratio > 0.0:
+                self.min_center_valid_ratio = meta_center_ratio
+
+        valid_sample_ids = {sample['id'] for sample in self.sample_pairs}
+        loaded = 0
+        for scene_id in sorted(set(scene_ids.tolist())):
+            if scene_id not in valid_sample_ids:
+                continue
+            idx = np.nonzero(scene_ids == scene_id)[0]
+            if idx.size == 0:
+                continue
+            scene_scores = np.maximum(scores[idx], 1e-6)
+            self.patch_index_by_id[scene_id] = {
+                'tops': torch.from_numpy(tops[idx].copy()).long(),
+                'lefts': torch.from_numpy(lefts[idx].copy()).long(),
+                'scores': torch.from_numpy(scene_scores.copy()).float(),
+            }
+            loaded += int(idx.size)
+
+        print(
+            f"[Patch Index] loaded {loaded} windows from {patch_index_path}; "
+            f"matched_scenes={len(self.patch_index_by_id)}/{len(self.sample_pairs)}, "
+            f"jitter={self.patch_index_jitter}, strict={self.patch_index_strict}, "
+            f"weighted={self.patch_index_weighted}, use_meta_thresholds={self.patch_index_use_meta_thresholds}, "
+            f"min_valid_ratio={self.min_valid_ratio:.3f}, "
+            f"min_depth_range_ips={self.min_depth_range_ips:.3f}, "
+            f"center_valid_ratio={self.min_center_valid_ratio:.3f}"
+        )
+
+    def _patch_quality_stats(self, depth_patch: torch.Tensor, mask_patch: torch.Tensor) -> Tuple[float, float, float]:
         valid = mask_patch > 0.5
         valid_ratio = float(valid.float().mean().item())
         if valid.sum() == 0:
-            return valid_ratio, 0.0
+            return valid_ratio, 0.0, 0.0
+
+        h, w = valid.shape[-2], valid.shape[-1]
+        center_h = max(1, h // 2)
+        center_w = max(1, w // 2)
+        center_top = max(0, (h - center_h) // 2)
+        center_left = max(0, (w - center_w) // 2)
+        center_valid = valid[
+            ..., center_top:center_top + center_h, center_left:center_left + center_w
+        ]
+        center_valid_ratio = float(center_valid.float().mean().item())
+
         valid_depth = depth_patch[valid]
         depth_range = float((valid_depth.max() - valid_depth.min()).item())
-        return valid_ratio, depth_range
+        return valid_ratio, depth_range, center_valid_ratio
 
     def _sample_random_crop_window(self, full_h: int, full_w: int) -> Tuple[int, int]:
         crop_h, crop_w = self.image_size
@@ -183,6 +275,50 @@ class HyperspectralDepthDataset(Dataset):
         if do_hflip:
             x = torch.flip(x, dims=[-1])
         return x
+
+    def _window_passes_quality(
+        self, depth_base: torch.Tensor, mask_base: torch.Tensor, top: int, left: int
+    ) -> bool:
+        depth_try = self._crop_window(depth_base, top, left)
+        mask_try = self._crop_window(mask_base, top, left)
+        valid_ratio, depth_range, center_valid_ratio = self._patch_quality_stats(depth_try, mask_try)
+        return (
+            valid_ratio >= self.min_valid_ratio
+            and depth_range >= self.min_depth_range_ips
+            and center_valid_ratio >= self.min_center_valid_ratio
+        )
+
+    def _sample_patch_index_window(
+        self, sample_id: str, full_h: int, full_w: int
+    ) -> Optional[Tuple[int, int, int, int]]:
+        index = self.patch_index_by_id.get(sample_id)
+        if not index:
+            return None
+
+        tops = index['tops']
+        lefts = index['lefts']
+        if tops.numel() == 0:
+            return None
+
+        if self.patch_index_weighted:
+            probs = index['scores']
+            pick = int(torch.multinomial(probs, 1).item())
+        else:
+            pick = int(torch.randint(0, tops.numel(), (1,)).item())
+
+        base_top = int(tops[pick].item())
+        base_left = int(lefts[pick].item())
+        top, left = base_top, base_left
+
+        if self.patch_index_jitter > 0:
+            jitter = self.patch_index_jitter
+            top += int(torch.randint(-jitter, jitter + 1, (1,)).item())
+            left += int(torch.randint(-jitter, jitter + 1, (1,)).item())
+
+        crop_h, crop_w = self.image_size
+        top = max(0, min(top, max(0, full_h - crop_h)))
+        left = max(0, min(left, max(0, full_w - crop_w)))
+        return top, left, base_top, base_left
 
     def __getitem__(self, idx):
         sample = self.sample_pairs[idx]
@@ -325,35 +461,58 @@ class HyperspectralDepthDataset(Dataset):
                     crop_h_proxy = 0
                     crop_w_proxy = 0
 
-                top, left = self._sample_random_crop_window(full_h, full_w)
-
-                for _ in range(self.max_crop_retries):
-                    if depth_proxy is not None and mask_proxy is not None:
-                        top_proxy = top // stride
-                        left_proxy = left // stride
-                        depth_try_proxy = depth_proxy[
-                            ..., top_proxy:top_proxy + crop_h_proxy, left_proxy:left_proxy + crop_w_proxy
-                        ]
-                        mask_try_proxy = mask_proxy[
-                            ..., top_proxy:top_proxy + crop_h_proxy, left_proxy:left_proxy + crop_w_proxy
-                        ]
-                        valid_ratio_proxy, depth_range_proxy = self._patch_quality_stats(
-                            depth_try_proxy, mask_try_proxy
-                        )
-                        if (
-                            valid_ratio_proxy < self.min_valid_ratio
-                            or depth_range_proxy < self.min_depth_range_ips
-                        ):
+                indexed_window = self._sample_patch_index_window(sample_id, full_h, full_w)
+                if indexed_window is not None:
+                    top, left, base_top, base_left = indexed_window
+                    use_retry_sampler = False
+                    if self.patch_index_strict and not self._window_passes_quality(depth_base, mask_base, top, left):
+                        if self._window_passes_quality(depth_base, mask_base, base_top, base_left):
+                            top, left = base_top, base_left
+                        else:
                             top, left = self._sample_random_crop_window(full_h, full_w)
-                            continue
-
-                    depth_try = self._crop_window(depth_base, top, left)
-                    mask_try = self._crop_window(mask_base, top, left)
-                    valid_ratio, depth_range = self._patch_quality_stats(depth_try, mask_try)
-
-                    if valid_ratio >= self.min_valid_ratio and depth_range >= self.min_depth_range_ips:
-                        break
+                            use_retry_sampler = True
+                    # 候选池窗口已离线通过质量筛选；strict=False 时直接使用，strict=True 时上面已复检。
+                else:
                     top, left = self._sample_random_crop_window(full_h, full_w)
+                    use_retry_sampler = True
+
+                if use_retry_sampler:
+                    for _ in range(self.max_crop_retries):
+                        if depth_proxy is not None and mask_proxy is not None:
+                            top_proxy = top // stride
+                            left_proxy = left // stride
+                            depth_try_proxy = depth_proxy[
+                                ..., top_proxy:top_proxy + crop_h_proxy, left_proxy:left_proxy + crop_w_proxy
+                            ]
+                            mask_try_proxy = mask_proxy[
+                                ..., top_proxy:top_proxy + crop_h_proxy, left_proxy:left_proxy + crop_w_proxy
+                            ]
+                            (
+                                valid_ratio_proxy,
+                                depth_range_proxy,
+                                center_valid_ratio_proxy,
+                            ) = self._patch_quality_stats(depth_try_proxy, mask_try_proxy)
+                            if (
+                                valid_ratio_proxy < self.min_valid_ratio
+                                or depth_range_proxy < self.min_depth_range_ips
+                                or center_valid_ratio_proxy < self.min_center_valid_ratio
+                            ):
+                                top, left = self._sample_random_crop_window(full_h, full_w)
+                                continue
+
+                        depth_try = self._crop_window(depth_base, top, left)
+                        mask_try = self._crop_window(mask_base, top, left)
+                        valid_ratio, depth_range, center_valid_ratio = self._patch_quality_stats(
+                            depth_try, mask_try
+                        )
+
+                        if (
+                            valid_ratio >= self.min_valid_ratio
+                            and depth_range >= self.min_depth_range_ips
+                            and center_valid_ratio >= self.min_center_valid_ratio
+                        ):
+                            break
+                        top, left = self._sample_random_crop_window(full_h, full_w)
 
                 hs_tensor = self._crop_window(hs_base, top, left)
                 depth_tensor = self._crop_window(depth_base, top, left)

@@ -86,6 +86,15 @@ def prepare_data(hparams):
     print(f"训练集文件夹数量: {len(train_folders)}")
     print(f"验证集文件夹数量: {len(val_folders)}")
 
+    patch_index_path = getattr(hparams, 'patch_index_path', '')
+    if patch_index_path == 'auto':
+        patch_index_path = os.path.join(
+            hparams.data_root,
+            '.patch_index',
+            f'patch{hparams.image_sz}_stride32_valid20_range060_center10_v1.npz',
+        )
+        print(f'[data] auto patch_index_path: {patch_index_path}')
+
     train_dataset = HyperspectralDepthDataset(
         base_dir=hparams.data_root,
         scene_folders=train_folders,
@@ -103,6 +112,12 @@ def prepare_data(hparams):
         min_depth_range_ips=getattr(hparams, 'min_depth_range_ips', 0.10),
         max_crop_retries=getattr(hparams, 'max_crop_retries', 8),
         patch_filter_stride=getattr(hparams, 'patch_filter_stride', 4),
+        patch_index_path=patch_index_path,
+        patch_index_jitter=getattr(hparams, 'patch_index_jitter', 16),
+        patch_index_strict=getattr(hparams, 'patch_index_strict', True),
+        patch_index_weighted=getattr(hparams, 'patch_index_weighted', False),
+        patch_index_use_meta_thresholds=getattr(hparams, 'patch_index_use_meta_thresholds', True),
+        min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
     )
 
     val_dataset = HyperspectralDepthDataset(
@@ -122,6 +137,12 @@ def prepare_data(hparams):
         min_depth_range_ips=getattr(hparams, 'min_depth_range_ips', 0.10),
         max_crop_retries=getattr(hparams, 'max_crop_retries', 8),
         patch_filter_stride=getattr(hparams, 'patch_filter_stride', 4),
+        patch_index_path='',
+        patch_index_jitter=getattr(hparams, 'patch_index_jitter', 16),
+        patch_index_strict=getattr(hparams, 'patch_index_strict', True),
+        patch_index_weighted=getattr(hparams, 'patch_index_weighted', False),
+        patch_index_use_meta_thresholds=getattr(hparams, 'patch_index_use_meta_thresholds', True),
+        min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
     )
 
     train_dataloader = DataLoader(train_dataset, batch_size=hparams.batch_sz,

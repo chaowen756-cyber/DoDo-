@@ -156,8 +156,10 @@ class DoDoForwardModel(nn.Module):
         sensing_normalize_mode: str = "global",
         use_second_doe: bool = True,
         sensor_measurement: str = "amplitude",
+        skip_prop2: bool = True,
     ):
         super().__init__()
+        self.skip_prop2 = skip_prop2
         self.input_size = input_size
         self.input_format = input_format.lower()
         self.output_format = output_format.lower()
@@ -254,8 +256,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
         soft_diopter_eps: float = 1e-8,
         soft_diopter_bandwidth_scale: float = 1.0,
         sensor_measurement: str = "amplitude",
+        skip_prop2: bool = True,
     ):
         super().__init__()
+        self.skip_prop2 = skip_prop2
         if depth_min >= depth_max:
             raise ValueError(f"depth_min ({depth_min}) must be < depth_max ({depth_max})")
         if num_depth_layers < 1:
