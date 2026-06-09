@@ -262,6 +262,25 @@ def main(args):
             mode='min',
         )
 
+    hs_ckpt_monitor = 'validation/hs_l1_masked'
+    try:
+        hs_checkpoint_callback = ModelCheckpoint(
+            monitor=hs_ckpt_monitor,
+            dirpath=ckpt_dir,
+            filename='hs-best-{epoch:03d}',
+            save_top_k=1,
+            mode='min',
+            verbose=True,
+        )
+    except TypeError:
+        hs_checkpoint_callback = ModelCheckpoint(
+            verbose=True,
+            monitor=hs_ckpt_monitor,
+            filepath=os.path.join(ckpt_dir, 'hs-best-{epoch:03d}'),
+            save_top_k=1,
+            mode='min',
+        )
+
     model = SnapshotDepth(hparams=args, log_dir=logger.log_dir, artifact_root=artifact_dir)
     train_dataloader, val_dataloader = prepare_data(hparams=args)
 
@@ -288,7 +307,8 @@ def main(args):
     # 兼容不同 PL 版本的 Trainer 初始化参数：
     # 1) 老版本依赖 checkpoint_callback=... 来注入 save_function
     # 2) 新版本通常通过 callbacks=[...] 传入 checkpoint callback
-    callbacks = [logmanager_callback, checkpoint_callback, depth_checkpoint_callback,DOEParameterClampCallback(),]
+    callbacks = [logmanager_callback, checkpoint_callback, depth_checkpoint_callback,
+                 hs_checkpoint_callback, DOEParameterClampCallback()]
     trainer_init_params = inspect.signature(Trainer.__init__).parameters
     trainer_kwargs = dict(
         logger=logger,
@@ -308,6 +328,9 @@ def main(args):
     if getattr(depth_checkpoint_callback, 'save_function', None) is None:
         depth_checkpoint_callback.save_function = trainer.save_checkpoint
         print('[Compat] Set depth_checkpoint_callback.save_function = trainer.save_checkpoint')
+    if getattr(hs_checkpoint_callback, 'save_function', None) is None:
+        hs_checkpoint_callback.save_function = trainer.save_checkpoint
+        print('[Compat] Set hs_checkpoint_callback.save_function = trainer.save_checkpoint')
 
     validate_only = getattr(args, 'validate_only_ckpt', '')
     if validate_only:

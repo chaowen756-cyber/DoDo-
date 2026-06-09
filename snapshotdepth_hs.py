@@ -60,6 +60,9 @@ class SnapshotDepthHS(pl.LightningModule):
         self._val_psnr_hs_sum = 0.0
         self._val_mae_depth_m_sum = 0.0
         self._val_mae_depth_sum = 0.0
+        self._val_hs_l1_masked_sum = 0.0
+        self._val_depth_tv_sum = 0.0
+        self._val_bg_hs_l1_sum = 0.0
         self._val_steps = 0
         self._val_skipped_steps = 0
         # Diagnostics state
@@ -298,6 +301,9 @@ class SnapshotDepthHS(pl.LightningModule):
         self._val_psnr_hs_sum = 0.0
         self._val_mae_depth_m_sum = 0.0
         self._val_mae_depth_sum = 0.0
+        self._val_hs_l1_masked_sum = 0.0
+        self._val_depth_tv_sum = 0.0
+        self._val_bg_hs_l1_sum = 0.0
         self._val_steps = 0
         self._val_skipped_steps = 0
 
@@ -360,15 +366,38 @@ class SnapshotDepthHS(pl.LightningModule):
         n_valid_hs = mask4d.sum() * est_images.shape[1]
         if n_valid_hs > 0:
             mse_hs = ((est_images - target_images_val) ** 2 * mask4d).sum() / n_valid_hs
+            hs_l1_masked = (torch.abs(est_images - target_images_val) * mask4d).sum() / n_valid_hs
         else:
             mse_hs = torch.tensor(1e-10, device=est_images.device)
+            hs_l1_masked = torch.tensor(0.0, device=est_images.device)
         psnr_hs_masked = 10 * torch.log10(1.0 / (mse_hs + 1e-10))
         self.log('validation/psnr_hs_masked', psnr_hs_masked, on_step=False, on_epoch=True)
+        self.log('validation/hs_l1_masked', hs_l1_masked, on_step=False, on_epoch=True)
 
         # Full-image PSNR (for reference)
         mse_hs_full = ((est_images - target_images_val) ** 2).mean()
         psnr_hs_full = 10 * torch.log10(1.0 / (mse_hs_full + 1e-10))
         self.log('validation/psnr_hs_full', psnr_hs_full, on_step=False, on_epoch=True)
+
+        # Baek-style depth TV on inverse-depth/IPS predictions, masked to valid neighbors.
+        dx = torch.abs(est[:, :, 1:] - est[:, :, :-1])
+        dy = torch.abs(est[:, 1:, :] - est[:, :-1, :])
+        mask_dx = final_mask[:, :, 1:] * final_mask[:, :, :-1]
+        mask_dy = final_mask[:, 1:, :] * final_mask[:, :-1, :]
+        depth_tv = 0.5 * (
+            (dx * mask_dx).sum() / (mask_dx.sum() + 1e-6) +
+            (dy * mask_dy).sum() / (mask_dy.sum() + 1e-6)
+        )
+        self.log('validation/depth_tv', depth_tv, on_step=False, on_epoch=True)
+
+        # Background HS L1 for full-image visual quality; opt-in via background_hs_loss_weight.
+        bg_mask4d = (1.0 - final_mask).unsqueeze(1)
+        n_bg_hs = bg_mask4d.sum() * est_images.shape[1]
+        if n_bg_hs > 0:
+            bg_hs_l1 = (torch.abs(est_images - target_images_val) * bg_mask4d).sum() / n_bg_hs
+        else:
+            bg_hs_l1 = torch.tensor(0.0, device=est_images.device)
+        self.log('validation/hs_l1_background', bg_hs_l1, on_step=False, on_epoch=True)
 
         # Accumulate for epoch-end artifact saving — skip no-valid-pixel batches
         if num_valid_px > 0:
@@ -376,6 +405,9 @@ class SnapshotDepthHS(pl.LightningModule):
             if not torch.isnan(mae_depth_m):
                 self._val_mae_depth_m_sum += mae_depth_m.item()
             self._val_mae_depth_sum += mae.item()
+            self._val_hs_l1_masked_sum += hs_l1_masked.item()
+            self._val_depth_tv_sum += depth_tv.item()
+            self._val_bg_hs_l1_sum += bg_hs_l1.item()
             self._val_steps += 1
         else:
             self._val_skipped_steps += 1
@@ -413,14 +445,24 @@ class SnapshotDepthHS(pl.LightningModule):
         avg_psnr_hs = self._val_psnr_hs_sum / n
         avg_mae_depth_m = self._val_mae_depth_m_sum / n
         avg_mae_depth = self._val_mae_depth_sum / n
-        val_loss = self.hparams.depth_loss_weight * avg_mae_depth + \
-                   self.hparams.image_loss_weight * (1.0 / (10 ** (avg_psnr_hs / 10) + 1e-10))
+        avg_hs_l1_masked = self._val_hs_l1_masked_sum / n
+        avg_depth_tv = self._val_depth_tv_sum / n
+        avg_bg_hs_l1 = self._val_bg_hs_l1_sum / n
+        val_loss = (
+            self.hparams.image_loss_weight * avg_hs_l1_masked +
+            self.hparams.depth_loss_weight * avg_mae_depth +
+            float(getattr(self.hparams, 'depth_smooth_weight', 0.0)) * avg_depth_tv +
+            float(getattr(self.hparams, 'background_hs_loss_weight', 0.0)) * avg_bg_hs_l1
+        )
         self.log('val_loss', torch.tensor(val_loss, device=self.device))
         extra = {
             'val_loss': val_loss,
             'validation/psnr_hs_masked': avg_psnr_hs,
             'validation/mae_depth_m': avg_mae_depth_m,
             'validation/mae_depthmap': avg_mae_depth,
+            'validation/hs_l1_masked': avg_hs_l1_masked,
+            'validation/depth_tv': avg_depth_tv,
+            'validation/hs_l1_background': avg_bg_hs_l1,
             'validation/val_steps': self._val_steps,
             'validation/skipped_steps': self._val_skipped_steps,
             'train_misc/nonfinite_count': self._nonfinite_count,
@@ -1034,9 +1076,9 @@ class SnapshotDepthHS(pl.LightningModule):
         if bg_hs_loss_weight > 0.0:
             bg_mask = (1.0 - final_mask.unsqueeze(1))  # [B,1,H,W], background=1
             if bg_mask.sum() > 0:
-                target_images_bg = target_images * bg_mask
-                est_images_bg = est_images * bg_mask
-                bg_hs_loss = (torch.abs(est_images_bg - target_images_bg) * bg_mask).sum() / (bg_mask.sum() + 1e-6)
+                bg_hs_loss = (
+                    torch.abs(est_images - target_images) * bg_mask
+                ).sum() / (bg_mask.sum() * est_images.shape[1] + 1e-6)
 
         # --- 2. 加权 ---
         weighted_depth_loss = self.hparams.depth_loss_weight * depth_loss
@@ -1220,7 +1262,7 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--no-patch_index_use_meta_thresholds', dest='patch_index_use_meta_thresholds',
                             action='store_false')
         parser.set_defaults(patch_index_use_meta_thresholds=True)
-        parser.add_argument('--depth_loss_weight', type=float, default=1.0)
+        parser.add_argument('--depth_loss_weight', type=float, default=0.03)
         parser.add_argument('--image_loss_weight', type=float, default=1.0)
         parser.add_argument('--psf_loss_weight', type=float, default=1.0)
         parser.add_argument('--depth_smooth_weight', type=float, default=0.01,
@@ -1229,7 +1271,7 @@ class SnapshotDepthHS(pl.LightningModule):
                     help='掩码内 metric-depth SmoothL1 损失权重（默认 0=关闭）')
         parser.add_argument('--psf_size', type=int, default=64)
         parser.add_argument('--l1_loss_weight', type=float, default=1.0)
-        parser.add_argument('--sam_loss_weight', type=float, default=0.5)
+        parser.add_argument('--sam_loss_weight', type=float, default=0.0)
         parser.add_argument('--image_sz', type=int, default=512)
         parser.add_argument('--n_depths', type=int, default=8)
         parser.add_argument('--min_depth', type=float, default=0.4)
@@ -1296,8 +1338,8 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--dodo_forward_norm', type=str, default='legacy_max',
                             choices=['legacy_max', 'none', 'per_sample_max'],
                             help='DoDo forward internal measurement norm mode')
-        parser.add_argument('--background_hs_loss_weight', type=float, default=0.0,
-                            help='Background HS L1 loss weight (opt-in, default 0)')
+        parser.add_argument('--background_hs_loss_weight', type=float, default=0.02,
+                            help='Background HS L1 loss weight for full-image visual quality')
         parser.add_argument('--dodo_sensing_mode', type=str, default='rgb',
                             choices=['rgb', 'spectral_bins', 'identity'],
                             help='DoDo sensing mode')

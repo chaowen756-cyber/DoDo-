@@ -342,6 +342,8 @@ def process_single_scene(
     stride_override: int = -1,
     min_tile_valid_ratio: float = 0.0,
     fill_skipped_tiles: str = 'zero',
+    tile_offset_y: int = 0,
+    tile_offset_x: int = 0,
 ):
     scene_name = os.path.splitext(os.path.basename(hs_path))[0].replace('_hs', '')
     print(f"\nProcessing scene: {scene_name} ...")
@@ -399,8 +401,11 @@ def process_single_scene(
         valid_mask_tensor = torch.from_numpy(valid_mask).float()
 
     stride = stride_override if stride_override > 0 else max(1, valid_size // 2)
+    tile_offset_y = int(tile_offset_y) % stride
+    tile_offset_x = int(tile_offset_x) % stride
     print(f"  [Stitching] Valid Patch: {valid_size}x{valid_size}")
     print(f"  [Stitching] Stride:      {stride}px")
+    print(f"  [Stitching] Tile offset: y={tile_offset_y}px, x={tile_offset_x}px")
 
     c, h, w = hs_tensor.shape
     est_hs_sum = torch.zeros((c, h, w), device=device)
@@ -432,8 +437,10 @@ def process_single_scene(
     total_tiles = 0
     skipped_tile_count = 0
 
-    for y in tqdm(range(0, h, stride), desc='Inference'):
-        for x in range(0, w, stride):
+    y_starts = range(-tile_offset_y, h, stride)
+    x_starts = range(-tile_offset_x, w, stride)
+    for y in tqdm(y_starts, desc='Inference'):
+        for x in x_starts:
             total_tiles += 1
             py = y + pad_buffer
             px = x + pad_buffer
@@ -446,8 +453,12 @@ def process_single_scene(
                     skipped_tile_count += 1
                     skipped_tiles.append({'y': y, 'x': x, 'valid_ratio': tile_vr,
                                           'py': py - pad_buffer, 'px': px - pad_buffer})
-                    target_h = min(valid_size, h - y)
-                    target_w = min(valid_size, w - x)
+                    out_y0 = max(y, 0)
+                    out_x0 = max(x, 0)
+                    out_y1 = min(y + valid_size, h)
+                    out_x1 = min(x + valid_size, w)
+                    target_h = max(0, out_y1 - out_y0)
+                    target_w = max(0, out_x1 - out_x0)
                     if fill_skipped_tiles == 'zero':
                         # zero-fill: leave sums unchanged (already zero)
                         pass
@@ -482,17 +493,27 @@ def process_single_scene(
             if out_depth.ndim == 4 and out_depth.shape[1] == 1:
                 out_depth = out_depth.squeeze(1)
 
-            target_h = min(valid_size, h - y)
-            target_w = min(valid_size, w - x)
+            out_y0 = max(y, 0)
+            out_x0 = max(x, 0)
+            out_y1 = min(y + valid_size, h)
+            out_x1 = min(x + valid_size, w)
+            target_h = out_y1 - out_y0
+            target_w = out_x1 - out_x0
             if target_h <= 0 or target_w <= 0:
                 continue
 
-            mask_slice = patch_weight_mask[:target_h, :target_w]
+            src_y0 = out_y0 - y
+            src_x0 = out_x0 - x
+            mask_slice = patch_weight_mask[src_y0:src_y0 + target_h, src_x0:src_x0 + target_w]
 
-            est_hs_sum[:, y:y + target_h, x:x + target_w] += out_hs[0, :, :target_h, :target_w] * mask_slice
-            est_hs_weight[:, y:y + target_h, x:x + target_w] += mask_slice
-            est_depth_sum[y:y + target_h, x:x + target_w] += out_depth[0, :target_h, :target_w] * mask_slice
-            est_depth_weight[y:y + target_h, x:x + target_w] += mask_slice
+            est_hs_sum[:, out_y0:out_y1, out_x0:out_x1] += (
+                out_hs[0, :, src_y0:src_y0 + target_h, src_x0:src_x0 + target_w] * mask_slice
+            )
+            est_hs_weight[:, out_y0:out_y1, out_x0:out_x1] += mask_slice
+            est_depth_sum[out_y0:out_y1, out_x0:out_x1] += (
+                out_depth[0, src_y0:src_y0 + target_h, src_x0:src_x0 + target_w] * mask_slice
+            )
+            est_depth_weight[out_y0:out_y1, out_x0:out_x1] += mask_slice
 
     final_hs_norm = est_hs_sum / (est_hs_weight + 1e-8)
     final_depth_ips = est_depth_sum / (est_depth_weight + 1e-8)
@@ -604,6 +625,8 @@ def process_single_scene(
         f.write("est_hs_model_raw.png=raw stitched model output; skipped/uncovered areas remain black\n")
         f.write("est_hs_foreground.png=raw model output multiplied by valid depth mask\n")
         f.write(f"stitch_coverage_ratio={stitch_coverage_ratio:.6f}\n")
+        f.write(f"tile_offset_y={tile_offset_y}\n")
+        f.write(f"tile_offset_x={tile_offset_x}\n")
 
     plt.imsave(os.path.join(scene_out_dir, 'stitch_weight_map.png'), stitch_weight_map, cmap='viridis')
 
@@ -961,6 +984,10 @@ def build_args() -> argparse.Namespace:
                         help='Save .npy arrays and extended diagnostic metrics')
     parser.add_argument('--stride', type=int, default=-1,
                         help='Tile stride override (-1 = auto = valid_size // 2)')
+    parser.add_argument('--tile_offset_y', type=int, default=0,
+                        help='Diagnostic tile-grid offset in y pixels; default keeps original stitching')
+    parser.add_argument('--tile_offset_x', type=int, default=0,
+                        help='Diagnostic tile-grid offset in x pixels; default keeps original stitching')
     parser.add_argument('--measurement_norm_override', type=str, default='checkpoint',
                         choices=['checkpoint', 'none', 'per_sample_mean_std', 'per_sample_minmax'],
                         help='Override dodo_measurement_norm for inference')
@@ -1064,6 +1091,8 @@ def main():
                 stride_override=args.stride,
                 min_tile_valid_ratio=args.min_tile_valid_ratio,
                 fill_skipped_tiles=args.fill_skipped_tiles,
+                tile_offset_y=args.tile_offset_y,
+                tile_offset_x=args.tile_offset_x,
             )
             all_results.append(results)
         except Exception as e:

@@ -31,7 +31,7 @@ def _build_wave_lengths(wave_lengths: Optional[torch.Tensor]) -> torch.Tensor:
 
 def _phase_scale(phase_scale_mode: str) -> float:
     if phase_scale_mode == "legacy_doe":
-        return 20.0 * m.pi
+        return 2.0 * m.pi
     if phase_scale_mode == "legacy_free":
         return 2.0 * m.pi
     raise ValueError("phase_scale_mode must be 'legacy_doe' or 'legacy_free'")
