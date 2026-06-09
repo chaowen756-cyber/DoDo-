@@ -42,6 +42,7 @@ build/
 # ============================================================
 Baek数据集/
 data/
+experiments/
 infer_results/
 result/
 

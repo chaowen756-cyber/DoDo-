@@ -182,6 +182,11 @@ def visualize_hyperspectral(
     return float(p_min), float(p_max)
 
 
+def composite_hs_background(est_hs: np.ndarray, gt_hs: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    mask = (valid_mask > 0.5).astype(np.float32)[..., None]
+    return est_hs * mask + gt_hs * (1.0 - mask)
+
+
 def visualize_depth(depth_data: np.ndarray, save_path: str, vmin: Optional[float], vmax: Optional[float]):
     plt.imsave(save_path, depth_data, cmap='inferno', vmin=vmin, vmax=vmax)
 
@@ -229,6 +234,27 @@ def choose_checkpoint(ckpt_path: str) -> str:
     chosen = ckpt_files[0]
     print(f"Checkpoint selected by latest mtime: {chosen}")
     return chosen
+
+
+def safe_path_name(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.=-]+", "_", name.strip())
+    return name.strip("_") or "infer"
+
+
+def infer_experiment_root_from_ckpt(real_ckpt_path: str) -> str:
+    ckpt_dir = os.path.dirname(os.path.abspath(real_ckpt_path))
+    if os.path.basename(ckpt_dir) == "checkpoints":
+        parent = os.path.dirname(ckpt_dir)
+        if os.path.basename(parent) == "artifacts":
+            return os.path.dirname(parent)
+    return os.path.dirname(ckpt_dir)
+
+
+def auto_output_dir(real_ckpt_path: str, input_folder: str) -> str:
+    exp_root = infer_experiment_root_from_ckpt(real_ckpt_path)
+    ckpt_name = safe_path_name(os.path.splitext(os.path.basename(real_ckpt_path))[0])
+    scene_tag = safe_path_name(os.path.basename(os.path.normpath(input_folder)))
+    return os.path.join(exp_root, "inference", f"{ckpt_name}_{scene_tag}")
 
 
 def load_model(real_ckpt_path: str, device: torch.device) -> SnapshotDepthHS:
@@ -473,6 +499,9 @@ def process_single_scene(
 
     final_hs_norm = torch.nan_to_num(final_hs_norm, 0.0).cpu().numpy().transpose(1, 2, 0)
     final_depth_ips = torch.nan_to_num(final_depth_ips, 0.0).cpu().numpy()
+    stitch_weight_map = est_depth_weight.cpu().numpy()
+    stitch_coverage = stitch_weight_map > 1e-7
+    stitch_coverage_ratio = float(stitch_coverage.mean())
 
     est_depth_real = ips_to_metric_np(final_depth_ips, min_depth, max_depth)
 
@@ -487,6 +516,7 @@ def process_single_scene(
         print(f"  {gt_bins[i]:.2f}-{gt_bins[i+1]:.2f}      {gt_pct[i]:6.2f}     {pred_pct[i]:6.2f}")
 
     print(f"  [Result Info] Pred Depth Range: [{est_depth_real.min():.4f}m, {est_depth_real.max():.4f}m]")
+    print(f"  [Stitching] Covered pixels: {stitch_coverage_ratio:.4f}")
 
     mse_real = calculate_masked_mse(depth_gt_raw, est_depth_real, valid_mask)
     rmse_real = float(np.sqrt(mse_real)) if not np.isnan(mse_real) else float('nan')
@@ -523,8 +553,36 @@ def process_single_scene(
     if rgb_p_max - rgb_p_min < 1e-6:
         rgb_p_max = rgb_p_min + 1.0
 
+    final_hs_foreground = final_hs_norm * (valid_mask > 0.5).astype(np.float32)[..., None]
+    final_hs_gt_background = composite_hs_background(final_hs_norm, hs_norm, valid_mask)
+
+    # Raw model output keeps uncovered/skipped tiles as zero. This is the honest model/stitching tensor.
     visualize_hyperspectral(
         torch.from_numpy(final_hs_norm).permute(2, 0, 1),
+        os.path.join(scene_out_dir, 'est_hs_model_raw.png'),
+        bands=rgb_bands,
+        p_min=rgb_p_min,
+        p_max=rgb_p_max,
+    )
+    # Foreground-only view matches the training/evaluation mask.
+    visualize_hyperspectral(
+        torch.from_numpy(final_hs_foreground).permute(2, 0, 1),
+        os.path.join(scene_out_dir, 'est_hs_foreground.png'),
+        bands=rgb_bands,
+        p_min=rgb_p_min,
+        p_max=rgb_p_max,
+    )
+    # Visual inspection composite: model foreground + original HS background.
+    # This is not used for metrics; it avoids mistaking masked/skipped background for a reconstruction failure.
+    visualize_hyperspectral(
+        torch.from_numpy(final_hs_gt_background).permute(2, 0, 1),
+        os.path.join(scene_out_dir, 'est_hs_gt_background.png'),
+        bands=rgb_bands,
+        p_min=rgb_p_min,
+        p_max=rgb_p_max,
+    )
+    visualize_hyperspectral(
+        torch.from_numpy(final_hs_gt_background).permute(2, 0, 1),
         os.path.join(scene_out_dir, 'est_hs.png'),
         bands=rgb_bands,
         p_min=rgb_p_min,
@@ -542,6 +600,12 @@ def process_single_scene(
         f.write(f"rgb_bands={rgb_bands}\n")
         f.write(f"rgb_percentile_min={rgb_p_min:.6f}\n")
         f.write(f"rgb_percentile_max={rgb_p_max:.6f}\n")
+        f.write("est_hs.png=est_hs_gt_background.png (model foreground + GT HS background for visualization only)\n")
+        f.write("est_hs_model_raw.png=raw stitched model output; skipped/uncovered areas remain black\n")
+        f.write("est_hs_foreground.png=raw model output multiplied by valid depth mask\n")
+        f.write(f"stitch_coverage_ratio={stitch_coverage_ratio:.6f}\n")
+
+    plt.imsave(os.path.join(scene_out_dir, 'stitch_weight_map.png'), stitch_weight_map, cmap='viridis')
 
     # Compute skipped pixel ratio
     skipped_pixel_ratio = 0.0
@@ -551,11 +615,10 @@ def process_single_scene(
     # Diagnostic outputs
     scenario_metrics = {'scene_name': scene_name,
                         'total_tiles': total_tiles, 'skipped_tiles': skipped_tile_count,
-                        'skipped_pixel_ratio': skipped_pixel_ratio}
+                        'skipped_pixel_ratio': skipped_pixel_ratio,
+                        'stitch_coverage_ratio': stitch_coverage_ratio}
     if diagnostic_dump:
         print('  [Diag] Saving diagnostic metrics...')
-        sw = est_depth_weight.cpu().numpy()
-        plt.imsave(os.path.join(scene_out_dir, 'stitch_weight_map.png'), sw, cmap='viridis')
 
         # Full scene metrics CSV
         with open(os.path.join(scene_out_dir, 'metrics_full_scene.csv'), 'w') as f:
@@ -881,7 +944,12 @@ def build_args() -> argparse.Namespace:
         default=os.path.join(script_dir, 'data', 'Hyperspectral_LearnedDepth', 'version_55', 'checkpoints'),
         help='checkpoint file or directory',
     )
-    parser.add_argument('--output_dir', type=str, default=os.path.join(script_dir, 'infer_results'))
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='auto',
+        help='Output directory. Use auto to save under the checkpoint experiment folder.',
+    )
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--depth_min', type=float, default=0.4)
     parser.add_argument('--depth_max', type=float, default=2.0)
@@ -911,7 +979,6 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     input_folder = resolve_path(args.input_folder, script_dir)
     ckpt_path = resolve_path(args.ckpt_path, script_dir)
-    output_dir = resolve_path(args.output_dir, script_dir)
 
     if args.device == 'cuda' and torch.cuda.is_available():
         device = torch.device('cuda')
@@ -924,12 +991,16 @@ def main():
     print(f'Using device: {device}')
     print(f'Input folder: {input_folder}')
     print(f'Checkpoint path: {ckpt_path}')
-    print(f'Output dir: {output_dir}')
 
     if not os.path.isdir(input_folder):
         raise FileNotFoundError(f'Input folder not found: {input_folder}')
 
     real_ckpt_path = choose_checkpoint(ckpt_path)
+    if args.output_dir == 'auto':
+        output_dir = auto_output_dir(real_ckpt_path, input_folder)
+    else:
+        output_dir = resolve_path(args.output_dir, script_dir)
+    print(f'Output dir: {output_dir}')
     print(f'Loading model from: {real_ckpt_path}')
     model = load_model(real_ckpt_path, device)
 

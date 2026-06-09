@@ -1276,8 +1276,8 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--bayer', dest='bayer', action='store_true')
         parser.add_argument('--no-bayer', dest='bayer', action='store_false')
         parser.set_defaults(bayer=False)
-        parser.add_argument('--checkpoint_monitor', type=str, default='validation/psnr_hs_masked')
-        parser.add_argument('--checkpoint_mode', type=str, default='max')
+        parser.add_argument('--checkpoint_monitor', type=str, default='val_loss')
+        parser.add_argument('--checkpoint_mode', type=str, default='min')
         parser.add_argument('--artifact_root', type=str, default='',
                             help='单一实验产物根目录；所有 metrics/PNG/logs 保存于此')
         parser.add_argument('--require_artifact_root', dest='require_artifact_root', action='store_true',

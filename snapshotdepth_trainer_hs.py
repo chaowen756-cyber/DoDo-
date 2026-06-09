@@ -221,7 +221,7 @@ def main(args):
     print(f'[artifact] resolved root={artifact_dir}')
     print(f'[artifact] checkpoint dir={ckpt_dir}')
 
-    # --- Checkpoint callbacks (PSNR-best + Depth-MAE-best) ---
+    # --- Checkpoint callbacks (Joint-best + Depth-MAE-best) ---
     # Use artifact_dir for checkpoint storage with stable filenames (no fake 0.0000 metric values).
     ckpt_monitor = getattr(args, 'checkpoint_monitor', 'validation/psnr_hs_masked')
     ckpt_mode = getattr(args, 'checkpoint_mode', 'max')
@@ -229,7 +229,7 @@ def main(args):
         checkpoint_callback = ModelCheckpoint(
             monitor=ckpt_monitor,
             dirpath=ckpt_dir,
-            filename='psnr-best-{epoch:03d}',
+            filename='joint-best-{epoch:03d}',
             save_top_k=1,
             mode=ckpt_mode,
             verbose=True,
@@ -238,7 +238,7 @@ def main(args):
         checkpoint_callback = ModelCheckpoint(
             verbose=True,
             monitor=ckpt_monitor,
-            filepath=os.path.join(ckpt_dir, 'psnr-best-{epoch:03d}'),
+            filepath=os.path.join(ckpt_dir, 'joint-best-{epoch:03d}'),
             save_top_k=1,
             mode=ckpt_mode,
         )
