@@ -100,10 +100,14 @@ def discover_scene_folders(base_dir: str) -> List[str]:
 
 
 def score_window(valid_ratio: float, center_valid_ratio: float, depth_range_ips: float,
-                 min_depth_range_ips: float) -> float:
+                 min_depth_range_ips: float, far_ratio: float = 0.0,
+                 very_far_ratio: float = 0.0, far_score_boost: float = 0.0,
+                 very_far_score_boost: float = 0.0) -> float:
     range_scale = depth_range_ips / max(min_depth_range_ips, 1e-6)
     range_scale = min(range_scale, 2.5)
-    return float(valid_ratio * (0.5 + 0.5 * center_valid_ratio) * range_scale)
+    base_score = valid_ratio * (0.5 + 0.5 * center_valid_ratio) * range_scale
+    far_boost = 1.0 + far_score_boost * far_ratio + very_far_score_boost * very_far_ratio
+    return float(base_score * max(far_boost, 1e-6))
 
 
 def build_index_for_scene(
@@ -118,6 +122,10 @@ def build_index_for_scene(
     min_depth_range_ips: float,
     center_fraction: float,
     min_center_valid_ratio: float,
+    far_depth_threshold: float,
+    very_far_depth_threshold: float,
+    far_score_boost: float,
+    very_far_score_boost: float,
 ) -> Tuple[Dict[str, List], Dict]:
     if depth_raw.ndim == 3:
         depth_raw = np.squeeze(depth_raw)
@@ -152,6 +160,8 @@ def build_index_for_scene(
         "valid_ratios": [],
         "center_valid_ratios": [],
         "depth_ranges_ips": [],
+        "far_ratios": [],
+        "very_far_ratios": [],
     }
 
     total_windows = 0
@@ -187,14 +197,30 @@ def build_index_for_scene(
                 continue
             pass_range += 1
 
+            patch_depth = depth_m[top:top + patch_size, left:left + patch_size]
+            valid_depth = patch_depth[patch_valid]
+            far_ratio = float(np.mean(valid_depth >= far_depth_threshold))
+            very_far_ratio = float(np.mean(valid_depth >= very_far_depth_threshold))
+
             out["scene_ids"].append(scene_id)
             out["tops"].append(top)
             out["lefts"].append(left)
             out["valid_ratios"].append(valid_ratio)
             out["center_valid_ratios"].append(center_valid_ratio)
             out["depth_ranges_ips"].append(depth_range_ips)
+            out["far_ratios"].append(far_ratio)
+            out["very_far_ratios"].append(very_far_ratio)
             out["scores"].append(
-                score_window(valid_ratio, center_valid_ratio, depth_range_ips, min_depth_range_ips)
+                score_window(
+                    valid_ratio,
+                    center_valid_ratio,
+                    depth_range_ips,
+                    min_depth_range_ips,
+                    far_ratio=far_ratio,
+                    very_far_ratio=very_far_ratio,
+                    far_score_boost=far_score_boost,
+                    very_far_score_boost=very_far_score_boost,
+                )
             )
 
     valid_values = depth_m[valid]
@@ -232,6 +258,10 @@ def main() -> None:
     parser.add_argument("--min_depth_range_ips", type=float, default=0.06)
     parser.add_argument("--center_fraction", type=float, default=0.5)
     parser.add_argument("--min_center_valid_ratio", type=float, default=0.10)
+    parser.add_argument("--far_depth_threshold", type=float, default=1.4)
+    parser.add_argument("--very_far_depth_threshold", type=float, default=1.6)
+    parser.add_argument("--far_score_boost", type=float, default=0.0)
+    parser.add_argument("--very_far_score_boost", type=float, default=0.0)
     parser.add_argument("--use_exr_cache", action="store_true", default=True)
     parser.add_argument("--no-use_exr_cache", dest="use_exr_cache", action="store_false")
     parser.add_argument("--exr_cache_dir", type=str, default="")
@@ -258,7 +288,11 @@ def main() -> None:
                 f"patch{args.patch_size}_stride{args.stride}"
                 f"_valid{int(round(args.min_valid_ratio * 100)):02d}"
                 f"_range{int(round(args.min_depth_range_ips * 1000)):03d}"
-                f"_center{int(round(args.min_center_valid_ratio * 100)):02d}_v1.npz"
+                f"_center{int(round(args.min_center_valid_ratio * 100)):02d}"
+                f"_far{int(round(args.far_depth_threshold * 100)):03d}"
+                f"b{int(round(args.far_score_boost * 10)):02d}"
+                f"_vfar{int(round(args.very_far_depth_threshold * 100)):03d}"
+                f"b{int(round(args.very_far_score_boost * 10)):02d}_v1.npz"
             ),
         )
     output = os.path.abspath(output)
@@ -276,6 +310,8 @@ def main() -> None:
         "valid_ratios": [],
         "center_valid_ratios": [],
         "depth_ranges_ips": [],
+        "far_ratios": [],
+        "very_far_ratios": [],
     }
     scene_stats = []
 
@@ -300,6 +336,10 @@ def main() -> None:
             min_depth_range_ips=args.min_depth_range_ips,
             center_fraction=args.center_fraction,
             min_center_valid_ratio=args.min_center_valid_ratio,
+            far_depth_threshold=args.far_depth_threshold,
+            very_far_depth_threshold=args.very_far_depth_threshold,
+            far_score_boost=args.far_score_boost,
+            very_far_score_boost=args.very_far_score_boost,
         )
         append_scene(all_candidates, scene_candidates)
         scene_stats.append(stats)
@@ -322,8 +362,17 @@ def main() -> None:
         "min_depth_range_ips": args.min_depth_range_ips,
         "center_fraction": args.center_fraction,
         "min_center_valid_ratio": args.min_center_valid_ratio,
+        "far_depth_threshold": args.far_depth_threshold,
+        "very_far_depth_threshold": args.very_far_depth_threshold,
+        "far_score_boost": args.far_score_boost,
+        "very_far_score_boost": args.very_far_score_boost,
         "valid_mask_rule": "finite(depth_m) and depth_m > min_depth - valid_eps",
         "depth_range_rule": "range(metric_to_ips(depth_m, min_depth, max_depth).clip(0, 1)) over valid pixels",
+        "score_rule": (
+            "base_score * (1 + far_score_boost * far_ratio "
+            "+ very_far_score_boost * very_far_ratio); "
+            "far ratios are measured over valid pixels only"
+        ),
         "scene_stats": scene_stats,
     }
 
@@ -336,6 +385,8 @@ def main() -> None:
         valid_ratios=np.asarray(all_candidates["valid_ratios"], dtype=np.float32),
         center_valid_ratios=np.asarray(all_candidates["center_valid_ratios"], dtype=np.float32),
         depth_ranges_ips=np.asarray(all_candidates["depth_ranges_ips"], dtype=np.float32),
+        far_ratios=np.asarray(all_candidates["far_ratios"], dtype=np.float32),
+        very_far_ratios=np.asarray(all_candidates["very_far_ratios"], dtype=np.float32),
         meta_json=np.asarray(json.dumps(meta, ensure_ascii=False)),
     )
 
