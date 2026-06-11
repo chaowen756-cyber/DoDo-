@@ -529,12 +529,27 @@ def process_single_scene(
     num_bins = 8
     gt_bins, gt_pct, _ = compute_depth_histogram(depth_gt_raw, valid_mask, min_depth, max_depth, num_bins)
     _, pred_pct, _ = compute_depth_histogram(est_depth_real, valid_mask, min_depth, max_depth, num_bins)
+    depth_distribution_rows = []
+    depth_distribution_lines = [
+        "[Depth Distribution Analysis]",
+        "Range (m)      GT (%)     Pred (%)",
+        "----------------------------------",
+    ]
 
     print('\n  [Depth Distribution Analysis]')
     print('  Range (m)      GT (%)     Pred (%)')
     print('  ----------------------------------')
     for i in range(num_bins):
-        print(f"  {gt_bins[i]:.2f}-{gt_bins[i+1]:.2f}      {gt_pct[i]:6.2f}     {pred_pct[i]:6.2f}")
+        row = {
+            'bin_start_m': float(gt_bins[i]),
+            'bin_end_m': float(gt_bins[i + 1]),
+            'gt_percent': float(gt_pct[i]),
+            'pred_percent': float(pred_pct[i]),
+        }
+        depth_distribution_rows.append(row)
+        line = f"{gt_bins[i]:.2f}-{gt_bins[i+1]:.2f}      {gt_pct[i]:6.2f}     {pred_pct[i]:6.2f}"
+        depth_distribution_lines.append(line)
+        print(f"  {line}")
 
     print(f"  [Result Info] Pred Depth Range: [{est_depth_real.min():.4f}m, {est_depth_real.max():.4f}m]")
     print(f"  [Stitching] Covered pixels: {stitch_coverage_ratio:.4f}")
@@ -563,6 +578,16 @@ def process_single_scene(
 
     scene_out_dir = os.path.join(output_dir, scene_name)
     os.makedirs(scene_out_dir, exist_ok=True)
+
+    with open(os.path.join(scene_out_dir, 'depth_distribution_analysis.txt'), 'w') as f:
+        f.write('\n'.join(depth_distribution_lines) + '\n')
+    with open(os.path.join(scene_out_dir, 'depth_distribution_analysis.csv'), 'w') as f:
+        f.write('bin_start_m,bin_end_m,gt_percent,pred_percent\n')
+        for row in depth_distribution_rows:
+            f.write(
+                f"{row['bin_start_m']:.6f},{row['bin_end_m']:.6f},"
+                f"{row['gt_percent']:.6f},{row['pred_percent']:.6f}\n"
+            )
 
     visualize_depth(est_depth_real, os.path.join(scene_out_dir, 'est_depth_fixed_scale.png'), vmin=min_depth, vmax=max_depth)
     visualize_depth(depth_gt_raw, os.path.join(scene_out_dir, 'gt_depth_fixed_scale.png'), vmin=min_depth, vmax=max_depth)
@@ -627,6 +652,8 @@ def process_single_scene(
         f.write(f"stitch_coverage_ratio={stitch_coverage_ratio:.6f}\n")
         f.write(f"tile_offset_y={tile_offset_y}\n")
         f.write(f"tile_offset_x={tile_offset_x}\n")
+        f.write("\n")
+        f.write('\n'.join(depth_distribution_lines) + '\n')
 
     plt.imsave(os.path.join(scene_out_dir, 'stitch_weight_map.png'), stitch_weight_map, cmap='viridis')
 
@@ -639,7 +666,8 @@ def process_single_scene(
     scenario_metrics = {'scene_name': scene_name,
                         'total_tiles': total_tiles, 'skipped_tiles': skipped_tile_count,
                         'skipped_pixel_ratio': skipped_pixel_ratio,
-                        'stitch_coverage_ratio': stitch_coverage_ratio}
+                        'stitch_coverage_ratio': stitch_coverage_ratio,
+                        'depth_distribution': depth_distribution_rows}
     if diagnostic_dump:
         print('  [Diag] Saving diagnostic metrics...')
 
