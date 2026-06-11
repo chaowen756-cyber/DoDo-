@@ -80,13 +80,26 @@ class SnapshotDepthHS(pl.LightningModule):
 #     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure=None, on_tpu=False,
 #                        using_native_amp=False, using_lbfgs=False):
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, **kwargs):
-        if self.trainer.global_step < 54:
-            lr_scale = min(1., float(self.trainer.global_step + 1) / 54.)
-            for pg in optimizer.param_groups:
-                if pg.get('name') == 'optics':
-                    pg['lr'] = lr_scale * self.hparams.optics_lr
-                else:
-                    pg['lr'] = lr_scale * self.hparams.cnn_lr
+        lr_decay_strategy = str(getattr(self.hparams, 'lr_decay_strategy', 'none'))
+        current_epoch = int(getattr(self.trainer, 'current_epoch', epoch))
+        warmup_steps = int(getattr(self.hparams, 'lr_warmup_steps', 54))
+        warmup_scale = 1.0
+        if warmup_steps > 0 and self.trainer.global_step < warmup_steps:
+            warmup_scale = min(1., float(self.trainer.global_step + 1) / float(warmup_steps))
+
+        for pg in optimizer.param_groups:
+            if pg.get('name') == 'optics':
+                base_lr = self.hparams.optics_lr
+                decay_epochs = int(getattr(self.hparams, 'optics_lr_decay_epochs', 10))
+            else:
+                base_lr = self.hparams.cnn_lr
+                decay_epochs = int(getattr(self.hparams, 'cnn_lr_decay_epochs', 20))
+
+            decay_scale = 1.0
+            if lr_decay_strategy == 'baek' and decay_epochs > 0:
+                decay_scale = 0.1 ** (current_epoch // decay_epochs)
+            pg['lr'] = warmup_scale * decay_scale * base_lr
+
         optimizer.step(closure=optimizer_closure)
         if self.hparams.optimize_optics and hasattr(self.camera, 'clamp_parameters_'):
             self.camera.clamp_parameters_()
@@ -1225,6 +1238,15 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--summary_track_train_every', type=int, default=4000)
         parser.add_argument('--cnn_lr', type=float, default=1e-4)
         parser.add_argument('--optics_lr', type=float, default=1e-9)
+        parser.add_argument('--lr_decay_strategy', type=str, default='none',
+                            choices=['none', 'baek'],
+                            help='学习率衰减策略；baek=optics每10epoch*0.1，CNN每20epoch*0.1')
+        parser.add_argument('--lr_warmup_steps', type=int, default=54,
+                            help='线性warmup步数；0=关闭')
+        parser.add_argument('--optics_lr_decay_epochs', type=int, default=10,
+                            help='baek策略下optics学习率每隔多少epoch乘0.1')
+        parser.add_argument('--cnn_lr_decay_epochs', type=int, default=20,
+                            help='baek策略下CNN学习率每隔多少epoch乘0.1')
         parser.add_argument('--batch_sz', type=int, default=2)
         parser.add_argument('--num_workers', type=int, default=8)
         parser.add_argument('--randcrop', default=False, action='store_true')
