@@ -95,6 +95,30 @@ def prepare_data(hparams):
         )
         print(f'[data] auto patch_index_path: {patch_index_path}')
 
+    train_samples_per_epoch = int(getattr(hparams, 'train_samples_per_epoch', 0) or 0)
+    if getattr(hparams, 'baek_patch_epoch', False):
+        if train_samples_per_epoch > 0 and train_samples_per_epoch != 6143:
+            print(f'[data] --baek_patch_epoch overrides train_samples_per_epoch='
+                  f'{train_samples_per_epoch} -> 6143')
+        train_samples_per_epoch = 6143
+        setattr(hparams, 'train_samples_per_epoch', train_samples_per_epoch)
+
+    if train_samples_per_epoch > 0:
+        batch_sz = max(1, int(getattr(hparams, 'batch_sz', 1)))
+        steps_per_epoch = (train_samples_per_epoch + batch_sz - 1) // batch_sz
+        print(f'[data] patch-epoch mode: train_samples_per_epoch={train_samples_per_epoch}, '
+              f'batch_sz={batch_sz}, estimated_train_steps_per_epoch={steps_per_epoch}')
+
+    val_patch_eval_arg = getattr(hparams, 'val_patch_eval', None)
+    if val_patch_eval_arg is None:
+        val_patch_eval = bool(getattr(hparams, 'baek_patch_epoch', False))
+    else:
+        val_patch_eval = bool(val_patch_eval_arg)
+    val_samples_per_epoch = int(getattr(hparams, 'val_samples_per_epoch', 0) or 0)
+    if val_patch_eval:
+        print(f'[data] fixed validation patch-index mode enabled; '
+              f'val_samples_per_epoch={val_samples_per_epoch or "all"}')
+
     train_dataset = HyperspectralDepthDataset(
         base_dir=hparams.data_root,
         scene_folders=train_folders,
@@ -118,6 +142,7 @@ def prepare_data(hparams):
         patch_index_weighted=getattr(hparams, 'patch_index_weighted', False),
         patch_index_use_meta_thresholds=getattr(hparams, 'patch_index_use_meta_thresholds', True),
         min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
+        samples_per_epoch=train_samples_per_epoch,
     )
 
     val_dataset = HyperspectralDepthDataset(
@@ -137,12 +162,14 @@ def prepare_data(hparams):
         min_depth_range_ips=getattr(hparams, 'min_depth_range_ips', 0.10),
         max_crop_retries=getattr(hparams, 'max_crop_retries', 8),
         patch_filter_stride=getattr(hparams, 'patch_filter_stride', 4),
-        patch_index_path='',
-        patch_index_jitter=getattr(hparams, 'patch_index_jitter', 16),
+        patch_index_path=patch_index_path if val_patch_eval else '',
+        patch_index_jitter=0 if val_patch_eval else getattr(hparams, 'patch_index_jitter', 16),
         patch_index_strict=getattr(hparams, 'patch_index_strict', True),
         patch_index_weighted=getattr(hparams, 'patch_index_weighted', False),
         patch_index_use_meta_thresholds=getattr(hparams, 'patch_index_use_meta_thresholds', True),
         min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
+        samples_per_epoch=val_samples_per_epoch,
+        eval_patch_index=val_patch_eval,
     )
 
     train_dataloader = DataLoader(train_dataset, batch_size=hparams.batch_sz,

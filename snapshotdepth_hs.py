@@ -1262,6 +1262,18 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--no-patch_index_use_meta_thresholds', dest='patch_index_use_meta_thresholds',
                             action='store_false')
         parser.set_defaults(patch_index_use_meta_thresholds=True)
+        parser.add_argument('--train_samples_per_epoch', type=int, default=0,
+                            help='训练时每个epoch抽取的虚拟patch数；0=按真实scene数量')
+        parser.add_argument('--baek_patch_epoch', dest='baek_patch_epoch', action='store_true',
+                            help='Baek-style patch epoch：每个训练epoch按当前候选池规模抽取6143个patch')
+        parser.add_argument('--no-baek_patch_epoch', dest='baek_patch_epoch', action='store_false')
+        parser.set_defaults(baek_patch_epoch=False)
+        parser.add_argument('--val_patch_eval', dest='val_patch_eval', action='store_true',
+                            help='验证时使用固定patch候选池，而不是每个val scene的中心crop')
+        parser.add_argument('--no-val_patch_eval', dest='val_patch_eval', action='store_false')
+        parser.set_defaults(val_patch_eval=None)
+        parser.add_argument('--val_samples_per_epoch', type=int, default=0,
+                            help='固定patch验证时每个epoch评估的patch数；0=使用全部匹配val候选')
         parser.add_argument('--depth_loss_weight', type=float, default=0.03)
         parser.add_argument('--image_loss_weight', type=float, default=1.0)
         parser.add_argument('--psf_loss_weight', type=float, default=1.0)

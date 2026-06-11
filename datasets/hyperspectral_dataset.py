@@ -72,7 +72,9 @@ class HyperspectralDepthDataset(Dataset):
                  patch_index_path: str = '', patch_index_jitter: int = 16,
                  patch_index_strict: bool = True, patch_index_weighted: bool = False,
                  patch_index_use_meta_thresholds: bool = True,
-                 min_center_valid_ratio: float = 0.0):
+                 min_center_valid_ratio: float = 0.0,
+                 samples_per_epoch: int = 0,
+                 eval_patch_index: bool = False):
         
         super().__init__()
         self.is_training = is_training
@@ -102,8 +104,11 @@ class HyperspectralDepthDataset(Dataset):
         self.patch_index_strict = bool(patch_index_strict)
         self.patch_index_weighted = bool(patch_index_weighted)
         self.patch_index_use_meta_thresholds = bool(patch_index_use_meta_thresholds)
+        self.samples_per_epoch = max(0, int(samples_per_epoch or 0))
+        self.eval_patch_index = bool(eval_patch_index and not self.is_training)
         self.patch_index_by_id: Dict[str, Dict[str, torch.Tensor]] = {}
         self.patch_index_meta: Dict = {}
+        self.patch_index_windows: List[Tuple[str, int, int]] = []
 
         self.use_exr_cache = use_exr_cache
         if not exr_cache_dir:
@@ -135,11 +140,30 @@ class HyperspectralDepthDataset(Dataset):
             else:
                 # 仅在调试时打印，避免刷屏
                 pass
+        self.sample_by_id = {sample['id']: sample for sample in self.sample_pairs}
 
-        if self.patch_filter and self.patch_index_path:
+        if (self.patch_filter or self.eval_patch_index) and self.patch_index_path:
             self._load_patch_index(self.patch_index_path)
 
+        if self.eval_patch_index:
+            print(
+                f"[Dataset] fixed eval patch-index mode: "
+                f"windows={len(self.patch_index_windows)}, "
+                f"samples_per_epoch={self.samples_per_epoch or 'all'}"
+            )
+
+        if self.samples_per_epoch > 0:
+            mode = 'train' if self.is_training else 'eval'
+            print(
+                f"[Dataset] virtual {mode} length enabled: "
+                f"samples_per_epoch={self.samples_per_epoch}, scenes={len(self.sample_pairs)}"
+            )
+
     def __len__(self):
+        if self.samples_per_epoch > 0:
+            return self.samples_per_epoch
+        if self.eval_patch_index and self.patch_index_windows:
+            return len(self.patch_index_windows)
         return len(self.sample_pairs)
 
     def _cache_file_path(self, exr_path: str) -> str:
@@ -220,6 +244,11 @@ class HyperspectralDepthDataset(Dataset):
                 'lefts': torch.from_numpy(lefts[idx].copy()).long(),
                 'scores': torch.from_numpy(scene_scores.copy()).float(),
             }
+            if self.eval_patch_index:
+                for i in idx.tolist():
+                    self.patch_index_windows.append(
+                        (scene_id, int(tops[i]), int(lefts[i]))
+                    )
             loaded += int(idx.size)
 
         print(
@@ -321,7 +350,16 @@ class HyperspectralDepthDataset(Dataset):
         return top, left, base_top, base_left
 
     def __getitem__(self, idx):
-        sample = self.sample_pairs[idx]
+        eval_window = None
+        if self.eval_patch_index and self.patch_index_windows:
+            scene_id, top, left = self.patch_index_windows[idx % len(self.patch_index_windows)]
+            sample = self.sample_by_id[scene_id]
+            eval_window = (top, left)
+        else:
+            if self.samples_per_epoch > 0:
+                idx = idx % len(self.sample_pairs)
+            sample = self.sample_pairs[idx]
+
         hs_path = sample['hs_path']
         depth_path = sample['depth_path']
         sample_id = sample['id']
@@ -533,10 +571,17 @@ class HyperspectralDepthDataset(Dataset):
                 mask_tensor = (depth_mask_cat[:, 2:3, :, :] > 0.5).float()
 
         else:
-            hs_tensor = self.centercrop(hs_tensor)
-            depth_tensor = self.centercrop(depth_tensor)
-            depth_metric_tensor = self.centercrop(depth_metric_tensor)
-            mask_tensor = self.centercrop(mask_tensor)
+            if eval_window is not None:
+                top, left = eval_window
+                hs_tensor = self._crop_window(hs_tensor, top, left)
+                depth_tensor = self._crop_window(depth_tensor, top, left)
+                depth_metric_tensor = self._crop_window(depth_metric_tensor, top, left)
+                mask_tensor = self._crop_window(mask_tensor, top, left)
+            else:
+                hs_tensor = self.centercrop(hs_tensor)
+                depth_tensor = self.centercrop(depth_tensor)
+                depth_metric_tensor = self.centercrop(depth_metric_tensor)
+                mask_tensor = self.centercrop(mask_tensor)
 
         # 移除 batch 维度
         hs_tensor = hs_tensor.squeeze(0)               # [C, H, W]
