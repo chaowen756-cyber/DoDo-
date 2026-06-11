@@ -59,6 +59,8 @@ class SnapshotDepthHS(pl.LightningModule):
         self.artifact_root = artifact_root
         self._val_psnr_hs_sum = 0.0
         self._val_mae_depth_m_sum = 0.0
+        self._val_mae_depth_m_abs_sum = 0.0
+        self._val_mae_depth_m_valid_px = 0.0
         self._val_mae_depth_sum = 0.0
         self._val_hs_l1_masked_sum = 0.0
         self._val_depth_tv_sum = 0.0
@@ -313,6 +315,8 @@ class SnapshotDepthHS(pl.LightningModule):
             metric.to(self.device)
         self._val_psnr_hs_sum = 0.0
         self._val_mae_depth_m_sum = 0.0
+        self._val_mae_depth_m_abs_sum = 0.0
+        self._val_mae_depth_m_valid_px = 0.0
         self._val_mae_depth_sum = 0.0
         self._val_hs_l1_masked_sum = 0.0
         self._val_depth_tv_sum = 0.0
@@ -362,10 +366,13 @@ class SnapshotDepthHS(pl.LightningModule):
         if num_valid_px > 0:
             est_m = ips_to_metric(est.clamp(0, 1), self.hparams.min_depth, self.hparams.max_depth)
             tgt_m = ips_to_metric(tgt.clamp(0, 1), self.hparams.min_depth, self.hparams.max_depth)
-            mae_depth_m = (torch.abs(est_m - tgt_m) * final_mask).sum() / num_valid_px
+            abs_depth_err_m = (torch.abs(est_m - tgt_m) * final_mask).sum()
+            mae_depth_m = abs_depth_err_m / num_valid_px
         else:
+            abs_depth_err_m = torch.tensor(0.0, device=est.device)
             mae_depth_m = torch.tensor(float('nan'), device=est.device)
-        self.log('validation/mae_depth_m', mae_depth_m, on_step=False, on_epoch=True)
+        if num_valid_px > 0:
+            self.log('validation/mae_depth_m_batch_avg', mae_depth_m, on_step=False, on_epoch=True)
 
         # Masked HS PSNR (with shape check)
         est_images = outputs.est_images
@@ -417,6 +424,8 @@ class SnapshotDepthHS(pl.LightningModule):
             self._val_psnr_hs_sum += psnr_hs_masked.item()
             if not torch.isnan(mae_depth_m):
                 self._val_mae_depth_m_sum += mae_depth_m.item()
+                self._val_mae_depth_m_abs_sum += abs_depth_err_m.item()
+                self._val_mae_depth_m_valid_px += num_valid_px.item()
             self._val_mae_depth_sum += mae.item()
             self._val_hs_l1_masked_sum += hs_l1_masked.item()
             self._val_depth_tv_sum += depth_tv.item()
@@ -456,7 +465,11 @@ class SnapshotDepthHS(pl.LightningModule):
     def validation_epoch_end(self, outputs):
         n = max(self._val_steps, 1)
         avg_psnr_hs = self._val_psnr_hs_sum / n
-        avg_mae_depth_m = self._val_mae_depth_m_sum / n
+        avg_mae_depth_m_batch = self._val_mae_depth_m_sum / n
+        if self._val_mae_depth_m_valid_px > 0:
+            avg_mae_depth_m = self._val_mae_depth_m_abs_sum / self._val_mae_depth_m_valid_px
+        else:
+            avg_mae_depth_m = float('nan')
         avg_mae_depth = self._val_mae_depth_sum / n
         avg_hs_l1_masked = self._val_hs_l1_masked_sum / n
         avg_depth_tv = self._val_depth_tv_sum / n
@@ -468,10 +481,13 @@ class SnapshotDepthHS(pl.LightningModule):
             float(getattr(self.hparams, 'background_hs_loss_weight', 0.0)) * avg_bg_hs_l1
         )
         self.log('val_loss', torch.tensor(val_loss, device=self.device))
+        self.log('validation/mae_depth_m', torch.tensor(avg_mae_depth_m, device=self.device))
         extra = {
             'val_loss': val_loss,
             'validation/psnr_hs_masked': avg_psnr_hs,
             'validation/mae_depth_m': avg_mae_depth_m,
+            'validation/mae_depth_m_batch_avg': avg_mae_depth_m_batch,
+            'validation/mae_depth_m_valid_px': self._val_mae_depth_m_valid_px,
             'validation/mae_depthmap': avg_mae_depth,
             'validation/hs_l1_masked': avg_hs_l1_masked,
             'validation/depth_tv': avg_depth_tv,

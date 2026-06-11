@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import argparse
+import json
 from typing import Optional, Tuple
 
 import numpy as np
@@ -146,9 +147,15 @@ def compute_depth_histogram(
 
     bin_edges = np.linspace(depth_min, depth_max, num_bins + 1)
     counts, _ = np.histogram(valid_depths, bins=bin_edges)
-    total = counts.sum()
+    total = valid_depths.size
     percentages = counts / max(total, 1) * 100.0
-    return bin_edges, percentages, counts
+    summary = {
+        'total_valid_count': int(total),
+        'in_range_count': int(counts.sum()),
+        'under_range_count': int(np.sum(valid_depths < depth_min)),
+        'over_range_count': int(np.sum(valid_depths > depth_max)),
+    }
+    return bin_edges, percentages, counts, summary
 
 
 def pick_rgb_band_indices(num_channels: int, start_wl: float, end_wl: float) -> Tuple[int, int, int]:
@@ -187,8 +194,32 @@ def composite_hs_background(est_hs: np.ndarray, gt_hs: np.ndarray, valid_mask: n
     return est_hs * mask + gt_hs * (1.0 - mask)
 
 
-def visualize_depth(depth_data: np.ndarray, save_path: str, vmin: Optional[float], vmax: Optional[float]):
-    plt.imsave(save_path, depth_data, cmap='inferno', vmin=vmin, vmax=vmax)
+def visualize_depth(
+    depth_data: np.ndarray,
+    save_path: str,
+    vmin: Optional[float],
+    vmax: Optional[float],
+    valid_mask: Optional[np.ndarray] = None,
+):
+    if valid_mask is None:
+        plt.imsave(save_path, depth_data, cmap='inferno', vmin=vmin, vmax=vmax)
+        return
+
+    mask = valid_mask > 0.5
+    if np.any(mask):
+        valid_depth = depth_data[mask]
+        d_min = float(np.min(valid_depth)) if vmin is None else float(vmin)
+        d_max = float(np.max(valid_depth)) if vmax is None else float(vmax)
+    else:
+        d_min = float(np.min(depth_data)) if vmin is None else float(vmin)
+        d_max = float(np.max(depth_data)) if vmax is None else float(vmax)
+    if d_max - d_min < 1e-6:
+        d_max = d_min + 1.0
+
+    norm = np.clip((depth_data - d_min) / (d_max - d_min), 0.0, 1.0)
+    rgb = plt.get_cmap('inferno')(norm)[..., :3]
+    rgb[~mask] = 0.0
+    plt.imsave(save_path, rgb)
 
 
 def get_cosine_mask(h: int, w: int, device: torch.device) -> torch.Tensor:
@@ -344,6 +375,7 @@ def process_single_scene(
     fill_skipped_tiles: str = 'zero',
     tile_offset_y: int = 0,
     tile_offset_x: int = 0,
+    depth_background: str = 'black',
 ):
     scene_name = os.path.splitext(os.path.basename(hs_path))[0].replace('_hs', '')
     print(f"\nProcessing scene: {scene_name} ...")
@@ -527,8 +559,10 @@ def process_single_scene(
     est_depth_real = ips_to_metric_np(final_depth_ips, min_depth, max_depth)
 
     num_bins = 8
-    gt_bins, gt_pct, _ = compute_depth_histogram(depth_gt_raw, valid_mask, min_depth, max_depth, num_bins)
-    _, pred_pct, _ = compute_depth_histogram(est_depth_real, valid_mask, min_depth, max_depth, num_bins)
+    gt_bins, gt_pct, _, gt_hist_summary = compute_depth_histogram(
+        depth_gt_raw, valid_mask, min_depth, max_depth, num_bins)
+    _, pred_pct, _, pred_hist_summary = compute_depth_histogram(
+        est_depth_real, valid_mask, min_depth, max_depth, num_bins)
     depth_distribution_rows = []
     depth_distribution_lines = [
         "[Depth Distribution Analysis]",
@@ -550,6 +584,37 @@ def process_single_scene(
         line = f"{gt_bins[i]:.2f}-{gt_bins[i+1]:.2f}      {gt_pct[i]:6.2f}     {pred_pct[i]:6.2f}"
         depth_distribution_lines.append(line)
         print(f"  {line}")
+    depth_distribution_lines.extend([
+        "",
+        (
+            "GT counts: "
+            f"valid={gt_hist_summary['total_valid_count']}, "
+            f"in_range={gt_hist_summary['in_range_count']}, "
+            f"under={gt_hist_summary['under_range_count']}, "
+            f"over={gt_hist_summary['over_range_count']}"
+        ),
+        (
+            "Pred counts: "
+            f"valid={pred_hist_summary['total_valid_count']}, "
+            f"in_range={pred_hist_summary['in_range_count']}, "
+            f"under={pred_hist_summary['under_range_count']}, "
+            f"over={pred_hist_summary['over_range_count']}"
+        ),
+    ])
+    print(
+        "  GT counts: "
+        f"valid={gt_hist_summary['total_valid_count']}, "
+        f"in_range={gt_hist_summary['in_range_count']}, "
+        f"under={gt_hist_summary['under_range_count']}, "
+        f"over={gt_hist_summary['over_range_count']}"
+    )
+    print(
+        "  Pred counts: "
+        f"valid={pred_hist_summary['total_valid_count']}, "
+        f"in_range={pred_hist_summary['in_range_count']}, "
+        f"under={pred_hist_summary['under_range_count']}, "
+        f"over={pred_hist_summary['over_range_count']}"
+    )
 
     print(f"  [Result Info] Pred Depth Range: [{est_depth_real.min():.4f}m, {est_depth_real.max():.4f}m]")
     print(f"  [Stitching] Covered pixels: {stitch_coverage_ratio:.4f}")
@@ -589,9 +654,16 @@ def process_single_scene(
                 f"{row['gt_percent']:.6f},{row['pred_percent']:.6f}\n"
             )
 
-    visualize_depth(est_depth_real, os.path.join(scene_out_dir, 'est_depth_fixed_scale.png'), vmin=min_depth, vmax=max_depth)
-    visualize_depth(depth_gt_raw, os.path.join(scene_out_dir, 'gt_depth_fixed_scale.png'), vmin=min_depth, vmax=max_depth)
-    visualize_depth(est_depth_real, os.path.join(scene_out_dir, 'est_depth_auto_scale.png'), vmin=None, vmax=None)
+    depth_vis_mask = valid_mask if depth_background == 'black' else None
+    visualize_depth(
+        est_depth_real, os.path.join(scene_out_dir, 'est_depth_fixed_scale.png'),
+        vmin=min_depth, vmax=max_depth, valid_mask=depth_vis_mask)
+    visualize_depth(
+        depth_gt_raw, os.path.join(scene_out_dir, 'gt_depth_fixed_scale.png'),
+        vmin=min_depth, vmax=max_depth, valid_mask=depth_vis_mask)
+    visualize_depth(
+        est_depth_real, os.path.join(scene_out_dir, 'est_depth_auto_scale.png'),
+        vmin=None, vmax=None, valid_mask=depth_vis_mask)
 
     gt_rgb = hs_norm[..., list(rgb_bands)]
     rgb_p_min = float(np.percentile(gt_rgb, 1))
@@ -649,6 +721,7 @@ def process_single_scene(
         f.write("est_hs.png=est_hs_gt_background.png (model foreground + GT HS background for visualization only)\n")
         f.write("est_hs_model_raw.png=raw stitched model output; skipped/uncovered areas remain black\n")
         f.write("est_hs_foreground.png=raw model output multiplied by valid depth mask\n")
+        f.write(f"depth_background={depth_background}\n")
         f.write(f"stitch_coverage_ratio={stitch_coverage_ratio:.6f}\n")
         f.write(f"tile_offset_y={tile_offset_y}\n")
         f.write(f"tile_offset_x={tile_offset_x}\n")
@@ -667,7 +740,11 @@ def process_single_scene(
                         'total_tiles': total_tiles, 'skipped_tiles': skipped_tile_count,
                         'skipped_pixel_ratio': skipped_pixel_ratio,
                         'stitch_coverage_ratio': stitch_coverage_ratio,
-                        'depth_distribution': depth_distribution_rows}
+                        'depth_distribution': depth_distribution_rows,
+                        'depth_distribution_summary': {
+                            'gt': gt_hist_summary,
+                            'pred': pred_hist_summary,
+                        }}
     if diagnostic_dump:
         print('  [Diag] Saving diagnostic metrics...')
 
@@ -750,7 +827,6 @@ def process_single_scene(
                     f.write(f"{st['y']},{st['x']},{st['valid_ratio']:.6f}\n")
 
         # Save diagnostic metrics JSON (comprehensive)
-        import json
         with open(os.path.join(scene_out_dir, 'diagnostic_metrics.json'), 'w') as f:
             json.dump(scenario_metrics, f, indent=2, default=str)
 
@@ -940,8 +1016,12 @@ def process_roi_direct(model, hs_tensor, depth_ips_tensor, depth_metric_tensor,
     valid_ratio = float(vm_crop.sum() / vm_crop.size)
 
     # Save quicklooks
-    visualize_depth(est_depth_m, os.path.join(out_dir, f'{roi_name}_est_depth_fixed.png'), vmin=min_depth, vmax=max_depth)
-    visualize_depth(gt_d_crop, os.path.join(out_dir, f'{roi_name}_gt_depth_fixed.png'), vmin=min_depth, vmax=max_depth)
+    visualize_depth(
+        est_depth_m, os.path.join(out_dir, f'{roi_name}_est_depth_fixed.png'),
+        vmin=min_depth, vmax=max_depth, valid_mask=vm_crop)
+    visualize_depth(
+        gt_d_crop, os.path.join(out_dir, f'{roi_name}_gt_depth_fixed.png'),
+        vmin=min_depth, vmax=max_depth, valid_mask=vm_crop)
     gt_rgb_crop = gt_hs_crop[..., list(rgb_bands)]
     p_min = float(np.percentile(gt_rgb_crop, 1))
     p_max = float(np.percentile(gt_rgb_crop, 99))
@@ -1024,6 +1104,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument('--fill_skipped_tiles', type=str, default='zero',
                         choices=['zero'],  # gt_background, nearest not yet implemented
                         help='How to fill skipped tiles (zero only for now)')
+    parser.add_argument('--depth_background', type=str, default='black',
+                        choices=['black', 'colormap'],
+                        help='Depth PNG background outside valid_mask')
 
     return parser.parse_args()
 
@@ -1121,6 +1204,7 @@ def main():
                 fill_skipped_tiles=args.fill_skipped_tiles,
                 tile_offset_y=args.tile_offset_y,
                 tile_offset_x=args.tile_offset_x,
+                depth_background=args.depth_background,
             )
             all_results.append(results)
         except Exception as e:
@@ -1166,7 +1250,6 @@ def main():
             'hs_psnr_full_db_median': float(np.median(psnr_f_vals)) if psnr_f_vals else float('nan'),
             'hs_sam_masked_rad_mean': float(np.mean(sam_vals)) if sam_vals else float('nan'),
         }
-        import json
         with open(agg_path, 'w') as f:
             json.dump(agg, f, indent=2)
         print(f'\nAggregate metrics saved to: {agg_path}')
@@ -1230,7 +1313,6 @@ def main():
             # Save ROI diagnostic metrics
             roi_all = {'roi_metrics': r_metrics, 'per_band': r_pb,
                        'depth_baselines': r_db, 'spectral': r_sq, 'region': r_rm}
-            import json
             with open(os.path.join(roi_dir, f'{roi_name}_metrics.json'), 'w') as f:
                 json.dump(roi_all, f, indent=2, default=str)
 
