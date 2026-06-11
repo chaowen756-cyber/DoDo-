@@ -1272,7 +1272,7 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='验证时使用固定patch候选池，而不是每个val scene的中心crop')
         parser.add_argument('--no-val_patch_eval', dest='val_patch_eval', action='store_false')
         parser.set_defaults(val_patch_eval=None)
-        parser.add_argument('--val_samples_per_epoch', type=int, default=0,
+        parser.add_argument('--val_samples_per_epoch', type=int, default=1024,
                             help='固定patch验证时每个epoch评估的patch数；0=使用全部匹配val候选')
         parser.add_argument('--depth_loss_weight', type=float, default=0.03)
         parser.add_argument('--image_loss_weight', type=float, default=1.0)
