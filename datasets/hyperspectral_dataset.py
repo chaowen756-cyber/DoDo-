@@ -440,12 +440,16 @@ class HyperspectralDepthDataset(Dataset):
         # ============================================================
         # 步骤 B: 高光谱图像处理
         # ============================================================
-        hs_image = normalize_hs_image(
-            hs_image,
-            norm_mode=self.hs_norm_mode,
-            norm_scale=self.hs_norm_scale,
-            sanity_threshold=self.hs_sanity_threshold,
-        )
+        # fixed_scale 不依赖整张图的 max。对于明确裁剪窗口的路径，先保留 raw HS，
+        # 后面只归一化实际送入模型的 patch，避免每个样本扫描整张高光谱图。
+        defer_hs_norm = self.hs_norm_mode == 'fixed_scale' and (self.patch_filter or not self.is_training)
+        if not defer_hs_norm:
+            hs_image = normalize_hs_image(
+                hs_image,
+                norm_mode=self.hs_norm_mode,
+                norm_scale=self.hs_norm_scale,
+                sanity_threshold=self.hs_sanity_threshold,
+            )
         
         # ============================================================
         # 步骤 C: 深度图归一化 (【IPS 体系】使用逆深度均匀化)
@@ -488,7 +492,7 @@ class HyperspectralDepthDataset(Dataset):
         # 步骤 D: 转 Tensor 并处理 Transform
         # ============================================================
         # HS: [H, W, C] -> [C, H, W]
-        hs_tensor = torch.from_numpy(hs_image).permute(2, 0, 1).float()
+        hs_tensor = None if defer_hs_norm else torch.from_numpy(hs_image).permute(2, 0, 1).float()
         
         # Depth & Mask: [H, W] -> [1, H, W]
         depth_tensor = torch.from_numpy(depth_map).unsqueeze(0).float()
@@ -496,10 +500,22 @@ class HyperspectralDepthDataset(Dataset):
         mask_tensor = torch.from_numpy(valid_mask).unsqueeze(0).float()
 
         # 增加 batch 维度以适配 transform: [1, C, H, W]
-        hs_tensor = hs_tensor.unsqueeze(0)
+        if hs_tensor is not None:
+            hs_tensor = hs_tensor.unsqueeze(0)
         depth_tensor = depth_tensor.unsqueeze(0)
         depth_metric_tensor = depth_metric_tensor.unsqueeze(0)
         mask_tensor = mask_tensor.unsqueeze(0)
+
+        def hs_window_tensor(top: int, left: int) -> torch.Tensor:
+            crop_h, crop_w = self.image_size
+            hs_patch = hs_image[top:top + crop_h, left:left + crop_w, :]
+            hs_patch = normalize_hs_image(
+                hs_patch,
+                norm_mode=self.hs_norm_mode,
+                norm_scale=self.hs_norm_scale,
+                sanity_threshold=self.hs_sanity_threshold,
+            )
+            return torch.from_numpy(hs_patch).permute(2, 0, 1).unsqueeze(0).float()
 
         if self.is_training:
             hs_base = hs_tensor
@@ -579,7 +595,7 @@ class HyperspectralDepthDataset(Dataset):
                             break
                         top, left = self._sample_random_crop_window(full_h, full_w)
 
-                hs_tensor = self._crop_window(hs_base, top, left)
+                hs_tensor = hs_window_tensor(top, left) if defer_hs_norm else self._crop_window(hs_base, top, left)
                 depth_tensor = self._crop_window(depth_base, top, left)
                 depth_metric_tensor = self._crop_window(depth_metric_base, top, left)
                 mask_tensor = (self._crop_window(mask_base, top, left) > 0.5).float()
@@ -600,12 +616,19 @@ class HyperspectralDepthDataset(Dataset):
         else:
             if eval_window is not None:
                 top, left = eval_window
-                hs_tensor = self._crop_window(hs_tensor, top, left)
+                hs_tensor = hs_window_tensor(top, left) if defer_hs_norm else self._crop_window(hs_tensor, top, left)
                 depth_tensor = self._crop_window(depth_tensor, top, left)
                 depth_metric_tensor = self._crop_window(depth_metric_tensor, top, left)
                 mask_tensor = self._crop_window(mask_tensor, top, left)
             else:
-                hs_tensor = self.centercrop(hs_tensor)
+                if defer_hs_norm:
+                    _, _, full_h, full_w = depth_tensor.shape
+                    crop_h, crop_w = self.image_size
+                    top = max(0, (full_h - crop_h) // 2)
+                    left = max(0, (full_w - crop_w) // 2)
+                    hs_tensor = hs_window_tensor(top, left)
+                else:
+                    hs_tensor = self.centercrop(hs_tensor)
                 depth_tensor = self.centercrop(depth_tensor)
                 depth_metric_tensor = self.centercrop(depth_metric_tensor)
                 mask_tensor = self.centercrop(mask_tensor)
