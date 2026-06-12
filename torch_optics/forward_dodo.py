@@ -250,6 +250,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         output_format: str = "nhwc",
         assets_dir: str = "torch_optics/assets",
         measurement_norm_mode: str = "legacy_max",
+        measurement_norm_scale: float = 1.0,
         sensing_mode: str = "rgb",
         measurement_channels: int = 3,
         depth_layering_mode: str = "hard_depth",
@@ -281,11 +282,19 @@ class DepthAwareDoDoForwardModel(nn.Module):
             raise ValueError(
                 f"depth_layering_mode must be one of {_DEPTH_LAYERING_MODES}, got '{depth_layering_mode}'")
         self.depth_layering_mode = depth_layering_mode
-        if measurement_norm_mode not in ("legacy_max", "none", "per_sample_max"):
+        if measurement_norm_mode not in ("legacy_max", "none", "per_sample_max", "fixed_scale"):
             raise ValueError(
-                f"measurement_norm_mode must be one of legacy_max/none/per_sample_max, "
+                f"measurement_norm_mode must be one of legacy_max/none/per_sample_max/fixed_scale, "
                 f"got '{measurement_norm_mode}'")
         self.measurement_norm_mode = measurement_norm_mode
+        measurement_norm_scale = float(measurement_norm_scale)
+        if measurement_norm_mode == "fixed_scale" and measurement_norm_scale <= 0.0:
+            raise ValueError("measurement_norm_scale must be > 0 when measurement_norm_mode='fixed_scale'")
+        self.register_buffer(
+            "measurement_norm_scale",
+            torch.tensor(max(measurement_norm_scale, 1e-8), dtype=torch.float32),
+            persistent=False,
+        )
 
         mss = 128
         minput = 128
@@ -471,6 +480,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
             y_flat = y_sum.view(b, -1)
             y_max = y_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
             y = y_sum / (y_max + 1e-8)
+        elif self.measurement_norm_mode == "fixed_scale":
+            y = torch.clamp(y_sum / (self.measurement_norm_scale.to(y_sum.device) + 1e-8), 0.0, 1.0)
         else:
             y = _normalize_once(y_sum)
 
@@ -490,6 +501,7 @@ def Forward_DM_Spiral_Depth(
     Train_c=True,
     assets_dir="torch_optics/assets",
     measurement_norm_mode="legacy_max",
+    measurement_norm_scale=1.0,
     sensing_mode="rgb",
     measurement_channels=3,
     depth_layering_mode="hard_depth",
@@ -509,6 +521,7 @@ def Forward_DM_Spiral_Depth(
         output_format="nhwc",
         assets_dir=assets_dir,
         measurement_norm_mode=measurement_norm_mode,
+        measurement_norm_scale=measurement_norm_scale,
         sensing_mode=sensing_mode,
         measurement_channels=measurement_channels,
         depth_layering_mode=depth_layering_mode,

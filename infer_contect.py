@@ -12,6 +12,7 @@ import Imath
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+from datasets.hyperspectral_dataset import normalize_hs_image
 from snapshotdepth_hs import SnapshotDepthHS
 from util.helper import metric_to_ips, ips_to_metric
 
@@ -56,6 +57,15 @@ def normalize_hs_minmax(data: np.ndarray) -> Tuple[np.ndarray, float, float]:
         return np.zeros_like(data), d_min, d_max
     norm = (data - d_min) / (d_max - d_min)
     return norm, d_min, d_max
+
+
+def normalize_hs_for_hparams(data: np.ndarray, hparams) -> np.ndarray:
+    return normalize_hs_image(
+        data,
+        norm_mode=getattr(hparams, 'hs_norm_mode', 'scene_max'),
+        norm_scale=float(getattr(hparams, 'hs_norm_scale', 0.0) or 0.0),
+        sanity_threshold=float(getattr(hparams, 'hs_sanity_threshold', 10000.0) or 10000.0),
+    )
 
 
 def metric_depth_to_ips_np(depth_m: np.ndarray, min_depth: float, max_depth: float) -> np.ndarray:
@@ -134,6 +144,49 @@ def calculate_masked_mae(gt: np.ndarray, pred: np.ndarray, valid_mask: np.ndarra
     return float(np.mean(np.abs(gt[m] - pred[m])))
 
 
+def calculate_hs_ssim(
+    gt: np.ndarray,
+    pred: np.ndarray,
+    valid_mask: np.ndarray,
+    data_range: float = 1.0,
+):
+    if gt.ndim != 3 or pred.ndim != 3:
+        raise ValueError('HS SSIM expects hyperspectral cubes with shape HxWxC.')
+    if gt.shape != pred.shape:
+        raise ValueError(f'HS SSIM shape mismatch: gt={gt.shape}, pred={pred.shape}')
+
+    try:
+        from skimage.metrics import structural_similarity
+    except ImportError:
+        return float('nan'), float('nan'), []
+
+    m = valid_mask > 0.5
+    full_vals = []
+    masked_vals = []
+    per_band = []
+    for b in range(gt.shape[2]):
+        full_ssim, ssim_map = structural_similarity(
+            gt[:, :, b],
+            pred[:, :, b],
+            data_range=data_range,
+            full=True,
+        )
+        masked_ssim = float(np.mean(ssim_map[m])) if m.sum() > 0 else float('nan')
+        full_ssim = float(full_ssim)
+        full_vals.append(full_ssim)
+        if not np.isnan(masked_ssim):
+            masked_vals.append(masked_ssim)
+        per_band.append({
+            'band': b,
+            'ssim_full': full_ssim,
+            'ssim_masked': masked_ssim,
+        })
+
+    full_mean = float(np.mean(full_vals)) if full_vals else float('nan')
+    masked_mean = float(np.mean(masked_vals)) if masked_vals else float('nan')
+    return full_mean, masked_mean, per_band
+
+
 def compute_depth_histogram(
     depth_map: np.ndarray,
     valid_mask: np.ndarray,
@@ -200,9 +253,10 @@ def visualize_depth(
     vmin: Optional[float],
     vmax: Optional[float],
     valid_mask: Optional[np.ndarray] = None,
+    cmap: str = 'inferno',
 ):
     if valid_mask is None:
-        plt.imsave(save_path, depth_data, cmap='inferno', vmin=vmin, vmax=vmax)
+        plt.imsave(save_path, depth_data, cmap=cmap, vmin=vmin, vmax=vmax)
         return
 
     mask = valid_mask > 0.5
@@ -217,7 +271,7 @@ def visualize_depth(
         d_max = d_min + 1.0
 
     norm = np.clip((depth_data - d_min) / (d_max - d_min), 0.0, 1.0)
-    rgb = plt.get_cmap('inferno')(norm)[..., :3]
+    rgb = plt.get_cmap(cmap)(norm)[..., :3]
     rgb[~mask] = 0.0
     plt.imsave(save_path, rgb)
 
@@ -391,11 +445,16 @@ def process_single_scene(
     depth_gt_raw = depth_gt_raw / 1000.0  # mm -> m
     valid_mask = (depth_gt_raw > (min_depth - 1e-3)).astype(np.float32)
 
-    hs_norm, _, _ = normalize_hs_minmax(hs_gt_raw)
+    hs_norm = normalize_hs_for_hparams(hs_gt_raw, model.hparams)
     depth_norm_ips = metric_depth_to_ips_np(depth_gt_raw, min_depth, max_depth)
 
     print(f"  [Data Info] GT Depth Range (Raw): [{depth_gt_raw.min():.4f}m, {depth_gt_raw.max():.4f}m]")
     print(f"  [Data Info] IPS Input Range:      [{depth_norm_ips.min():.4f}, {depth_norm_ips.max():.4f}]")
+    print(
+        "  [Data Info] HS norm: "
+        f"mode={getattr(model.hparams, 'hs_norm_mode', 'scene_max')}, "
+        f"scale={float(getattr(model.hparams, 'hs_norm_scale', 0.0) or 0.0):g}"
+    )
 
     hs_tensor = torch.from_numpy(hs_norm).permute(2, 0, 1).float()
     depth_tensor = torch.from_numpy(depth_norm_ips).float()
@@ -622,9 +681,15 @@ def process_single_scene(
     mse_real = calculate_masked_mse(depth_gt_raw, est_depth_real, valid_mask)
     rmse_real = float(np.sqrt(mse_real)) if not np.isnan(mse_real) else float('nan')
     mae_real = calculate_masked_mae(depth_gt_raw, est_depth_real, valid_mask)
+    depth_abs_error = np.abs(est_depth_real - depth_gt_raw)
+    valid_error = depth_abs_error[valid_mask > 0.5]
+    error_vmax = float(np.percentile(valid_error, 99)) if valid_error.size > 0 else 1.0
+    if error_vmax < 1e-6:
+        error_vmax = 1.0
     psnr_hs_full = calculate_psnr(hs_norm, final_hs_norm)
     psnr_hs_masked = calculate_masked_psnr(hs_norm, final_hs_norm, valid_mask)
     sam_hs_masked = calculate_masked_sam(hs_norm, final_hs_norm, valid_mask)
+    ssim_hs_full, ssim_hs_masked, ssim_per_band = calculate_hs_ssim(hs_norm, final_hs_norm, valid_mask)
     valid_ratio = float(valid_mask.sum() / valid_mask.size)
     pred_d_min = float(est_depth_real[valid_mask > 0.5].min()) if valid_mask.sum() > 0 else float('nan')
     pred_d_max = float(est_depth_real[valid_mask > 0.5].max()) if valid_mask.sum() > 0 else float('nan')
@@ -638,6 +703,8 @@ def process_single_scene(
     print(f"     HS PSNR(full):   {psnr_hs_full:.4f} dB")
     print(f"     HS PSNR(masked): {psnr_hs_masked:.4f} dB")
     print(f"     HS SAM(masked):  {sam_hs_masked:.6f} rad")
+    print(f"     HS SSIM(full):   {ssim_hs_full:.6f}")
+    print(f"     HS SSIM(masked): {ssim_hs_masked:.6f}")
     print(f"     Valid ratio:     {valid_ratio:.4f}")
     print(f"     Pred Depth:      min={pred_d_min:.3f} max={pred_d_max:.3f} mean={pred_d_mean:.3f} std={pred_d_std:.3f}")
 
@@ -664,6 +731,9 @@ def process_single_scene(
     visualize_depth(
         est_depth_real, os.path.join(scene_out_dir, 'est_depth_auto_scale.png'),
         vmin=None, vmax=None, valid_mask=depth_vis_mask)
+    visualize_depth(
+        depth_abs_error, os.path.join(scene_out_dir, 'depth_abs_error_m.png'),
+        vmin=0.0, vmax=error_vmax, valid_mask=depth_vis_mask, cmap='magma')
 
     gt_rgb = hs_norm[..., list(rgb_bands)]
     rgb_p_min = float(np.percentile(gt_rgb, 1))
@@ -718,10 +788,13 @@ def process_single_scene(
         f.write(f"rgb_bands={rgb_bands}\n")
         f.write(f"rgb_percentile_min={rgb_p_min:.6f}\n")
         f.write(f"rgb_percentile_max={rgb_p_max:.6f}\n")
+        f.write(f"hs_norm_mode={getattr(model.hparams, 'hs_norm_mode', 'scene_max')}\n")
+        f.write(f"hs_norm_scale={float(getattr(model.hparams, 'hs_norm_scale', 0.0) or 0.0):.8g}\n")
         f.write("est_hs.png=est_hs_gt_background.png (model foreground + GT HS background for visualization only)\n")
         f.write("est_hs_model_raw.png=raw stitched model output; skipped/uncovered areas remain black\n")
         f.write("est_hs_foreground.png=raw model output multiplied by valid depth mask\n")
         f.write(f"depth_background={depth_background}\n")
+        f.write(f"depth_abs_error_m.png=absolute metric depth error; vmin=0, vmax=p99_valid_error={error_vmax:.6f}m\n")
         f.write(f"stitch_coverage_ratio={stitch_coverage_ratio:.6f}\n")
         f.write(f"tile_offset_y={tile_offset_y}\n")
         f.write(f"tile_offset_x={tile_offset_x}\n")
@@ -740,20 +813,24 @@ def process_single_scene(
                         'total_tiles': total_tiles, 'skipped_tiles': skipped_tile_count,
                         'skipped_pixel_ratio': skipped_pixel_ratio,
                         'stitch_coverage_ratio': stitch_coverage_ratio,
+                        'hs_ssim_full': ssim_hs_full,
+                        'hs_ssim_masked': ssim_hs_masked,
                         'depth_distribution': depth_distribution_rows,
                         'depth_distribution_summary': {
                             'gt': gt_hist_summary,
                             'pred': pred_hist_summary,
-                        }}
+                        },
+                        'depth_abs_error_p99_m': error_vmax}
     if diagnostic_dump:
         print('  [Diag] Saving diagnostic metrics...')
 
         # Full scene metrics CSV
         with open(os.path.join(scene_out_dir, 'metrics_full_scene.csv'), 'w') as f:
-            f.write('scene_name,psnr_full_db,psnr_masked_db,sam_masked_rad,depth_mae_m,depth_rmse_m,'
+            f.write('scene_name,psnr_full_db,psnr_masked_db,sam_masked_rad,ssim_full,ssim_masked,depth_mae_m,depth_rmse_m,'
                     'valid_ratio,skipped_tiles,skipped_pixel_ratio,'
                     'pseudo_rgb_psnr_db,pseudo_rgb_mae,oracle_simulation\n')
             f.write(f'{scene_name},{psnr_hs_full:.4f},{psnr_hs_masked:.4f},{sam_hs_masked:.6f},'
+                    f'{ssim_hs_full:.6f},{ssim_hs_masked:.6f},'
                     f'{mae_real:.6f},{rmse_real:.6f},{valid_ratio:.4f},'
                     f'{skipped_tile_count},{skipped_pixel_ratio:.4f},'
                     f'{calculate_masked_psnr(hs_norm[..., list(rgb_bands)], final_hs_norm[..., list(rgb_bands)], valid_mask):.4f},'
@@ -763,9 +840,12 @@ def process_single_scene(
         # Per-band metrics
         pb = compute_per_band_metrics(hs_norm, final_hs_norm, valid_mask)
         with open(os.path.join(scene_out_dir, 'metrics_per_band.csv'), 'w') as f:
-            f.write('band,psnr_masked_db,mae_masked\n')
+            f.write('band,psnr_masked_db,mae_masked,ssim_full,ssim_masked\n')
             for r in pb:
-                f.write(f"{r['band']},{r['psnr_masked_db']:.4f},{r['mae_masked']:.6f}\n")
+                f.write(
+                    f"{r['band']},{r['psnr_masked_db']:.4f},{r['mae_masked']:.6f},"
+                    f"{r['ssim_full']:.6f},{r['ssim_masked']:.6f}\n"
+                )
 
         # Region metrics CSV
         rm = compute_region_metrics(hs_norm, final_hs_norm, depth_gt_raw, est_depth_real, valid_mask, min_depth, max_depth)
@@ -830,19 +910,28 @@ def process_single_scene(
         with open(os.path.join(scene_out_dir, 'diagnostic_metrics.json'), 'w') as f:
             json.dump(scenario_metrics, f, indent=2, default=str)
 
-    return scene_name, mse_real, rmse_real, mae_real, psnr_hs_full, psnr_hs_masked, sam_hs_masked, valid_ratio, pred_d_min, pred_d_max, pred_d_mean, pred_d_std, scenario_metrics
+    return scene_name, mse_real, rmse_real, mae_real, psnr_hs_full, psnr_hs_masked, sam_hs_masked, ssim_hs_full, ssim_hs_masked, valid_ratio, pred_d_min, pred_d_max, pred_d_mean, pred_d_std, scenario_metrics
 
 
 def compute_per_band_metrics(gt_hs, est_hs, valid_mask):
-    """Compute per-band masked PSNR and MAE."""
+    """Compute per-band masked PSNR, MAE, and SSIM."""
     n_bands = gt_hs.shape[2]
+    _, _, ssim_per_band = calculate_hs_ssim(gt_hs, est_hs, valid_mask)
+    ssim_by_band = {r['band']: r for r in ssim_per_band}
     records = []
     for b in range(n_bands):
         gt_b = gt_hs[:, :, b]
         est_b = est_hs[:, :, b]
         psnr_b = calculate_masked_psnr(gt_b, est_b, valid_mask)
         mae_b = calculate_masked_mae(gt_b, est_b, valid_mask)
-        records.append({'band': b, 'psnr_masked_db': psnr_b, 'mae_masked': mae_b})
+        ssim_b = ssim_by_band.get(b, {})
+        records.append({
+            'band': b,
+            'psnr_masked_db': psnr_b,
+            'mae_masked': mae_b,
+            'ssim_full': ssim_b.get('ssim_full', float('nan')),
+            'ssim_masked': ssim_b.get('ssim_masked', float('nan')),
+        })
     return records
 
 
@@ -920,6 +1009,7 @@ def compute_depth_baselines(gt_d_m, est_d_m, valid_mask):
 def compute_spectral_quality(gt_hs, est_hs, valid_mask, rgb_bands):
     """Compute SAM, spectral MAE, pseudo-RGB PSNR/MAE."""
     sam = calculate_masked_sam(gt_hs, est_hs, valid_mask)
+    ssim_full, ssim_masked, _ = calculate_hs_ssim(gt_hs, est_hs, valid_mask)
 
     # Spectral MAE: per-pixel mean abs error across bands, then average over valid pixels
     m = valid_mask > 0.5
@@ -934,6 +1024,8 @@ def compute_spectral_quality(gt_hs, est_hs, valid_mask, rgb_bands):
 
     return {
         'sam_rad': sam,
+        'ssim_full': ssim_full,
+        'ssim_masked': ssim_masked,
         'spectral_mae': spec_mae,
         'pseudo_rgb_psnr_db': rgb_psnr,
         'pseudo_rgb_mae': rgb_mae,
@@ -1016,12 +1108,20 @@ def process_roi_direct(model, hs_tensor, depth_ips_tensor, depth_metric_tensor,
     valid_ratio = float(vm_crop.sum() / vm_crop.size)
 
     # Save quicklooks
+    depth_abs_error = np.abs(est_depth_m - gt_d_crop)
+    valid_error = depth_abs_error[vm_crop > 0.5]
+    error_vmax = float(np.percentile(valid_error, 99)) if valid_error.size > 0 else 1.0
+    if error_vmax < 1e-6:
+        error_vmax = 1.0
     visualize_depth(
         est_depth_m, os.path.join(out_dir, f'{roi_name}_est_depth_fixed.png'),
         vmin=min_depth, vmax=max_depth, valid_mask=vm_crop)
     visualize_depth(
         gt_d_crop, os.path.join(out_dir, f'{roi_name}_gt_depth_fixed.png'),
         vmin=min_depth, vmax=max_depth, valid_mask=vm_crop)
+    visualize_depth(
+        depth_abs_error, os.path.join(out_dir, f'{roi_name}_depth_abs_error_m.png'),
+        vmin=0.0, vmax=error_vmax, valid_mask=vm_crop, cmap='magma')
     gt_rgb_crop = gt_hs_crop[..., list(rgb_bands)]
     p_min = float(np.percentile(gt_rgb_crop, 1))
     p_max = float(np.percentile(gt_rgb_crop, 99))
@@ -1050,7 +1150,7 @@ def process_roi_direct(model, hs_tensor, depth_ips_tensor, depth_metric_tensor,
         'roi_name': roi_name, 'y': py, 'x': px,
         'hs_psnr_full_db': psnr_f, 'hs_psnr_masked_db': psnr_m,
         'hs_sam_masked_rad': sam_m, 'depth_mae_m': mae_d, 'depth_rmse_m': rmse_d,
-        'valid_ratio': valid_ratio,
+        'valid_ratio': valid_ratio, 'depth_abs_error_p99_m': error_vmax,
     }
     roi_metrics.update({f'capt_{k}': v for k, v in cs.items()})
 
@@ -1152,7 +1252,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     metrics_path = os.path.join(output_dir, 'metrics_real.txt')
     with open(metrics_path, 'w') as f:
-        f.write('scene,mse_m2,rmse_m,mae_m,hs_psnr_full_db,hs_psnr_masked_db,hs_sam_masked_rad,valid_ratio,pred_d_min_m,pred_d_max_m,pred_d_mean_m,pred_d_std_m,oracle_simulation\n')
+        f.write('scene,mse_m2,rmse_m,mae_m,hs_psnr_full_db,hs_psnr_masked_db,hs_sam_masked_rad,hs_ssim_full,hs_ssim_masked,valid_ratio,pred_d_min_m,pred_d_max_m,pred_d_mean_m,pred_d_std_m,oracle_simulation\n')
 
     ckpt_min_depth = float(getattr(model.hparams, 'min_depth', args.depth_min))
     ckpt_max_depth = float(getattr(model.hparams, 'max_depth', args.depth_max))
@@ -1216,12 +1316,14 @@ def main():
         scene_name = results[0]
         mse_real, rmse_real, mae_real = results[1], results[2], results[3]
         psnr_hs_full, psnr_hs_masked, sam_hs_masked = results[4], results[5], results[6]
-        valid_ratio, pred_d_min, pred_d_max, pred_d_mean, pred_d_std = results[7], results[8], results[9], results[10], results[11]
-        scenario_metrics = results[12] if len(results) > 12 else {}
+        ssim_hs_full, ssim_hs_masked = results[7], results[8]
+        valid_ratio, pred_d_min, pred_d_max, pred_d_mean, pred_d_std = results[9], results[10], results[11], results[12], results[13]
+        scenario_metrics = results[14] if len(results) > 14 else {}
         with open(metrics_path, 'a') as f:
             f.write(
                 f'{scene_name},{mse_real:.6f},{rmse_real:.6f},{mae_real:.6f},'
                 f'{psnr_hs_full:.4f},{psnr_hs_masked:.4f},{sam_hs_masked:.6f},'
+                f'{ssim_hs_full:.6f},{ssim_hs_masked:.6f},'
                 f'{valid_ratio:.4f},{pred_d_min:.3f},{pred_d_max:.3f},{pred_d_mean:.3f},{pred_d_std:.3f},'
                 f'{oracle_simulation}\n'
             )
@@ -1233,6 +1335,8 @@ def main():
         psnr_m_vals = [r[5] for r in all_results if not np.isnan(r[5])]
         psnr_f_vals = [r[4] for r in all_results if not np.isnan(r[4])]
         sam_vals = [r[6] for r in all_results if not np.isnan(r[6])]
+        ssim_f_vals = [r[7] for r in all_results if not np.isnan(r[7])]
+        ssim_m_vals = [r[8] for r in all_results if not np.isnan(r[8])]
 
         agg_path = os.path.join(output_dir, 'aggregate_metrics.json')
         agg = {
@@ -1249,6 +1353,10 @@ def main():
             'hs_psnr_full_db_mean': float(np.mean(psnr_f_vals)) if psnr_f_vals else float('nan'),
             'hs_psnr_full_db_median': float(np.median(psnr_f_vals)) if psnr_f_vals else float('nan'),
             'hs_sam_masked_rad_mean': float(np.mean(sam_vals)) if sam_vals else float('nan'),
+            'hs_ssim_full_mean': float(np.mean(ssim_f_vals)) if ssim_f_vals else float('nan'),
+            'hs_ssim_full_median': float(np.median(ssim_f_vals)) if ssim_f_vals else float('nan'),
+            'hs_ssim_masked_mean': float(np.mean(ssim_m_vals)) if ssim_m_vals else float('nan'),
+            'hs_ssim_masked_median': float(np.median(ssim_m_vals)) if ssim_m_vals else float('nan'),
         }
         with open(agg_path, 'w') as f:
             json.dump(agg, f, indent=2)
@@ -1257,6 +1365,7 @@ def main():
         print(f'  Depth MAE:   mean={agg["depth_mae_m_mean"]:.4f}m, median={agg["depth_mae_m_median"]:.4f}m')
         print(f'  Depth RMSE:  mean={agg["depth_rmse_m_mean"]:.4f}m, median={agg["depth_rmse_m_median"]:.4f}m')
         print(f'  HS PSNR(m):  mean={agg["hs_psnr_masked_db_mean"]:.2f}dB, median={agg["hs_psnr_masked_db_median"]:.2f}dB')
+        print(f'  HS SSIM(m):  mean={agg["hs_ssim_masked_mean"]:.4f}, median={agg["hs_ssim_masked_median"]:.4f}')
     else:
         print('No successful scenes processed!')
 
@@ -1273,7 +1382,7 @@ def main():
             depth_gt_raw = depth_gt_raw.squeeze(-1)
         depth_gt_raw = depth_gt_raw / 1000.0
         valid_mask_roi = (depth_gt_raw > (ckpt_min_depth - 1e-3)).astype(np.float32)
-        hs_norm_roi, _, _ = normalize_hs_minmax(hs_gt_raw)
+        hs_norm_roi = normalize_hs_for_hparams(hs_gt_raw, model.hparams)
         depth_ips_roi = metric_depth_to_ips_np(depth_gt_raw, ckpt_min_depth, ckpt_max_depth)
         hs_t_roi = torch.from_numpy(hs_norm_roi).permute(2, 0, 1).float()
         dp_t_roi = torch.from_numpy(depth_ips_roi).float()

@@ -61,6 +61,40 @@ def read_exr(file_path):
     return image_np
 
 
+def normalize_hs_image(
+    hs_image: np.ndarray,
+    norm_mode: str = 'scene_max',
+    norm_scale: float = 0.0,
+    sanity_threshold: float = 10000.0,
+) -> np.ndarray:
+    """Normalize HS data with the same contract for training and inference."""
+    hs_image = hs_image.astype(np.float32, copy=False)
+    min_hs = 0.0
+
+    if np.max(hs_image) > sanity_threshold:
+        valid_pixels = hs_image < sanity_threshold
+        scene_max = float(np.max(hs_image[valid_pixels])) if np.any(valid_pixels) else 1.0
+        hs_image = np.clip(hs_image, min_hs, scene_max)
+    else:
+        scene_max = float(np.max(hs_image))
+
+    norm_mode = str(norm_mode or 'scene_max')
+    if norm_mode == 'scene_max':
+        scale = scene_max
+    elif norm_mode == 'fixed_scale':
+        scale = float(norm_scale)
+        if scale <= 0.0:
+            raise ValueError('hs_norm_mode=fixed_scale requires --hs_norm_scale > 0')
+    else:
+        raise ValueError(f"Unsupported hs_norm_mode: {norm_mode}")
+
+    if scale > min_hs:
+        hs_image = (hs_image - min_hs) / (scale - min_hs)
+    if norm_mode == 'fixed_scale':
+        hs_image = np.clip(hs_image, 0.0, 1.0)
+    return hs_image.astype(np.float32, copy=False)
+
+
 class HyperspectralDepthDataset(Dataset):
     def __init__(self, base_dir: str, scene_folders: List[str], image_size: Tuple[int, int], hs_channels: int,
                  is_training: bool = True, randcrop: bool = False, augment: bool = False,
@@ -74,7 +108,10 @@ class HyperspectralDepthDataset(Dataset):
                  patch_index_use_meta_thresholds: bool = True,
                  min_center_valid_ratio: float = 0.0,
                  samples_per_epoch: int = 0,
-                 eval_patch_index: bool = False):
+                 eval_patch_index: bool = False,
+                 hs_norm_mode: str = 'scene_max',
+                 hs_norm_scale: float = 0.0,
+                 hs_sanity_threshold: float = 10000.0):
         
         super().__init__()
         self.is_training = is_training
@@ -106,6 +143,9 @@ class HyperspectralDepthDataset(Dataset):
         self.patch_index_use_meta_thresholds = bool(patch_index_use_meta_thresholds)
         self.samples_per_epoch = max(0, int(samples_per_epoch or 0))
         self.eval_patch_index = bool(eval_patch_index and not self.is_training)
+        self.hs_norm_mode = str(hs_norm_mode or 'scene_max')
+        self.hs_norm_scale = float(hs_norm_scale or 0.0)
+        self.hs_sanity_threshold = float(hs_sanity_threshold or 10000.0)
         self.patch_index_by_id: Dict[str, Dict[str, torch.Tensor]] = {}
         self.patch_index_meta: Dict = {}
         self.patch_index_windows: List[Tuple[str, int, int]] = []
@@ -398,27 +438,14 @@ class HyperspectralDepthDataset(Dataset):
         valid_mask = (depth_map > self.min_depth - 1e-3).astype(np.float32)
 
         # ============================================================
-        # 步骤 B: 高光谱图像处理 (保持你原有的去异常值逻辑)
+        # 步骤 B: 高光谱图像处理
         # ============================================================
-        SANITY_THRESHOLD = 10000.0 
-        min_hs = 0.0 # 假设最小光强是0
-        
-        # 你的逻辑：如果最大值异常大，寻找正常的第二大值
-        if np.max(hs_image) > SANITY_THRESHOLD:
-            valid_pixels = hs_image < SANITY_THRESHOLD
-            if np.any(valid_pixels):
-                real_max = np.max(hs_image[valid_pixels])
-            else:
-                real_max = 1.0
-            # 截断异常值
-            hs_image = np.clip(hs_image, min_hs, real_max)
-            max_hs = real_max
-        else:
-            max_hs = np.max(hs_image)
-
-        # HS 归一化
-        if max_hs > min_hs:
-            hs_image = (hs_image - min_hs) / (max_hs - min_hs)
+        hs_image = normalize_hs_image(
+            hs_image,
+            norm_mode=self.hs_norm_mode,
+            norm_scale=self.hs_norm_scale,
+            sanity_threshold=self.hs_sanity_threshold,
+        )
         
         # ============================================================
         # 步骤 C: 深度图归一化 (【IPS 体系】使用逆深度均匀化)

@@ -655,6 +655,7 @@ class SnapshotDepthHS(pl.LightningModule):
             use_second_doe = getattr(hparams, 'dodo_use_second_doe', False)
             dodo_doe_type = getattr(hparams, 'dodo_doe_type', 'Zeros')
             dodo_forward_norm = getattr(hparams, 'dodo_forward_norm', 'legacy_max')
+            dodo_forward_scale = float(getattr(hparams, 'dodo_forward_scale', 1.0))
             dodo_sensing_mode = getattr(hparams, 'dodo_sensing_mode', 'rgb')
             depth_layering_mode = getattr(hparams, 'depth_layering_mode', 'hard_depth')
             soft_diopter_eps = getattr(hparams, 'soft_diopter_eps', 1e-8)
@@ -681,6 +682,7 @@ class SnapshotDepthHS(pl.LightningModule):
                 input_format='nchw',
                 output_format='nchw',
                 measurement_norm_mode=dodo_forward_norm,
+                measurement_norm_scale=dodo_forward_scale,
                 sensing_mode=dodo_sensing_mode,
                 measurement_channels=int(hparams.measurement_channels),
                 depth_layering_mode=depth_layering_mode,
@@ -690,6 +692,7 @@ class SnapshotDepthHS(pl.LightningModule):
             )
             print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
                   f'forward_norm={dodo_forward_norm}, '
+                  f'forward_scale={dodo_forward_scale:g}, '
                   f'depth_layering={depth_layering_mode}, '
                   f'sensor_measurement={dodo_sensor_measurement}, '
                   f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
@@ -1363,6 +1366,13 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--no-psfjitter', dest='psf_jitter', action='store_false')
         parser.set_defaults(psf_jitter=True)
         parser.add_argument('--hs_channels', type=int, default=25, help='高光谱数据的通道数')
+        parser.add_argument('--hs_norm_mode', type=str, default='fixed_scale',
+                            choices=['scene_max', 'fixed_scale'],
+                            help='HS target normalization mode; fixed_scale uses --hs_norm_scale for train/val/infer')
+        parser.add_argument('--hs_norm_scale', type=float, default=0.9367284796834017,
+                            help='Fixed HS scale used when --hs_norm_mode=fixed_scale')
+        parser.add_argument('--hs_sanity_threshold', type=float, default=10000.0,
+                            help='Clip EXR outliers above this threshold before HS normalization')
         parser.add_argument('--start_wl', type=float, default=420e-9, help='起始波长（米, 例如 420nm）')
         parser.add_argument('--end_wl', type=float, default=660e-9, help='结束波长（米, 例如 660nm）')
         parser.add_argument('--bayer', dest='bayer', action='store_true')
@@ -1385,9 +1395,11 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--dodo_nonfinite_policy', type=str, default='zero',
                             choices=['zero', 'fail'],
                             help='DoDo 非有限测量策略（zero=替换为0继续, fail=抛异常停止）')
-        parser.add_argument('--dodo_forward_norm', type=str, default='legacy_max',
-                            choices=['legacy_max', 'none', 'per_sample_max'],
+        parser.add_argument('--dodo_forward_norm', type=str, default='fixed_scale',
+                            choices=['legacy_max', 'none', 'per_sample_max', 'fixed_scale'],
                             help='DoDo forward internal measurement norm mode')
+        parser.add_argument('--dodo_forward_scale', type=float, default=3.7003112959862983,
+                            help='Fixed DoDo sensor scale used when --dodo_forward_norm=fixed_scale')
         parser.add_argument('--background_hs_loss_weight', type=float, default=0.02,
                             help='Background HS L1 loss weight for full-image visual quality')
         parser.add_argument('--dodo_sensing_mode', type=str, default='rgb',

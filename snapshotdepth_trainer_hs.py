@@ -2,6 +2,8 @@
 
 import os
 import inspect
+import json
+import math
 from argparse import ArgumentParser
 import torch
 from pytorch_lightning import Trainer, seed_everything
@@ -27,6 +29,79 @@ class DOEParameterClampCallback(Callback):
             clamp_fn = getattr(module, "clamp_parameters_", None)
             if callable(clamp_fn):
                 clamp_fn()
+
+
+class BestMetricTracker(Callback):
+    """Track best validation metrics without writing checkpoint files."""
+
+    def __init__(self, metrics, output_path):
+        self.metrics = metrics
+        self.output_path = output_path
+        self.best = {
+            name: {
+                'monitor': monitor,
+                'mode': mode,
+                'best_epoch': None,
+                'best_score': None,
+            }
+            for name, monitor, mode in metrics
+        }
+
+    @staticmethod
+    def _to_float(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            value = value.detach().cpu().item()
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @staticmethod
+    def _is_better(value, best_value, mode):
+        if best_value is None:
+            return True
+        if mode == 'min':
+            return value < best_value
+        return value > best_value
+
+    def _write_summary(self):
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        with open(self.output_path, 'w') as f:
+            json.dump(self.best, f, indent=2)
+
+    def _update_from_trainer(self, trainer):
+        if getattr(trainer, 'sanity_checking', False):
+            return
+
+        callback_metrics = getattr(trainer, 'callback_metrics', {}) or {}
+        epoch = int(getattr(trainer, 'current_epoch', 0))
+        changed = False
+
+        for name, monitor, mode in self.metrics:
+            value = self._to_float(callback_metrics.get(monitor))
+            if value is None:
+                continue
+
+            entry = self.best[name]
+            if self._is_better(value, entry['best_score'], mode):
+                entry['best_score'] = value
+                entry['best_epoch'] = epoch
+                changed = True
+                print(f'[best-metric] {name}: epoch={epoch:03d}, {monitor}={value:.6g}')
+
+        if changed:
+            self._write_summary()
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        self._update_from_trainer(trainer)
+
+    def on_validation_end(self, trainer, pl_module):
+        self._update_from_trainer(trainer)
 
 
 def _patch_pl_ddp_sync_params_if_missing():
@@ -143,6 +218,9 @@ def prepare_data(hparams):
         patch_index_use_meta_thresholds=getattr(hparams, 'patch_index_use_meta_thresholds', True),
         min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
         samples_per_epoch=train_samples_per_epoch,
+        hs_norm_mode=getattr(hparams, 'hs_norm_mode', 'scene_max'),
+        hs_norm_scale=getattr(hparams, 'hs_norm_scale', 0.0),
+        hs_sanity_threshold=getattr(hparams, 'hs_sanity_threshold', 10000.0),
     )
 
     val_dataset = HyperspectralDepthDataset(
@@ -170,6 +248,9 @@ def prepare_data(hparams):
         min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
         samples_per_epoch=val_samples_per_epoch,
         eval_patch_index=val_patch_eval,
+        hs_norm_mode=getattr(hparams, 'hs_norm_mode', 'scene_max'),
+        hs_norm_scale=getattr(hparams, 'hs_norm_scale', 0.0),
+        hs_sanity_threshold=getattr(hparams, 'hs_sanity_threshold', 10000.0),
     )
 
     train_dataloader = DataLoader(train_dataset, batch_size=hparams.batch_sz,
@@ -189,7 +270,7 @@ def main(args):
 
     # Determine artifact root FIRST: CLI → DODO_ARTIFACT_ROOT → EXP_ROOT → legacy fallback
     # Must happen before checkpoint creation so checkpoints land under artifact_dir/checkpoints/.
-    import json, sys, subprocess
+    import sys, subprocess
     raw_cli = getattr(args, 'artifact_root', '')
     require_root = getattr(args, 'require_artifact_root', False)
 
@@ -248,7 +329,9 @@ def main(args):
     print(f'[artifact] resolved root={artifact_dir}')
     print(f'[artifact] checkpoint dir={ckpt_dir}')
 
-    # --- Checkpoint callbacks (Joint-best + Depth-MAE-best) ---
+    # --- Checkpoint callbacks ---
+    # Default policy: only joint-best writes a checkpoint. Auxiliary best metrics
+    # are tracked in JSON to avoid duplicating large .ckpt files.
     # Use artifact_dir for checkpoint storage with stable filenames (no fake 0.0000 metric values).
     ckpt_monitor = getattr(args, 'checkpoint_monitor', 'validation/psnr_hs_masked')
     ckpt_mode = getattr(args, 'checkpoint_mode', 'max')
@@ -270,43 +353,39 @@ def main(args):
             mode=ckpt_mode,
         )
 
-    depth_ckpt_monitor = 'validation/mae_depth_m'
-    try:
-        depth_checkpoint_callback = ModelCheckpoint(
-            monitor=depth_ckpt_monitor,
-            dirpath=ckpt_dir,
-            filename='depth-best-{epoch:03d}',
-            save_top_k=1,
-            mode='min',
-            verbose=True,
-        )
-    except TypeError:
-        depth_checkpoint_callback = ModelCheckpoint(
-            verbose=True,
-            monitor=depth_ckpt_monitor,
-            filepath=os.path.join(ckpt_dir, 'depth-best-{epoch:03d}'),
-            save_top_k=1,
-            mode='min',
-        )
+    auxiliary_best_metrics = [
+        ('depth-best', 'validation/mae_depth_m', 'min'),
+        ('hs-best', 'validation/hs_l1_masked', 'min'),
+    ]
+    checkpoint_callbacks_for_compat = [checkpoint_callback]
+    auxiliary_callbacks = []
 
-    hs_ckpt_monitor = 'validation/hs_l1_masked'
-    try:
-        hs_checkpoint_callback = ModelCheckpoint(
-            monitor=hs_ckpt_monitor,
-            dirpath=ckpt_dir,
-            filename='hs-best-{epoch:03d}',
-            save_top_k=1,
-            mode='min',
-            verbose=True,
-        )
-    except TypeError:
-        hs_checkpoint_callback = ModelCheckpoint(
-            verbose=True,
-            monitor=hs_ckpt_monitor,
-            filepath=os.path.join(ckpt_dir, 'hs-best-{epoch:03d}'),
-            save_top_k=1,
-            mode='min',
-        )
+    if getattr(args, 'save_aux_best_ckpts', False):
+        for metric_name, metric_monitor, metric_mode in auxiliary_best_metrics:
+            try:
+                auxiliary_callback = ModelCheckpoint(
+                    monitor=metric_monitor,
+                    dirpath=ckpt_dir,
+                    filename=f'{metric_name}-{{epoch:03d}}',
+                    save_top_k=1,
+                    mode=metric_mode,
+                    verbose=True,
+                )
+            except TypeError:
+                auxiliary_callback = ModelCheckpoint(
+                    verbose=True,
+                    monitor=metric_monitor,
+                    filepath=os.path.join(ckpt_dir, f'{metric_name}-{{epoch:03d}}'),
+                    save_top_k=1,
+                    mode=metric_mode,
+                )
+            auxiliary_callbacks.append(auxiliary_callback)
+            checkpoint_callbacks_for_compat.append(auxiliary_callback)
+        print('[checkpoint] auxiliary best checkpoints enabled: depth-best, hs-best')
+    else:
+        best_metric_path = os.path.join(artifact_dir, 'best_metric_epochs.json')
+        auxiliary_callbacks.append(BestMetricTracker(auxiliary_best_metrics, best_metric_path))
+        print(f'[checkpoint] auxiliary best checkpoints disabled; tracking epochs in {best_metric_path}')
 
     model = SnapshotDepth(hparams=args, log_dir=logger.log_dir, artifact_root=artifact_dir)
     train_dataloader, val_dataloader = prepare_data(hparams=args)
@@ -334,8 +413,9 @@ def main(args):
     # 兼容不同 PL 版本的 Trainer 初始化参数：
     # 1) 老版本依赖 checkpoint_callback=... 来注入 save_function
     # 2) 新版本通常通过 callbacks=[...] 传入 checkpoint callback
-    callbacks = [logmanager_callback, checkpoint_callback, depth_checkpoint_callback,
-                 hs_checkpoint_callback, DOEParameterClampCallback()]
+    callbacks = [logmanager_callback, checkpoint_callback] + auxiliary_callbacks + [
+        DOEParameterClampCallback()
+    ]
     trainer_init_params = inspect.signature(Trainer.__init__).parameters
     trainer_kwargs = dict(
         logger=logger,
@@ -349,15 +429,10 @@ def main(args):
     trainer = Trainer.from_argparse_args(args, **trainer_kwargs)
 
     # 老版本 Lightning 在某些路径不会自动注入 save_function，做兜底。
-    if getattr(checkpoint_callback, 'save_function', None) is None:
-        checkpoint_callback.save_function = trainer.save_checkpoint
-        print('[Compat] Set checkpoint_callback.save_function = trainer.save_checkpoint')
-    if getattr(depth_checkpoint_callback, 'save_function', None) is None:
-        depth_checkpoint_callback.save_function = trainer.save_checkpoint
-        print('[Compat] Set depth_checkpoint_callback.save_function = trainer.save_checkpoint')
-    if getattr(hs_checkpoint_callback, 'save_function', None) is None:
-        hs_checkpoint_callback.save_function = trainer.save_checkpoint
-        print('[Compat] Set hs_checkpoint_callback.save_function = trainer.save_checkpoint')
+    for callback in checkpoint_callbacks_for_compat:
+        if getattr(callback, 'save_function', None) is None:
+            callback.save_function = trainer.save_checkpoint
+            print(f'[Compat] Set {callback.__class__.__name__}.save_function = trainer.save_checkpoint')
 
     validate_only = getattr(args, 'validate_only_ckpt', '')
     if validate_only:
@@ -412,6 +487,10 @@ if __name__ == '__main__':
                         help='验证/评估标签，记录到 metrics.json')
     parser.add_argument('--init_ckpt_path', type=str, default='',
                         help='从指定 checkpoint 初始化模型权重（optimizer 从零开始）')
+    parser.add_argument('--save_aux_best_ckpts', dest='save_aux_best_ckpts', action='store_true',
+                        help='保存 depth-best/hs-best 辅助 checkpoint；默认只记录 best epoch/score，不落盘 ckpt')
+    parser.add_argument('--no-save_aux_best_ckpts', dest='save_aux_best_ckpts', action='store_false')
+    parser.set_defaults(save_aux_best_ckpts=False)
 
     # --- 核心修改点：动态计算默认的数据集路径 ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
