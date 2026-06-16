@@ -657,6 +657,7 @@ class SnapshotDepthHS(pl.LightningModule):
             dodo_forward_norm = getattr(hparams, 'dodo_forward_norm', 'legacy_max')
             dodo_forward_scale = float(getattr(hparams, 'dodo_forward_scale', 1.0))
             dodo_sensing_mode = getattr(hparams, 'dodo_sensing_mode', 'rgb')
+            dodo_skip_prop2 = bool(getattr(hparams, 'dodo_skip_prop2', False))
             depth_layering_mode = getattr(hparams, 'depth_layering_mode', 'hard_depth')
             soft_diopter_eps = getattr(hparams, 'soft_diopter_eps', 1e-8)
             soft_diopter_bandwidth_scale = getattr(hparams, 'soft_diopter_bandwidth_scale', 1.0)
@@ -689,10 +690,12 @@ class SnapshotDepthHS(pl.LightningModule):
                 soft_diopter_eps=soft_diopter_eps,
                 soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
                 sensor_measurement=dodo_sensor_measurement,
+                skip_prop2=dodo_skip_prop2,
             )
             print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
                   f'forward_norm={dodo_forward_norm}, '
                   f'forward_scale={dodo_forward_scale:g}, '
+                  f'skip_prop2={dodo_skip_prop2}, '
                   f'depth_layering={depth_layering_mode}, '
                   f'sensor_measurement={dodo_sensor_measurement}, '
                   f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
@@ -1400,6 +1403,11 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='DoDo forward internal measurement norm mode')
         parser.add_argument('--dodo_forward_scale', type=float, default=3.7003112959862983,
                             help='Fixed DoDo sensor scale used when --dodo_forward_norm=fixed_scale')
+        parser.add_argument('--dodo_skip_prop2', dest='dodo_skip_prop2', action='store_true',
+                            help='Skip the prop2 propagation stage between doe1 and optional doe2')
+        parser.add_argument('--no-dodo_skip_prop2', dest='dodo_skip_prop2', action='store_false',
+                            help='Keep the prop2 propagation stage between doe1 and optional doe2')
+        parser.set_defaults(dodo_skip_prop2=False)
         parser.add_argument('--background_hs_loss_weight', type=float, default=0.02,
                             help='Background HS L1 loss weight for full-image visual quality')
         parser.add_argument('--dodo_sensing_mode', type=str, default='rgb',

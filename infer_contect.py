@@ -242,6 +242,181 @@ def visualize_hyperspectral(
     return float(p_min), float(p_max)
 
 
+def save_gray_png(path: str, img: np.ndarray, vmin: float, vmax: float):
+    if vmax - vmin < 1e-8:
+        vmax = vmin + 1.0
+    scaled = np.clip((img - vmin) / (vmax - vmin), 0.0, 1.0)
+    arr = (scaled * 255.0 + 0.5).astype(np.uint8)
+    try:
+        from PIL import Image
+        Image.fromarray(arr, mode='L').save(path)
+    except Exception:
+        plt.imsave(path, scaled, cmap='gray', vmin=0.0, vmax=1.0)
+
+
+def downsample_for_plot(img: np.ndarray, max_side: int = 384) -> np.ndarray:
+    h, w = img.shape[:2]
+    step = max(1, int(np.ceil(max(h, w) / float(max_side))))
+    return img[::step, ::step]
+
+
+def sampled_percentile(img: np.ndarray, q: float, max_side: int = 1024) -> float:
+    return float(np.percentile(downsample_for_plot(img, max_side=max_side), q))
+
+
+def plot_band_grid(
+    cube: np.ndarray,
+    save_path: str,
+    title: str,
+    wavelengths_nm: np.ndarray,
+    band_metrics,
+    scale_source: np.ndarray,
+    error_cube: Optional[np.ndarray] = None,
+):
+    n_bands = cube.shape[2]
+    cols = 5
+    rows = int(np.ceil(n_bands / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.0, rows * 3.25), dpi=160)
+    axes = np.asarray(axes).reshape(rows, cols)
+    metric_by_band = {int(r['band']): r for r in band_metrics}
+
+    for b in range(rows * cols):
+        ax = axes.flat[b]
+        ax.axis('off')
+        if b >= n_bands:
+            continue
+        if error_cube is None:
+            vmin = sampled_percentile(scale_source[:, :, b], 1)
+            vmax = sampled_percentile(scale_source[:, :, b], 99)
+        else:
+            vmin = 0.0
+            vmax = sampled_percentile(error_cube[:, :, b], 99)
+        if vmax - vmin < 1e-8:
+            vmax = vmin + 1.0
+        ax.imshow(downsample_for_plot(cube[:, :, b]), cmap='gray', vmin=vmin, vmax=vmax)
+        m = metric_by_band.get(b, {})
+        psnr = m.get('psnr_masked_db', float('nan'))
+        ssim = m.get('ssim_masked', float('nan'))
+        ax.set_title(
+            f"B{b:02d} {wavelengths_nm[b]:.0f}nm\nPSNR {psnr:.2f}  SSIM {ssim:.3f}",
+            fontsize=8,
+        )
+
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(save_path)
+    plt.close(fig)
+
+
+def plot_band_comparison_pages(
+    gt_hs: np.ndarray,
+    est_hs: np.ndarray,
+    output_dir: str,
+    wavelengths_nm: np.ndarray,
+    band_metrics,
+):
+    metric_by_band = {int(r['band']): r for r in band_metrics}
+    ranges = [(0, min(13, gt_hs.shape[2])), (min(13, gt_hs.shape[2]), gt_hs.shape[2])]
+    for page_idx, (start, end) in enumerate(ranges, start=1):
+        if start >= end:
+            continue
+        rows = end - start
+        fig, axes = plt.subplots(rows, 3, figsize=(9.2, rows * 2.1), dpi=160)
+        if rows == 1:
+            axes = axes[None, :]
+        for row, b in enumerate(range(start, end)):
+            vmin = sampled_percentile(gt_hs[:, :, b], 1)
+            vmax = sampled_percentile(gt_hs[:, :, b], 99)
+            if vmax - vmin < 1e-8:
+                vmax = vmin + 1.0
+            err = np.abs(est_hs[:, :, b] - gt_hs[:, :, b])
+            err_vmax = sampled_percentile(err, 99)
+            if err_vmax < 1e-8:
+                err_vmax = 1.0
+            panels = [
+                ('GT', gt_hs[:, :, b], vmin, vmax),
+                ('Pred', est_hs[:, :, b], vmin, vmax),
+                ('Abs err', err, 0.0, err_vmax),
+            ]
+            m = metric_by_band.get(b, {})
+            for col, (name, img, pmin, pmax) in enumerate(panels):
+                ax = axes[row, col]
+                ax.imshow(downsample_for_plot(img), cmap='gray', vmin=pmin, vmax=pmax)
+                ax.axis('off')
+                if col == 0:
+                    psnr = m.get('psnr_masked_db', float('nan'))
+                    ssim = m.get('ssim_masked', float('nan'))
+                    ax.set_ylabel(
+                        f"B{b:02d} {wavelengths_nm[b]:.0f}nm\nPSNR {psnr:.2f}\nSSIM {ssim:.3f}",
+                        fontsize=8,
+                        rotation=0,
+                        labelpad=42,
+                        va='center',
+                    )
+                ax.set_title(name if row == 0 else '', fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f'compare_gt_pred_error_page{page_idx}.png'))
+        plt.close(fig)
+
+
+def save_hs_band_grayscale_outputs(
+    scene_out_dir: str,
+    gt_hs: np.ndarray,
+    est_hs: np.ndarray,
+    valid_mask: np.ndarray,
+    model_hparams,
+    ssim_per_band=None,
+):
+    band_dir = os.path.join(scene_out_dir, 'hs_25band_grayscale')
+    est_dir = os.path.join(band_dir, 'predicted_bands')
+    gt_dir = os.path.join(band_dir, 'gt_bands')
+    os.makedirs(est_dir, exist_ok=True)
+    os.makedirs(gt_dir, exist_ok=True)
+
+    n_bands = est_hs.shape[2]
+    wavelengths_nm = np.linspace(
+        float(getattr(model_hparams, 'start_wl', 420e-9)) * 1e9,
+        float(getattr(model_hparams, 'end_wl', 660e-9)) * 1e9,
+        n_bands,
+    )
+    band_metrics = compute_per_band_metrics(gt_hs, est_hs, valid_mask, ssim_per_band=ssim_per_band)
+    metric_by_band = {int(r['band']): r for r in band_metrics}
+
+    for b in range(n_bands):
+        vmin = sampled_percentile(gt_hs[:, :, b], 1)
+        vmax = sampled_percentile(gt_hs[:, :, b], 99)
+        suffix = f'band_{b:02d}_{wavelengths_nm[b]:.0f}nm.png'
+        save_gray_png(os.path.join(est_dir, f'pred_{suffix}'), est_hs[:, :, b], vmin, vmax)
+        save_gray_png(os.path.join(gt_dir, f'gt_{suffix}'), gt_hs[:, :, b], vmin, vmax)
+
+    with open(os.path.join(band_dir, 'band_metrics.csv'), 'w') as f:
+        f.write('band,wavelength_nm,psnr_masked_db,mae_masked,ssim_full,ssim_masked\n')
+        for b in range(n_bands):
+            m = metric_by_band[b]
+            f.write(
+                f"{b},{wavelengths_nm[b]:.2f},{m['psnr_masked_db']:.6f},"
+                f"{m['mae_masked']:.8f},{m['ssim_full']:.8f},{m['ssim_masked']:.8f}\n"
+            )
+
+    error_cube = np.abs(est_hs - gt_hs)
+    plot_band_grid(
+        gt_hs, os.path.join(band_dir, 'gt_bands_5x5.png'),
+        'Scene01 GT hyperspectral bands', wavelengths_nm, band_metrics, gt_hs)
+    plot_band_grid(
+        est_hs, os.path.join(band_dir, 'pred_bands_5x5.png'),
+        'Scene01 predicted hyperspectral bands', wavelengths_nm, band_metrics, gt_hs)
+    plot_band_grid(
+        error_cube, os.path.join(band_dir, 'abs_error_bands_5x5.png'),
+        'Scene01 absolute error per band', wavelengths_nm, band_metrics, gt_hs, error_cube=error_cube)
+    plot_band_comparison_pages(gt_hs, est_hs, band_dir, wavelengths_nm, band_metrics)
+
+    with open(os.path.join(band_dir, 'README.txt'), 'w') as f:
+        f.write('All grayscale band images use per-band GT 1st/99th percentile scaling.\n')
+        f.write('PSNR/SSIM labels are computed on the valid depth mask, matching metrics_real.txt.\n')
+        f.write('predicted_bands contains the raw stitched model output for each of the 25 bands.\n')
+    print(f'  [Bands] 25-band grayscale outputs saved to: {band_dir}')
+
+
 def composite_hs_background(est_hs: np.ndarray, gt_hs: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     mask = (valid_mask > 0.5).astype(np.float32)[..., None]
     return est_hs * mask + gt_hs * (1.0 - mask)
@@ -430,6 +605,8 @@ def process_single_scene(
     tile_offset_y: int = 0,
     tile_offset_x: int = 0,
     depth_background: str = 'black',
+    save_hs_band_grayscale: bool = False,
+    save_rgb_visuals: bool = True,
 ):
     scene_name = os.path.splitext(os.path.basename(hs_path))[0].replace('_hs', '')
     print(f"\nProcessing scene: {scene_name} ...")
@@ -735,54 +912,63 @@ def process_single_scene(
         depth_abs_error, os.path.join(scene_out_dir, 'depth_abs_error_m.png'),
         vmin=0.0, vmax=error_vmax, valid_mask=depth_vis_mask, cmap='magma')
 
-    gt_rgb = hs_norm[..., list(rgb_bands)]
-    rgb_p_min = float(np.percentile(gt_rgb, 1))
-    rgb_p_max = float(np.percentile(gt_rgb, 99))
-    if rgb_p_max - rgb_p_min < 1e-6:
-        rgb_p_max = rgb_p_min + 1.0
+    rgb_p_min = float('nan')
+    rgb_p_max = float('nan')
+    if save_hs_band_grayscale:
+        save_hs_band_grayscale_outputs(
+            scene_out_dir, hs_norm, final_hs_norm, valid_mask, model.hparams,
+            ssim_per_band=ssim_per_band,
+        )
 
-    final_hs_foreground = final_hs_norm * (valid_mask > 0.5).astype(np.float32)[..., None]
-    final_hs_gt_background = composite_hs_background(final_hs_norm, hs_norm, valid_mask)
+    if save_rgb_visuals:
+        gt_rgb = hs_norm[..., list(rgb_bands)]
+        rgb_p_min = float(np.percentile(gt_rgb, 1))
+        rgb_p_max = float(np.percentile(gt_rgb, 99))
+        if rgb_p_max - rgb_p_min < 1e-6:
+            rgb_p_max = rgb_p_min + 1.0
 
-    # Raw model output keeps uncovered/skipped tiles as zero. This is the honest model/stitching tensor.
-    visualize_hyperspectral(
-        torch.from_numpy(final_hs_norm).permute(2, 0, 1),
-        os.path.join(scene_out_dir, 'est_hs_model_raw.png'),
-        bands=rgb_bands,
-        p_min=rgb_p_min,
-        p_max=rgb_p_max,
-    )
-    # Foreground-only view matches the training/evaluation mask.
-    visualize_hyperspectral(
-        torch.from_numpy(final_hs_foreground).permute(2, 0, 1),
-        os.path.join(scene_out_dir, 'est_hs_foreground.png'),
-        bands=rgb_bands,
-        p_min=rgb_p_min,
-        p_max=rgb_p_max,
-    )
-    # Visual inspection composite: model foreground + original HS background.
-    # This is not used for metrics; it avoids mistaking masked/skipped background for a reconstruction failure.
-    visualize_hyperspectral(
-        torch.from_numpy(final_hs_gt_background).permute(2, 0, 1),
-        os.path.join(scene_out_dir, 'est_hs_gt_background.png'),
-        bands=rgb_bands,
-        p_min=rgb_p_min,
-        p_max=rgb_p_max,
-    )
-    visualize_hyperspectral(
-        torch.from_numpy(final_hs_gt_background).permute(2, 0, 1),
-        os.path.join(scene_out_dir, 'est_hs.png'),
-        bands=rgb_bands,
-        p_min=rgb_p_min,
-        p_max=rgb_p_max,
-    )
-    visualize_hyperspectral(
-        hs_tensor,
-        os.path.join(scene_out_dir, 'gt_hs.png'),
-        bands=rgb_bands,
-        p_min=rgb_p_min,
-        p_max=rgb_p_max,
-    )
+        final_hs_foreground = final_hs_norm * (valid_mask > 0.5).astype(np.float32)[..., None]
+        final_hs_gt_background = composite_hs_background(final_hs_norm, hs_norm, valid_mask)
+
+        # Raw model output keeps uncovered/skipped tiles as zero. This is the honest model/stitching tensor.
+        visualize_hyperspectral(
+            torch.from_numpy(final_hs_norm).permute(2, 0, 1),
+            os.path.join(scene_out_dir, 'est_hs_model_raw.png'),
+            bands=rgb_bands,
+            p_min=rgb_p_min,
+            p_max=rgb_p_max,
+        )
+        # Foreground-only view matches the training/evaluation mask.
+        visualize_hyperspectral(
+            torch.from_numpy(final_hs_foreground).permute(2, 0, 1),
+            os.path.join(scene_out_dir, 'est_hs_foreground.png'),
+            bands=rgb_bands,
+            p_min=rgb_p_min,
+            p_max=rgb_p_max,
+        )
+        # Visual inspection composite: model foreground + original HS background.
+        # This is not used for metrics; it avoids mistaking masked/skipped background for a reconstruction failure.
+        visualize_hyperspectral(
+            torch.from_numpy(final_hs_gt_background).permute(2, 0, 1),
+            os.path.join(scene_out_dir, 'est_hs_gt_background.png'),
+            bands=rgb_bands,
+            p_min=rgb_p_min,
+            p_max=rgb_p_max,
+        )
+        visualize_hyperspectral(
+            torch.from_numpy(final_hs_gt_background).permute(2, 0, 1),
+            os.path.join(scene_out_dir, 'est_hs.png'),
+            bands=rgb_bands,
+            p_min=rgb_p_min,
+            p_max=rgb_p_max,
+        )
+        visualize_hyperspectral(
+            hs_tensor,
+            os.path.join(scene_out_dir, 'gt_hs.png'),
+            bands=rgb_bands,
+            p_min=rgb_p_min,
+            p_max=rgb_p_max,
+        )
 
     with open(os.path.join(scene_out_dir, 'vis_info.txt'), 'w') as f:
         f.write(f"rgb_bands={rgb_bands}\n")
@@ -790,9 +976,14 @@ def process_single_scene(
         f.write(f"rgb_percentile_max={rgb_p_max:.6f}\n")
         f.write(f"hs_norm_mode={getattr(model.hparams, 'hs_norm_mode', 'scene_max')}\n")
         f.write(f"hs_norm_scale={float(getattr(model.hparams, 'hs_norm_scale', 0.0) or 0.0):.8g}\n")
-        f.write("est_hs.png=est_hs_gt_background.png (model foreground + GT HS background for visualization only)\n")
-        f.write("est_hs_model_raw.png=raw stitched model output; skipped/uncovered areas remain black\n")
-        f.write("est_hs_foreground.png=raw model output multiplied by valid depth mask\n")
+        if save_rgb_visuals:
+            f.write("est_hs.png=est_hs_gt_background.png (model foreground + GT HS background for visualization only)\n")
+            f.write("est_hs_model_raw.png=raw stitched model output; skipped/uncovered areas remain black\n")
+            f.write("est_hs_foreground.png=raw model output multiplied by valid depth mask\n")
+        else:
+            f.write("rgb_hs_visualizations=skipped\n")
+        if save_hs_band_grayscale:
+            f.write("hs_25band_grayscale=raw stitched 25-band grayscale exports with per-band metrics\n")
         f.write(f"depth_background={depth_background}\n")
         f.write(f"depth_abs_error_m.png=absolute metric depth error; vmin=0, vmax=p99_valid_error={error_vmax:.6f}m\n")
         f.write(f"stitch_coverage_ratio={stitch_coverage_ratio:.6f}\n")
@@ -913,10 +1104,11 @@ def process_single_scene(
     return scene_name, mse_real, rmse_real, mae_real, psnr_hs_full, psnr_hs_masked, sam_hs_masked, ssim_hs_full, ssim_hs_masked, valid_ratio, pred_d_min, pred_d_max, pred_d_mean, pred_d_std, scenario_metrics
 
 
-def compute_per_band_metrics(gt_hs, est_hs, valid_mask):
+def compute_per_band_metrics(gt_hs, est_hs, valid_mask, ssim_per_band=None):
     """Compute per-band masked PSNR, MAE, and SSIM."""
     n_bands = gt_hs.shape[2]
-    _, _, ssim_per_band = calculate_hs_ssim(gt_hs, est_hs, valid_mask)
+    if ssim_per_band is None:
+        _, _, ssim_per_band = calculate_hs_ssim(gt_hs, est_hs, valid_mask)
     ssim_by_band = {r['band']: r for r in ssim_per_band}
     records = []
     for b in range(n_bands):
@@ -1207,6 +1399,10 @@ def build_args() -> argparse.Namespace:
     parser.add_argument('--depth_background', type=str, default='black',
                         choices=['black', 'colormap'],
                         help='Depth PNG background outside valid_mask')
+    parser.add_argument('--save_hs_band_grayscale', action='store_true', default=False,
+                        help='Save 25 grayscale HS band PNGs and comparison montages')
+    parser.add_argument('--skip_rgb_visuals', action='store_true', default=False,
+                        help='Skip pseudo-RGB HS visualizations')
 
     return parser.parse_args()
 
@@ -1305,6 +1501,8 @@ def main():
                 tile_offset_y=args.tile_offset_y,
                 tile_offset_x=args.tile_offset_x,
                 depth_background=args.depth_background,
+                save_hs_band_grayscale=args.save_hs_band_grayscale,
+                save_rgb_visuals=not args.skip_rgb_visuals,
             )
             all_results.append(results)
         except Exception as e:

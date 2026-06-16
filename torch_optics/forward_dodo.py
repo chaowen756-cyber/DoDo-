@@ -156,10 +156,10 @@ class DoDoForwardModel(nn.Module):
         sensing_normalize_mode: str = "global",
         use_second_doe: bool = True,
         sensor_measurement: str = "amplitude",
-        skip_prop2: bool = True,
+        skip_prop2: bool = False,
     ):
         super().__init__()
-        self.skip_prop2 = skip_prop2
+        self.skip_prop2 = bool(skip_prop2)
         self.input_size = input_size
         self.input_format = input_format.lower()
         self.output_format = output_format.lower()
@@ -227,7 +227,8 @@ class DoDoForwardModel(nn.Module):
 
         x = self.prop1(x)
         x = self.doe1(x)
-        x = self.prop2(x)
+        if not self.skip_prop2:
+            x = self.prop2(x)
         if self.use_second_doe:
             x = self.doe2(x)
         x = self.prop3(x)
@@ -257,10 +258,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
         soft_diopter_eps: float = 1e-8,
         soft_diopter_bandwidth_scale: float = 1.0,
         sensor_measurement: str = "amplitude",
-        skip_prop2: bool = True,
+        skip_prop2: bool = False,
     ):
         super().__init__()
-        self.skip_prop2 = skip_prop2
+        self.skip_prop2 = bool(skip_prop2)
         if depth_min >= depth_max:
             raise ValueError(f"depth_min ({depth_min}) must be < depth_max ({depth_max})")
         if num_depth_layers < 1:
@@ -451,8 +452,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
             if debug_stages and k == 0:
                 stage_diag.append(('doe1', _tensor_stats_real(x_k)))
 
-            x_k = self.prop2(x_k)
-            if debug_stages and k == 0:
+            if not self.skip_prop2:
+                x_k = self.prop2(x_k)
+            if debug_stages and k == 0 and not self.skip_prop2:
                 stage_diag.append(('prop2', _tensor_stats_real(x_k)))
 
             if self.use_second_doe:
@@ -508,6 +510,7 @@ def Forward_DM_Spiral_Depth(
     soft_diopter_eps=1e-8,
     soft_diopter_bandwidth_scale=1.0,
     sensor_measurement="amplitude",
+    skip_prop2=False,
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=depth_min,
@@ -528,6 +531,7 @@ def Forward_DM_Spiral_Depth(
         soft_diopter_eps=soft_diopter_eps,
         soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
         sensor_measurement=sensor_measurement,
+        skip_prop2=skip_prop2,
     )
 
 
