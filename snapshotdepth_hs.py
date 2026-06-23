@@ -75,6 +75,61 @@ class SnapshotDepthHS(pl.LightningModule):
         self._last_train_loss_logs = {}
         self._last_train_misc_logs = {}
 
+    def _build_rgb_pinv_prior_matrix(self, ridge_lambda):
+        sensing = getattr(self.camera, 'sensing_unnorm', None)
+        if sensing is None or getattr(sensing, 'sensing_mode', None) != 'rgb':
+            raise ValueError('decoder RGB pinv prior requires dodo_sensing_mode="rgb"')
+        if not all(hasattr(sensing, name) for name in ('sensor_r', 'sensor_g', 'sensor_b')):
+            raise ValueError('RGB sensor response buffers are missing; cannot build pinv prior')
+
+        response = torch.stack([
+            sensing.sensor_r.to(dtype=torch.float32),
+            sensing.sensor_g.to(dtype=torch.float32),
+            sensing.sensor_b.to(dtype=torch.float32),
+        ], dim=0)  # [3, 25], matching SensingLayer RGB collapse.
+        if response.shape != (3, int(self.hparams.hs_channels)):
+            raise ValueError(
+                f'RGB response shape {tuple(response.shape)} is incompatible with '
+                f'hs_channels={self.hparams.hs_channels}'
+            )
+
+        ridge = float(ridge_lambda)
+        if ridge < 0:
+            raise ValueError(f'decoder_rgb_pinv_lambda must be >= 0, got {ridge}')
+        eye = torch.eye(response.shape[0], dtype=response.dtype, device=response.device)
+        gram = response @ response.t()
+        return response.t() @ torch.linalg.solve(gram + ridge * eye, eye)  # [25, 3]
+
+    def _rgb_pinv_prior_from_measurement(self, captimgs):
+        if captimgs.ndim != 4 or captimgs.shape[1] != 3:
+            raise ValueError(
+                f'RGB pinv prior expects captimgs with shape [B,3,H,W], got {tuple(captimgs.shape)}'
+            )
+
+        rgb = captimgs
+        if getattr(self.hparams, 'decoder_rgb_pinv_unscale_measurement', True):
+            forward_norm = getattr(self.hparams, 'dodo_forward_norm', 'legacy_max')
+            if forward_norm == 'fixed_scale':
+                scale = float(getattr(self.hparams, 'dodo_forward_scale', 1.0) or 1.0)
+                rgb = rgb * scale
+
+        pinv = self.rgb_pinv_prior_matrix.to(device=rgb.device, dtype=rgb.dtype)
+        prior = torch.einsum('cm,bmhw->bchw', pinv, rgb)
+        prior = torch.clamp(prior, min=0.0)
+
+        norm_mode = getattr(self.hparams, 'decoder_rgb_pinv_norm', 'per_sample_max')
+        eps = 1e-8
+        if norm_mode == 'none':
+            return prior
+        if norm_mode == 'per_sample_max':
+            denom = torch.amax(prior, dim=(1, 2, 3), keepdim=True)
+            return prior / (denom + eps)
+        if norm_mode == 'per_sample_mean_std':
+            mean = prior.mean(dim=(1, 2, 3), keepdim=True)
+            std = prior.std(dim=(1, 2, 3), keepdim=True)
+            return (prior - mean) / (std + eps)
+        raise ValueError(f'Unknown decoder_rgb_pinv_norm={norm_mode}')
+
     # =================================================================================
     # ## 以下是之前缺失的、从原始文件迁移过来的 PyTorch Lightning 核心方法 ##
     # =================================================================================
@@ -729,14 +784,44 @@ class SnapshotDepthHS(pl.LightningModule):
                 hparams.measurement_channels = hparams.hs_channels
             print(self.camera)
 
-        # Decoder depth input (opt-in, default false)
+        # Decoder depth input / RGB pseudo-inverse prior (opt-in, default false)
         decoder_use_depth_input = getattr(hparams, 'decoder_use_depth_input', False)
         decoder_depth_input_mode = getattr(hparams, 'decoder_depth_input_mode', 'normalized_diopter')
+        decoder_use_rgb_pinv_prior = getattr(hparams, 'decoder_use_rgb_pinv_prior', False)
+        decoder_rgb_pinv_lambda = getattr(hparams, 'decoder_rgb_pinv_lambda', 1e-3)
+        decoder_rgb_pinv_norm = getattr(hparams, 'decoder_rgb_pinv_norm', 'per_sample_max')
+        decoder_rgb_pinv_unscale = getattr(hparams, 'decoder_rgb_pinv_unscale_measurement', True)
         hparams.decoder_use_depth_input = bool(decoder_use_depth_input)
         hparams.decoder_depth_input_mode = str(decoder_depth_input_mode)
-        hparams.decoder_in_channels = (int(hparams.measurement_channels) + 1
-                                        if hparams.decoder_use_depth_input
-                                        else int(hparams.measurement_channels))
+        hparams.decoder_use_rgb_pinv_prior = bool(decoder_use_rgb_pinv_prior)
+        hparams.decoder_rgb_pinv_lambda = float(decoder_rgb_pinv_lambda)
+        hparams.decoder_rgb_pinv_norm = str(decoder_rgb_pinv_norm)
+        hparams.decoder_rgb_pinv_unscale_measurement = bool(decoder_rgb_pinv_unscale)
+
+        if hparams.decoder_use_rgb_pinv_prior:
+            if self.optical_model_type != 'dodo_depth':
+                raise ValueError('decoder_rgb_pinv_prior is only supported for optical_model=dodo_depth')
+            if hparams.preinverse:
+                raise ValueError('decoder_rgb_pinv_prior is only supported with --no-preinverse')
+            if getattr(hparams, 'dodo_sensing_mode', 'rgb') != 'rgb' or int(hparams.measurement_channels) != 3:
+                raise ValueError('decoder_rgb_pinv_prior requires dodo_sensing_mode=rgb and measurement_channels=3')
+            if getattr(hparams, 'dodo_measurement_norm', 'none') != 'none':
+                raise ValueError('decoder_rgb_pinv_prior requires dodo_measurement_norm=none')
+            if hparams.decoder_rgb_pinv_norm not in ('none', 'per_sample_max', 'per_sample_mean_std'):
+                raise ValueError(
+                    'decoder_rgb_pinv_norm must be one of none/per_sample_max/per_sample_mean_std'
+                )
+            pinv_prior = self._build_rgb_pinv_prior_matrix(hparams.decoder_rgb_pinv_lambda)
+            self.register_buffer('rgb_pinv_prior_matrix', pinv_prior, persistent=False)
+        else:
+            self.register_buffer('rgb_pinv_prior_matrix', torch.empty(0), persistent=False)
+
+        decoder_extra_channels = 0
+        if hparams.decoder_use_depth_input:
+            decoder_extra_channels += 1
+        if hparams.decoder_use_rgb_pinv_prior:
+            decoder_extra_channels += int(hparams.hs_channels)
+        hparams.decoder_in_channels = int(hparams.measurement_channels) + decoder_extra_channels
 
         self.decoder = SimpleModel(hparams)
         decoder_norm = getattr(hparams, 'decoder_norm', 'batch')
@@ -744,6 +829,10 @@ class SnapshotDepthHS(pl.LightningModule):
         print(f'[decoder] decoder_norm={decoder_norm}, dodo_measurement_norm={dodo_meas_norm}, '
               f'decoder_use_depth_input={hparams.decoder_use_depth_input}, '
               f'decoder_depth_input_mode={hparams.decoder_depth_input_mode}, '
+              f'decoder_use_rgb_pinv_prior={hparams.decoder_use_rgb_pinv_prior}, '
+              f'decoder_rgb_pinv_lambda={hparams.decoder_rgb_pinv_lambda:g}, '
+              f'decoder_rgb_pinv_norm={hparams.decoder_rgb_pinv_norm}, '
+              f'decoder_rgb_pinv_unscale_measurement={hparams.decoder_rgb_pinv_unscale_measurement}, '
               f'decoder_in_channels={hparams.decoder_in_channels}')
         self.image_lossfn = CombinedLoss(l1_weight=hparams.l1_loss_weight)
         self.depth_lossfn = torch.nn.L1Loss()
@@ -849,6 +938,9 @@ class SnapshotDepthHS(pl.LightningModule):
             captimgs = captimgs + noise_sigma * torch.randn(captimgs.shape, device=images.device, dtype=images.dtype)
 
             captimgs = crop_boundary(captimgs, self.crop_width)
+            rgb_pinv_prior = None
+            if getattr(self.hparams, 'decoder_use_rgb_pinv_prior', False):
+                rgb_pinv_prior = self._rgb_pinv_prior_from_measurement(captimgs)
             pinv_volumes = torch.zeros(
                 captimgs.shape[0], self.hparams.hs_channels * self.hparams.n_depths,
                 captimgs.shape[2], captimgs.shape[3], device=images.device
@@ -904,6 +996,16 @@ class SnapshotDepthHS(pl.LightningModule):
             if depth_feature.shape[-2:] != captimgs.shape[-2:]:
                 depth_feature = crop_boundary(depth_feature, self.crop_width)
             captimgs = torch.cat([captimgs, depth_feature.to(captimgs.dtype)], dim=1)
+
+        if (getattr(self.hparams, 'decoder_use_rgb_pinv_prior', False)
+                and not self.hparams.preinverse):
+            if self.optical_model_type != 'dodo_depth':
+                raise ValueError('decoder_rgb_pinv_prior is only supported for dodo_depth')
+            if rgb_pinv_prior is None:
+                rgb_pinv_prior = self._rgb_pinv_prior_from_measurement(captimgs[:, :3, :, :])
+            if rgb_pinv_prior.shape[-2:] != captimgs.shape[-2:]:
+                rgb_pinv_prior = crop_boundary(rgb_pinv_prior, self.crop_width)
+            captimgs = torch.cat([captimgs, rgb_pinv_prior.to(captimgs.dtype)], dim=1)
 
         model_outputs = self.decoder(captimgs=captimgs, pinv_volumes=pinv_volumes, images=images_linear,
                                      depthmaps=depthmaps)
@@ -1416,6 +1518,25 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--dodo_sensor_measurement', type=str, default='amplitude',
                             choices=['amplitude', 'intensity'],
                             help='DoDo sensor measurement type (amplitude=abs(field), intensity=abs(field)^2)')
+        parser.add_argument('--decoder_use_rgb_pinv_prior', dest='decoder_use_rgb_pinv_prior',
+                            action='store_true',
+                            help='Concat a 25-channel ridge pseudo-inverse prior X0 computed from RGB measurement')
+        parser.add_argument('--no-decoder_use_rgb_pinv_prior', dest='decoder_use_rgb_pinv_prior',
+                            action='store_false',
+                            help='Disable RGB pseudo-inverse prior (default)')
+        parser.set_defaults(decoder_use_rgb_pinv_prior=False)
+        parser.add_argument('--decoder_rgb_pinv_lambda', type=float, default=1e-3,
+                            help='Ridge lambda for RGB sensor-response pseudo-inverse prior')
+        parser.add_argument('--decoder_rgb_pinv_norm', type=str, default='per_sample_max',
+                            choices=['none', 'per_sample_max', 'per_sample_mean_std'],
+                            help='Normalization applied to the 25-channel RGB pseudo-inverse prior before concat')
+        parser.add_argument('--decoder_rgb_pinv_unscale_measurement',
+                            dest='decoder_rgb_pinv_unscale_measurement', action='store_true',
+                            help='Undo fixed_scale forward normalization before applying the RGB pseudo-inverse')
+        parser.add_argument('--no-decoder_rgb_pinv_unscale_measurement',
+                            dest='decoder_rgb_pinv_unscale_measurement', action='store_false',
+                            help='Apply the RGB pseudo-inverse directly to normalized captimgs')
+        parser.set_defaults(decoder_rgb_pinv_unscale_measurement=True)
         parser.add_argument('--decoder_use_depth_input', dest='decoder_use_depth_input',
                             action='store_true',
                             help='Enable decoder depth input channel (concat normalized depth to captimgs)')
