@@ -16,6 +16,40 @@ from util.helper import metric_to_ips
 import OpenEXR
 import Imath
 
+STRATIFIED_CATEGORY_BITS = {
+    'depth_hard': 1,
+    'hs_bright': 2,
+    'hs_complex': 4,
+    'general': 8,
+}
+
+
+def parse_patch_category_mix(value: str) -> Dict[str, float]:
+    text = str(value or '').strip()
+    if not text:
+        return {}
+    result = {}
+    for item in text.split(','):
+        name, separator, ratio = item.strip().partition('=')
+        if not separator:
+            raise ValueError(
+                f"Invalid patch category mix item {item!r}; expected name=ratio"
+            )
+        name = name.strip()
+        if name not in STRATIFIED_CATEGORY_BITS:
+            raise ValueError(
+                f"Unknown patch category {name!r}; "
+                f"expected one of {sorted(STRATIFIED_CATEGORY_BITS)}"
+            )
+        result[name] = float(ratio)
+    if any(value < 0.0 for value in result.values()):
+        raise ValueError('Patch category ratios must be non-negative')
+    total = sum(result.values())
+    if total <= 0.0:
+        raise ValueError('Patch category ratios must sum to a positive value')
+    return {name: ratio / total for name, ratio in result.items()}
+
+
 def read_exr(file_path):
     """
     使用OpenEXR库读取.exr文件并返回一个NumPy数组。
@@ -109,6 +143,10 @@ class HyperspectralDepthDataset(Dataset):
                  min_center_valid_ratio: float = 0.0,
                  samples_per_epoch: int = 0,
                  eval_patch_index: bool = False,
+                 enumerate_patch_index: bool = False,
+                 patch_category_mix: str = '',
+                 patch_category_seed: int = 123,
+                 patch_index_hs_jitter: int = 8,
                  hs_norm_mode: str = 'scene_max',
                  hs_norm_scale: float = 0.0,
                  hs_sanity_threshold: float = 10000.0):
@@ -143,12 +181,20 @@ class HyperspectralDepthDataset(Dataset):
         self.patch_index_use_meta_thresholds = bool(patch_index_use_meta_thresholds)
         self.samples_per_epoch = max(0, int(samples_per_epoch or 0))
         self.eval_patch_index = bool(eval_patch_index and not self.is_training)
+        self.enumerate_patch_index = bool(enumerate_patch_index and self.is_training)
+        self.patch_category_mix = parse_patch_category_mix(patch_category_mix)
+        self.patch_category_seed = int(patch_category_seed)
+        self.patch_index_hs_jitter = max(0, int(patch_index_hs_jitter))
         self.hs_norm_mode = str(hs_norm_mode or 'scene_max')
         self.hs_norm_scale = float(hs_norm_scale or 0.0)
         self.hs_sanity_threshold = float(hs_sanity_threshold or 10000.0)
         self.patch_index_by_id: Dict[str, Dict[str, torch.Tensor]] = {}
         self.patch_index_meta: Dict = {}
         self.patch_index_windows: List[Tuple[str, int, int]] = []
+        self.patch_index_category_bits = dict(STRATIFIED_CATEGORY_BITS)
+        self.patch_index_scene_thresholds: Dict[str, Dict[str, float]] = {}
+        self.stratified_category_schedule: Dict[str, List[str]] = {}
+        self._hs_scene_scale_cache: Dict[str, float] = {}
 
         self.use_exr_cache = use_exr_cache
         if not exr_cache_dir:
@@ -182,12 +228,24 @@ class HyperspectralDepthDataset(Dataset):
                 pass
         self.sample_by_id = {sample['id']: sample for sample in self.sample_pairs}
 
-        if (self.patch_filter or self.eval_patch_index) and self.patch_index_path:
+        if (
+            self.patch_filter
+            or self.eval_patch_index
+            or self.enumerate_patch_index
+        ) and self.patch_index_path:
             self._load_patch_index(self.patch_index_path)
+        if self.is_training and self.patch_category_mix:
+            self._build_stratified_category_schedule()
 
         if self.eval_patch_index:
             print(
                 f"[Dataset] fixed eval patch-index mode: "
+                f"windows={len(self.patch_index_windows)}, "
+                f"samples_per_epoch={self.samples_per_epoch or 'all'}"
+            )
+        if self.enumerate_patch_index:
+            print(
+                f"[Dataset] fixed train patch-index mode: "
                 f"windows={len(self.patch_index_windows)}, "
                 f"samples_per_epoch={self.samples_per_epoch or 'all'}"
             )
@@ -202,6 +260,8 @@ class HyperspectralDepthDataset(Dataset):
     def __len__(self):
         if self.samples_per_epoch > 0:
             return self.samples_per_epoch
+        if self.enumerate_patch_index and self.patch_index_windows:
+            return len(self.patch_index_windows)
         if self.eval_patch_index and self.patch_index_windows:
             return len(self.patch_index_windows)
         return len(self.sample_pairs)
@@ -212,13 +272,14 @@ class HyperspectralDepthDataset(Dataset):
         key = hashlib.sha1(key_src.encode('utf-8')).hexdigest()
         return os.path.join(self.exr_cache_dir, f"{key}.npy")
 
-    def _read_exr_with_cache(self, exr_path: str) -> np.ndarray:
+    def _read_exr_with_cache(self, exr_path: str, mmap: bool = False) -> np.ndarray:
         if not self.use_exr_cache:
             return read_exr(exr_path)
 
         cache_path = self._cache_file_path(exr_path)
         if os.path.exists(cache_path):
-            return np.load(cache_path, allow_pickle=False)
+            mmap_mode = 'r' if mmap else None
+            return np.load(cache_path, allow_pickle=False, mmap_mode=mmap_mode)
 
         image_np = read_exr(exr_path)
         tmp_path = f"{cache_path}.tmp.{os.getpid()}.npy"
@@ -229,6 +290,8 @@ class HyperspectralDepthDataset(Dataset):
             # 多进程下可能并发写入同一缓存文件，保留先写入者即可。
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+        if mmap and os.path.exists(cache_path):
+            return np.load(cache_path, allow_pickle=False, mmap_mode='r')
         return image_np
 
     def _load_patch_index(self, patch_index_path: str) -> None:
@@ -251,12 +314,27 @@ class HyperspectralDepthDataset(Dataset):
             scores = data['scores'].astype(np.float32)
         else:
             scores = np.ones(len(tops), dtype=np.float32)
+        if 'category_masks' in data.files:
+            category_masks = data['category_masks'].astype(np.uint8)
+        else:
+            category_masks = np.zeros(len(tops), dtype=np.uint8)
+        if 'category_names' in data.files and 'category_bits' in data.files:
+            self.patch_index_category_bits = {
+                str(name): int(bit)
+                for name, bit in zip(data['category_names'], data['category_bits'])
+            }
 
         if 'meta_json' in data.files:
             try:
                 self.patch_index_meta = json.loads(str(data['meta_json'].item()))
             except Exception:
                 self.patch_index_meta = {}
+        for scene_stats in self.patch_index_meta.get('scene_stats', []):
+            scene_id = str(scene_stats.get('scene_id', ''))
+            if scene_id:
+                self.patch_index_scene_thresholds[scene_id] = dict(
+                    scene_stats.get('thresholds', {})
+                )
 
         # 默认沿用候选池生成时的阈值，保证“填入候选池路径即可使用”的复检口径一致。
         if self.patch_index_use_meta_thresholds:
@@ -265,7 +343,9 @@ class HyperspectralDepthDataset(Dataset):
             meta_center_ratio = float(self.patch_index_meta.get('min_center_valid_ratio', 0.0) or 0.0)
             if meta_valid_ratio > 0.0:
                 self.min_valid_ratio = meta_valid_ratio
-            if meta_depth_range > 0.0:
+            if self.patch_index_meta.get('index_type') == 'stratified_training':
+                self.min_depth_range_ips = meta_depth_range
+            elif meta_depth_range > 0.0:
                 self.min_depth_range_ips = meta_depth_range
             if meta_center_ratio > 0.0:
                 self.min_center_valid_ratio = meta_center_ratio
@@ -283,8 +363,9 @@ class HyperspectralDepthDataset(Dataset):
                 'tops': torch.from_numpy(tops[idx].copy()).long(),
                 'lefts': torch.from_numpy(lefts[idx].copy()).long(),
                 'scores': torch.from_numpy(scene_scores.copy()).float(),
+                'category_masks': torch.from_numpy(category_masks[idx].copy()).to(torch.uint8),
             }
-            if self.eval_patch_index:
+            if self.eval_patch_index or self.enumerate_patch_index:
                 for i in idx.tolist():
                     self.patch_index_windows.append(
                         (scene_id, int(tops[i]), int(lefts[i]))
@@ -300,6 +381,144 @@ class HyperspectralDepthDataset(Dataset):
             f"min_depth_range_ips={self.min_depth_range_ips:.3f}, "
             f"center_valid_ratio={self.min_center_valid_ratio:.3f}"
         )
+
+    def _build_stratified_category_schedule(self) -> None:
+        if not self.patch_category_mix:
+            return
+        if not self.patch_index_by_id:
+            raise ValueError('Stratified patch sampling requires a loaded patch index')
+        missing = [
+            category
+            for category in self.patch_category_mix
+            if category not in self.patch_index_category_bits
+        ]
+        if missing:
+            raise ValueError(f'Patch index is missing categories: {missing}')
+
+        scene_count = max(1, len(self.sample_pairs))
+        scene_sample_counts = {}
+        scene_category_counts = {}
+        for scene_offset, sample in enumerate(self.sample_pairs):
+            scene_id = sample['id']
+            sample_count = 0
+            if self.samples_per_epoch > scene_offset:
+                sample_count = 1 + (self.samples_per_epoch - 1 - scene_offset) // scene_count
+            scene_sample_counts[scene_id] = sample_count
+            if sample_count <= 0:
+                scene_category_counts[scene_id] = {
+                    name: 0 for name in self.patch_category_mix
+                }
+                continue
+
+            exact = {
+                name: ratio * sample_count
+                for name, ratio in self.patch_category_mix.items()
+            }
+            counts = {name: int(math.floor(value)) for name, value in exact.items()}
+            remainder = sample_count - sum(counts.values())
+            order = sorted(
+                exact,
+                key=lambda name: (exact[name] - counts[name], name),
+                reverse=True,
+            )
+            for name in order[:remainder]:
+                counts[name] += 1
+            scene_category_counts[scene_id] = counts
+
+        global_exact = {
+            name: ratio * self.samples_per_epoch
+            for name, ratio in self.patch_category_mix.items()
+        }
+        global_targets = {
+            name: int(math.floor(value)) for name, value in global_exact.items()
+        }
+        global_remainder = self.samples_per_epoch - sum(global_targets.values())
+        global_order = sorted(
+            global_exact,
+            key=lambda name: (global_exact[name] - global_targets[name], name),
+            reverse=True,
+        )
+        for name in global_order[:global_remainder]:
+            global_targets[name] += 1
+
+        current_totals = {
+            name: sum(counts[name] for counts in scene_category_counts.values())
+            for name in self.patch_category_mix
+        }
+        while current_totals != global_targets:
+            under = next(
+                name
+                for name in self.patch_category_mix
+                if current_totals[name] < global_targets[name]
+            )
+            over = next(
+                name
+                for name in self.patch_category_mix
+                if current_totals[name] > global_targets[name]
+            )
+            candidates = [
+                sample['id']
+                for sample in self.sample_pairs
+                if scene_category_counts[sample['id']][over] > 0
+            ]
+            if not candidates:
+                raise RuntimeError(
+                    f'Cannot rebalance patch categories from {over} to {under}'
+                )
+            scene_id = min(
+                candidates,
+                key=lambda item: (
+                    scene_category_counts[item][under]
+                    / max(scene_sample_counts[item], 1),
+                    item,
+                ),
+            )
+            scene_category_counts[scene_id][over] -= 1
+            scene_category_counts[scene_id][under] += 1
+            current_totals[over] -= 1
+            current_totals[under] += 1
+
+        for scene_offset, sample in enumerate(self.sample_pairs):
+            scene_id = sample['id']
+            sample_count = scene_sample_counts[scene_id]
+            counts = scene_category_counts[scene_id]
+            schedule = [
+                name
+                for name in self.patch_category_mix
+                for _ in range(counts[name])
+            ]
+            rng = np.random.default_rng(self.patch_category_seed + scene_offset)
+            rng.shuffle(schedule)
+            self.stratified_category_schedule[scene_id] = schedule
+            index = self.patch_index_by_id.get(scene_id)
+            if index is None:
+                raise ValueError(f'Patch index has no entries for {scene_id}')
+            category_masks = index['category_masks']
+            availability = {
+                name: int(
+                    torch.count_nonzero(
+                        category_masks & int(self.patch_index_category_bits[name])
+                    ).item()
+                )
+                for name in counts
+            }
+            empty = [name for name, count in availability.items() if count == 0]
+            if empty:
+                raise ValueError(f'{scene_id} has empty stratified categories: {empty}')
+            print(
+                f"[Patch Mix] {scene_id}: samples={sample_count}, "
+                + ', '.join(f"{name}={counts[name]}" for name in counts)
+                + '; pools='
+                + ', '.join(f"{name}:{availability[name]}" for name in availability)
+            )
+
+    def _stratified_category_for_index(self, sample_id: str, idx: int) -> Optional[str]:
+        schedule = self.stratified_category_schedule.get(sample_id)
+        if not schedule:
+            return None
+        scene_count = max(1, len(self.sample_pairs))
+        occurrence = int(idx) // scene_count
+        return schedule[occurrence % len(schedule)]
 
     def _patch_quality_stats(self, depth_patch: torch.Tensor, mask_patch: torch.Tensor) -> Tuple[float, float, float]:
         valid = mask_patch > 0.5
@@ -345,6 +564,152 @@ class HyperspectralDepthDataset(Dataset):
             x = torch.flip(x, dims=[-1])
         return x
 
+    def _normalize_hs_patch(
+        self, hs_patch: np.ndarray, hs_image: np.ndarray, cache_key: str
+    ) -> np.ndarray:
+        norm_mode = str(self.hs_norm_mode or 'scene_max')
+        if norm_mode != 'scene_max':
+            return normalize_hs_image(
+                hs_patch,
+                norm_mode=norm_mode,
+                norm_scale=self.hs_norm_scale,
+                sanity_threshold=self.hs_sanity_threshold,
+            )
+
+        scale = self._hs_scene_scale_cache.get(cache_key)
+        if scale is None:
+            hs_for_scale = hs_image[:, :, :self.hs_channels]
+            max_hs = float(np.max(hs_for_scale))
+            if max_hs > self.hs_sanity_threshold:
+                valid_pixels = hs_for_scale < self.hs_sanity_threshold
+                scale = float(np.max(hs_for_scale[valid_pixels])) if np.any(valid_pixels) else 1.0
+            else:
+                scale = max_hs
+            if scale <= 1e-8:
+                scale = 1.0
+            self._hs_scene_scale_cache[cache_key] = scale
+
+        patch = hs_patch.astype(np.float32, copy=False)
+        if scale < self.hs_sanity_threshold:
+            patch = np.clip(patch, 0.0, scale)
+        return patch / scale
+
+    def _patch_tensors_from_arrays(
+        self,
+        hs_image: np.ndarray,
+        depth_map: np.ndarray,
+        top: int,
+        left: int,
+        hs_cache_key: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        crop_h, crop_w = self.image_size
+        hs_patch = np.asarray(
+            hs_image[top:top + crop_h, left:left + crop_w, :self.hs_channels],
+            dtype=np.float32,
+        )
+        hs_patch = self._normalize_hs_patch(hs_patch, hs_image, hs_cache_key)
+        hs_tensor = torch.from_numpy(hs_patch).permute(2, 0, 1).unsqueeze(0).float()
+
+        if depth_map.ndim == 3:
+            depth_patch = depth_map[top:top + crop_h, left:left + crop_w, 0]
+        else:
+            depth_patch = depth_map[top:top + crop_h, left:left + crop_w]
+        depth_patch = np.asarray(depth_patch, dtype=np.float32) / 1000.0
+        valid_mask = (depth_patch > self.min_depth - 1e-3).astype(np.float32)
+
+        depth_raw_tensor = torch.from_numpy(depth_patch).float()
+        valid_mask_bool = depth_raw_tensor >= self.min_depth - 1e-3
+        depth_metric_raw = torch.clamp(depth_raw_tensor, self.min_depth, self.max_depth)
+        depth_safe = torch.where(
+            valid_mask_bool,
+            depth_raw_tensor,
+            torch.tensor(self.min_depth),
+        )
+        ips_depth = metric_to_ips(depth_safe, self.min_depth, self.max_depth)
+
+        depth_tensor = torch.clamp(ips_depth, 0.0, 1.0).unsqueeze(0).unsqueeze(0).float()
+        depth_metric_tensor = depth_metric_raw.unsqueeze(0).unsqueeze(0).float()
+        mask_tensor = torch.from_numpy(valid_mask).unsqueeze(0).unsqueeze(0).float()
+        return hs_tensor, depth_tensor, depth_metric_tensor, mask_tensor
+
+    def _depth_mask_tensors_from_arrays(
+        self, depth_map: np.ndarray, top: int, left: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        crop_h, crop_w = self.image_size
+        if depth_map.ndim == 3:
+            depth_patch = depth_map[top:top + crop_h, left:left + crop_w, 0]
+        else:
+            depth_patch = depth_map[top:top + crop_h, left:left + crop_w]
+        depth_patch = np.asarray(depth_patch, dtype=np.float32) / 1000.0
+        valid_mask = (depth_patch > self.min_depth - 1e-3).astype(np.float32)
+        depth_raw_tensor = torch.from_numpy(depth_patch).float()
+        valid_mask_bool = depth_raw_tensor >= self.min_depth - 1e-3
+        depth_safe = torch.where(
+            valid_mask_bool,
+            depth_raw_tensor,
+            torch.tensor(self.min_depth),
+        )
+        ips_depth = metric_to_ips(depth_safe, self.min_depth, self.max_depth)
+        depth_tensor = torch.clamp(ips_depth, 0.0, 1.0).unsqueeze(0).unsqueeze(0).float()
+        mask_tensor = torch.from_numpy(valid_mask).unsqueeze(0).unsqueeze(0).float()
+        return depth_tensor, mask_tensor
+
+    def _patch_passes_stratified_category(
+        self,
+        sample_id: str,
+        category: str,
+        hs_patch: np.ndarray,
+        depth_patch: torch.Tensor,
+        mask_patch: torch.Tensor,
+    ) -> bool:
+        if not self._window_passes_quality(depth_patch, mask_patch, 0, 0):
+            return False
+        if category == 'general':
+            return True
+
+        valid = mask_patch[0, 0] > 0.5
+        if not torch.any(valid):
+            return False
+        if category == 'depth_hard':
+            threshold = float(
+                self.patch_index_meta.get(
+                    'depth_hard_min_ips', self.min_depth_range_ips
+                )
+            )
+            depth_try = depth_patch[0, 0]
+            valid_depth = depth_try[valid]
+            return float((valid_depth.max() - valid_depth.min()).item()) >= threshold
+
+        valid_np = valid.numpy()
+        hs_valid = hs_patch[valid_np]
+        if hs_valid.size == 0:
+            return False
+        thresholds = self.patch_index_scene_thresholds.get(sample_id, {})
+        if category == 'hs_bright':
+            bright_value = float(self.patch_index_meta.get('bright_value_threshold', 0.8))
+            hs_rms = float(np.sqrt(np.mean(np.square(hs_valid))))
+            bright_ratio = float(np.mean(np.max(hs_patch, axis=2) >= bright_value))
+            return (
+                hs_rms >= float(thresholds.get('hs_rms_bright', 0.0))
+                or bright_ratio >= float(
+                    self.patch_index_meta.get('absolute_bright_ratio', 1.0)
+                )
+            )
+        if category == 'hs_complex':
+            spectral_var = float(np.mean(np.var(hs_valid, axis=1)))
+            intensity = np.mean(hs_patch, axis=2)
+            gradient = np.zeros_like(intensity)
+            gradient[:, 1:] += np.abs(intensity[:, 1:] - intensity[:, :-1])
+            gradient[1:, :] += np.abs(intensity[1:, :] - intensity[:-1, :])
+            spatial_gradient = float(np.mean(gradient[valid_np]))
+            return (
+                spectral_var >= float(thresholds.get('hs_spectral_var_complex', 0.0))
+                or spatial_gradient >= float(
+                    thresholds.get('hs_spatial_gradient_complex', 0.0)
+                )
+            )
+        return True
+
     def _window_passes_quality(
         self, depth_base: torch.Tensor, mask_base: torch.Tensor, top: int, left: int
     ) -> bool:
@@ -358,8 +723,8 @@ class HyperspectralDepthDataset(Dataset):
         )
 
     def _sample_patch_index_window(
-        self, sample_id: str, full_h: int, full_w: int
-    ) -> Optional[Tuple[int, int, int, int]]:
+        self, sample_id: str, full_h: int, full_w: int, category: Optional[str] = None
+    ) -> Optional[Tuple[int, int, int, int, Optional[str]]]:
         index = self.patch_index_by_id.get(sample_id)
         if not index:
             return None
@@ -369,29 +734,222 @@ class HyperspectralDepthDataset(Dataset):
         if tops.numel() == 0:
             return None
 
+        candidate_indices = torch.arange(tops.numel())
+        if category is not None:
+            bit = int(self.patch_index_category_bits[category])
+            candidate_indices = torch.nonzero(
+                (index['category_masks'] & bit) != 0, as_tuple=False
+            ).flatten()
+            if candidate_indices.numel() == 0:
+                raise RuntimeError(f'No {category} patch candidates for {sample_id}')
+
         if self.patch_index_weighted:
-            probs = index['scores']
-            pick = int(torch.multinomial(probs, 1).item())
+            probs = index['scores'][candidate_indices]
+            local_pick = int(torch.multinomial(probs, 1).item())
         else:
-            pick = int(torch.randint(0, tops.numel(), (1,)).item())
+            local_pick = int(torch.randint(0, candidate_indices.numel(), (1,)).item())
+        pick = int(candidate_indices[local_pick].item())
 
         base_top = int(tops[pick].item())
         base_left = int(lefts[pick].item())
         top, left = base_top, base_left
 
-        if self.patch_index_jitter > 0:
-            jitter = self.patch_index_jitter
+        jitter = self.patch_index_jitter
+        if category in ('hs_bright', 'hs_complex'):
+            jitter = min(jitter, self.patch_index_hs_jitter)
+        if jitter > 0:
             top += int(torch.randint(-jitter, jitter + 1, (1,)).item())
             left += int(torch.randint(-jitter, jitter + 1, (1,)).item())
 
         crop_h, crop_w = self.image_size
         top = max(0, min(top, max(0, full_h - crop_h)))
         left = max(0, min(left, max(0, full_w - crop_w)))
-        return top, left, base_top, base_left
+        return top, left, base_top, base_left, category
+
+    def _window_passes_stratified_category(
+        self,
+        sample_id: str,
+        category: str,
+        hs_image: np.ndarray,
+        depth_base: torch.Tensor,
+        mask_base: torch.Tensor,
+        top: int,
+        left: int,
+    ) -> bool:
+        if not self._window_passes_quality(depth_base, mask_base, top, left):
+            return False
+        if category == 'general':
+            return True
+
+        depth_try = self._crop_window(depth_base, top, left)
+        mask_try = self._crop_window(mask_base, top, left)
+        valid = mask_try[0, 0] > 0.5
+        if not torch.any(valid):
+            return False
+        if category == 'depth_hard':
+            threshold = float(
+                self.patch_index_meta.get(
+                    'depth_hard_min_ips', self.min_depth_range_ips
+                )
+            )
+            values = depth_try[0, 0][valid]
+            return float(values.max() - values.min()) >= threshold
+
+        crop_h, crop_w = self.image_size
+        hs_patch = hs_image[top:top + crop_h, left:left + crop_w, :]
+        hs_patch = normalize_hs_image(
+            hs_patch,
+            norm_mode=self.hs_norm_mode,
+            norm_scale=self.hs_norm_scale,
+            sanity_threshold=self.hs_sanity_threshold,
+        )
+        valid_np = valid.cpu().numpy()
+        hs_valid = hs_patch[valid_np]
+        thresholds = self.patch_index_scene_thresholds.get(sample_id, {})
+        if category == 'hs_bright':
+            hs_rms = float(np.sqrt(np.mean(hs_valid * hs_valid)))
+            bright_value = float(self.patch_index_meta.get('bright_value_threshold', 0.8))
+            bright_ratio = float(np.mean(hs_valid >= bright_value))
+            return (
+                hs_rms >= float(thresholds.get('hs_rms_bright', 0.0))
+                or bright_ratio >= float(
+                    self.patch_index_meta.get('absolute_bright_ratio', 1.0)
+                )
+            )
+        if category == 'hs_complex':
+            spectral_var = float(np.mean(np.var(hs_valid, axis=1)))
+            intensity = np.mean(hs_patch, axis=2)
+            gradient = np.zeros_like(intensity)
+            gradient[:, 1:] += np.abs(intensity[:, 1:] - intensity[:, :-1])
+            gradient[1:, :] += np.abs(intensity[1:, :] - intensity[:-1, :])
+            spatial_gradient = float(np.mean(gradient[valid_np]))
+            return (
+                spectral_var
+                >= float(thresholds.get('hs_spectral_var_complex', 0.0))
+                or spatial_gradient
+                >= float(thresholds.get('hs_spatial_gradient_complex', 0.0))
+            )
+        return True
+
+    def _getitem_patch_first(
+        self,
+        idx: int,
+        sample: Dict[str, str],
+        eval_window: Optional[Tuple[int, int]],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if self.is_training and not self.patch_filter:
+            return None
+        if str(self.hs_norm_mode or 'scene_max') not in ('fixed_scale', 'scene_max'):
+            return None
+
+        hs_path = sample['hs_path']
+        depth_path = sample['depth_path']
+        sample_id = sample['id']
+
+        try:
+            hs_image = self._read_exr_with_cache(hs_path, mmap=True)
+            depth_map = self._read_exr_with_cache(depth_path, mmap=True)
+        except Exception as e:
+            raise IOError(f"无法读取文件: {sample_id} \n错误: {e}")
+
+        if hs_image.ndim != 3:
+            raise ValueError(f"高光谱图像维度异常: {sample_id}, shape={hs_image.shape}")
+        if hs_image.shape[2] < self.hs_channels:
+            raise ValueError(
+                f"高光谱通道数不足: {sample_id}, got={hs_image.shape[2]}, required={self.hs_channels}"
+            )
+
+        full_h, full_w = depth_map.shape[:2]
+        if self.is_training and eval_window is not None:
+            top, left = eval_window
+        elif self.is_training:
+            category = self._stratified_category_for_index(sample_id, idx)
+            indexed_window = self._sample_patch_index_window(
+                sample_id, full_h, full_w, category=category
+            )
+            if indexed_window is not None:
+                top, left, base_top, base_left, category = indexed_window
+                use_retry_sampler = False
+                if category is not None and self.patch_index_strict:
+                    depth_try, mask_try = self._depth_mask_tensors_from_arrays(
+                        depth_map, top, left
+                    )
+                    crop_h, crop_w = self.image_size
+                    hs_try = np.asarray(
+                        hs_image[top:top + crop_h, left:left + crop_w, :self.hs_channels],
+                        dtype=np.float32,
+                    )
+                    if not self._patch_passes_stratified_category(
+                        sample_id, category, hs_try, depth_try, mask_try
+                    ):
+                        top, left = base_top, base_left
+                elif self.patch_index_strict:
+                    depth_try, mask_try = self._depth_mask_tensors_from_arrays(
+                        depth_map, top, left
+                    )
+                    if not self._window_passes_quality(depth_try, mask_try, 0, 0):
+                        depth_base_try, mask_base_try = self._depth_mask_tensors_from_arrays(
+                            depth_map, base_top, base_left
+                        )
+                        if self._window_passes_quality(depth_base_try, mask_base_try, 0, 0):
+                            top, left = base_top, base_left
+                        else:
+                            top, left = self._sample_random_crop_window(full_h, full_w)
+                            use_retry_sampler = True
+            else:
+                top, left = self._sample_random_crop_window(full_h, full_w)
+                use_retry_sampler = True
+
+            if use_retry_sampler:
+                for _ in range(self.max_crop_retries):
+                    depth_try, mask_try = self._depth_mask_tensors_from_arrays(
+                        depth_map, top, left
+                    )
+                    valid_ratio, depth_range, center_valid_ratio = self._patch_quality_stats(
+                        depth_try, mask_try
+                    )
+                    if (
+                        valid_ratio >= self.min_valid_ratio
+                        and depth_range >= self.min_depth_range_ips
+                        and center_valid_ratio >= self.min_center_valid_ratio
+                    ):
+                        break
+                    top, left = self._sample_random_crop_window(full_h, full_w)
+        else:
+            if eval_window is not None:
+                top, left = eval_window
+            else:
+                crop_h, crop_w = self.image_size
+                top = max(0, (full_h - crop_h) // 2)
+                left = max(0, (full_w - crop_w) // 2)
+
+        hs_tensor, depth_tensor, depth_metric_tensor, mask_tensor = self._patch_tensors_from_arrays(
+            hs_image,
+            depth_map,
+            top,
+            left,
+            self._cache_file_path(hs_path),
+        )
+
+        if self.is_training and self.augment:
+            do_vflip = bool(torch.rand(1).item() < 0.5)
+            do_hflip = bool(torch.rand(1).item() < 0.5)
+            hs_tensor = self._apply_random_flips(hs_tensor, do_vflip, do_hflip)
+            depth_tensor = self._apply_random_flips(depth_tensor, do_vflip, do_hflip)
+            depth_metric_tensor = self._apply_random_flips(depth_metric_tensor, do_vflip, do_hflip)
+            mask_tensor = self._apply_random_flips(mask_tensor, do_vflip, do_hflip)
+
+        return {
+            'id': sample_id,
+            'hs_image': hs_tensor.squeeze(0),
+            'depth_map': depth_tensor.squeeze(0).squeeze(0),
+            'depth_metric': depth_metric_tensor.squeeze(0).squeeze(0),
+            'mask': mask_tensor.squeeze(0).squeeze(0),
+        }
 
     def __getitem__(self, idx):
         eval_window = None
-        if self.eval_patch_index and self.patch_index_windows:
+        if (self.eval_patch_index or self.enumerate_patch_index) and self.patch_index_windows:
             scene_id, top, left = self.patch_index_windows[idx % len(self.patch_index_windows)]
             sample = self.sample_by_id[scene_id]
             eval_window = (top, left)
@@ -403,6 +961,10 @@ class HyperspectralDepthDataset(Dataset):
         hs_path = sample['hs_path']
         depth_path = sample['depth_path']
         sample_id = sample['id']
+
+        fast_item = self._getitem_patch_first(idx, sample, eval_window)
+        if fast_item is not None:
+            return fast_item
         
         try:
             hs_image = self._read_exr_with_cache(hs_path)
@@ -542,11 +1104,22 @@ class HyperspectralDepthDataset(Dataset):
                     crop_h_proxy = 0
                     crop_w_proxy = 0
 
-                indexed_window = self._sample_patch_index_window(sample_id, full_h, full_w)
+                category = self._stratified_category_for_index(sample_id, idx)
+                indexed_window = self._sample_patch_index_window(
+                    sample_id, full_h, full_w, category=category
+                )
                 if indexed_window is not None:
-                    top, left, base_top, base_left = indexed_window
+                    top, left, base_top, base_left, category = indexed_window
                     use_retry_sampler = False
-                    if self.patch_index_strict and not self._window_passes_quality(depth_base, mask_base, top, left):
+                    if category is not None and self.patch_index_strict:
+                        shifted_ok = self._window_passes_stratified_category(
+                            sample_id, category, hs_image, depth_base, mask_base, top, left
+                        )
+                        if not shifted_ok:
+                            top, left = base_top, base_left
+                    elif self.patch_index_strict and not self._window_passes_quality(
+                        depth_base, mask_base, top, left
+                    ):
                         if self._window_passes_quality(depth_base, mask_base, base_top, base_left):
                             top, left = base_top, base_left
                         else:

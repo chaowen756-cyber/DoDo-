@@ -169,6 +169,16 @@ def prepare_data(hparams):
             f'patch{hparams.image_sz}_stride32_valid20_range060_center10_v1.npz',
         )
         print(f'[data] auto patch_index_path: {patch_index_path}')
+    train_patch_index_path = str(
+        getattr(hparams, 'train_patch_index_path', '') or patch_index_path
+    )
+    val_patch_index_path = str(
+        getattr(hparams, 'val_patch_index_path', '') or patch_index_path
+    )
+    if train_patch_index_path:
+        print(f'[data] train patch index: {train_patch_index_path}')
+    if val_patch_index_path:
+        print(f'[data] val patch index: {val_patch_index_path}')
 
     train_samples_per_epoch = int(getattr(hparams, 'train_samples_per_epoch', 0) or 0)
     if getattr(hparams, 'baek_patch_epoch', False):
@@ -190,6 +200,11 @@ def prepare_data(hparams):
     else:
         val_patch_eval = bool(val_patch_eval_arg)
     val_samples_per_epoch = int(getattr(hparams, 'val_samples_per_epoch', 0) or 0)
+    train_patch_index_enumerate = bool(
+        getattr(hparams, 'train_patch_index_enumerate', False)
+    )
+    if train_patch_index_enumerate:
+        print('[data] fixed training patch-index enumeration enabled')
     if val_patch_eval:
         print(f'[data] fixed validation patch-index mode enabled; '
               f'val_samples_per_epoch={val_samples_per_epoch or "all"}')
@@ -211,13 +226,17 @@ def prepare_data(hparams):
         min_depth_range_ips=getattr(hparams, 'min_depth_range_ips', 0.10),
         max_crop_retries=getattr(hparams, 'max_crop_retries', 8),
         patch_filter_stride=getattr(hparams, 'patch_filter_stride', 4),
-        patch_index_path=patch_index_path,
+        patch_index_path=train_patch_index_path,
         patch_index_jitter=getattr(hparams, 'patch_index_jitter', 16),
         patch_index_strict=getattr(hparams, 'patch_index_strict', True),
         patch_index_weighted=getattr(hparams, 'patch_index_weighted', False),
         patch_index_use_meta_thresholds=getattr(hparams, 'patch_index_use_meta_thresholds', True),
         min_center_valid_ratio=getattr(hparams, 'min_center_valid_ratio', 0.0),
         samples_per_epoch=train_samples_per_epoch,
+        enumerate_patch_index=train_patch_index_enumerate,
+        patch_category_mix=getattr(hparams, 'train_patch_category_mix', ''),
+        patch_category_seed=getattr(hparams, 'train_patch_category_seed', 123),
+        patch_index_hs_jitter=getattr(hparams, 'patch_index_hs_jitter', 8),
         hs_norm_mode=getattr(hparams, 'hs_norm_mode', 'scene_max'),
         hs_norm_scale=getattr(hparams, 'hs_norm_scale', 0.0),
         hs_sanity_threshold=getattr(hparams, 'hs_sanity_threshold', 10000.0),
@@ -240,7 +259,7 @@ def prepare_data(hparams):
         min_depth_range_ips=getattr(hparams, 'min_depth_range_ips', 0.10),
         max_crop_retries=getattr(hparams, 'max_crop_retries', 8),
         patch_filter_stride=getattr(hparams, 'patch_filter_stride', 4),
-        patch_index_path=patch_index_path if val_patch_eval else '',
+        patch_index_path=val_patch_index_path if val_patch_eval else '',
         patch_index_jitter=0 if val_patch_eval else getattr(hparams, 'patch_index_jitter', 16),
         patch_index_strict=getattr(hparams, 'patch_index_strict', True),
         patch_index_weighted=getattr(hparams, 'patch_index_weighted', False),

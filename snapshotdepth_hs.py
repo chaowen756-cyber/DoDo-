@@ -1392,8 +1392,14 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='patch筛选预检步长(>1更快，=1最严格)')
         parser.add_argument('--patch_index_path', type=str, nargs='?', const='auto', default='',
                             help='离线高质量patch候选池 .npz 路径；只写参数不填值时自动使用 data_root/.patch_index 下的默认候选池')
+        parser.add_argument('--train_patch_index_path', type=str, default='',
+                            help='训练专用patch索引；为空时沿用--patch_index_path')
+        parser.add_argument('--val_patch_index_path', type=str, default='',
+                            help='验证专用patch索引；为空时沿用--patch_index_path')
         parser.add_argument('--patch_index_jitter', type=int, default=16,
                             help='候选池坐标在线随机扰动像素数；0=不扰动')
+        parser.add_argument('--patch_index_hs_jitter', type=int, default=8,
+                            help='HS高亮/复杂类别的最大坐标扰动；避免偏离光谱难例')
         parser.add_argument('--patch_index_strict', dest='patch_index_strict', action='store_true',
                             help='候选池坐标/jitter后仍按当前质量阈值复检')
         parser.add_argument('--no-patch_index_strict', dest='patch_index_strict', action='store_false')
@@ -1410,6 +1416,24 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.set_defaults(patch_index_use_meta_thresholds=True)
         parser.add_argument('--train_samples_per_epoch', type=int, default=0,
                             help='训练时每个epoch抽取的虚拟patch数；0=按真实scene数量')
+        parser.add_argument('--train_patch_index_enumerate', dest='train_patch_index_enumerate',
+                            action='store_true',
+                            help='训练时按patch index固定窗口枚举；DataLoader可打乱顺序，但epoch覆盖候选池')
+        parser.add_argument('--no-train_patch_index_enumerate', dest='train_patch_index_enumerate',
+                            action='store_false')
+        parser.set_defaults(train_patch_index_enumerate=False)
+        parser.add_argument(
+            '--train_patch_category_mix',
+            type=str,
+            default='',
+            help=(
+                '分层训练patch比例，例如 '
+                'depth_hard=0.4,hs_bright=0.2,hs_complex=0.2,general=0.2；'
+                '为空时保持旧索引采样行为'
+            ),
+        )
+        parser.add_argument('--train_patch_category_seed', type=int, default=123,
+                            help='每场景类别配额调度的固定随机种子')
         parser.add_argument('--baek_patch_epoch', dest='baek_patch_epoch', action='store_true',
                             help='Baek-style patch epoch：每个训练epoch按当前候选池规模抽取6143个patch')
         parser.add_argument('--no-baek_patch_epoch', dest='baek_patch_epoch', action='store_false')
