@@ -27,10 +27,17 @@ class SimpleModelHS(nn.Module):
         depth_ch = 1
         base_ch = hparams.model_base_ch # 32
         n_depths = hparams.n_depths
+        depth_bins = int(getattr(hparams, 'dodo_depth_layers', n_depths) or n_depths)
         # For preinverse=False: captimgs may carry extra depth channel
         # For preinverse=True: decoder depth input is not supported, captimgs unchanged
         self._expected_measurement_channels = (
             measurement_channels if hparams.preinverse else decoder_in_channels
+        )
+        self.depth_bins = depth_bins
+        self.register_buffer(
+            'depth_bin_values',
+            torch.linspace(0.0, 1.0, steps=depth_bins).view(1, depth_bins, 1, 1),
+            persistent=False,
         )
 
         # ================= 1. 适配层 (Stem) =================
@@ -67,6 +74,7 @@ class SimpleModelHS(nn.Module):
             scheme=mamba_scheme,  # 'hybrid' or 'pure'
             depth_shallow_skip_mode=depth_shallow_skip_mode,
             norm_type=decoder_norm,
+            depth_bins=depth_bins,
         )
 
         # ================= 3. 激活函数 =================
@@ -74,6 +82,8 @@ class SimpleModelHS(nn.Module):
 
         # 权重初始化
         self._init_weights()
+        if hasattr(self.backbone, 'init_depth_conditioning_identity'):
+            self.backbone.init_depth_conditioning_identity()
 
     def _init_weights(self):
         for m in self.modules():
@@ -122,12 +132,16 @@ class SimpleModelHS(nn.Module):
         depth_logits, hs_logits = self.backbone(x)
 
         # --- 4. 激活 ---
-        est_depthmaps = self.sigmoid(depth_logits)
+        # Depth is represented internally as a distribution over IPS depth bins
+        # and converted back to a continuous [0, 1] IPS depth map for the
+        # existing training/validation code.
+        depth_prob = torch.softmax(depth_logits, dim=1)
+        depth_bin_values = self.depth_bin_values.to(
+            device=depth_prob.device,
+            dtype=depth_prob.dtype,
+        )
+        est_depthmaps = torch.sum(depth_prob * depth_bin_values, dim=1)
         est_images = self.sigmoid(hs_logits)
-
-        # 调整深度图维度
-        if est_depthmaps.ndim == 4 and est_depthmaps.shape[1] == 1:
-            est_depthmaps = est_depthmaps.squeeze(1)
 
         outputs = OutputsContainer(
             est_images=est_images,

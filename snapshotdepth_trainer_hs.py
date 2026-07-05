@@ -104,6 +104,132 @@ class BestMetricTracker(Callback):
         self._update_from_trainer(trainer)
 
 
+class LossCurvePlotter(Callback):
+    """Write a lightweight train/validation loss curve during training."""
+
+    def __init__(self, output_dir, every_n_steps=50):
+        self.output_dir = output_dir
+        self.every_n_steps = max(1, int(every_n_steps))
+        self.train_points = []
+        self.val_points = []
+        self.png_path = os.path.join(output_dir, 'train_loss.png')
+        self.json_path = os.path.join(output_dir, 'loss_history.json')
+
+    @staticmethod
+    def _to_float(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            value = value.detach().cpu().item()
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @staticmethod
+    def _is_global_zero(trainer):
+        if hasattr(trainer, 'is_global_zero'):
+            return bool(trainer.is_global_zero)
+        return int(getattr(trainer, 'global_rank', 0) or 0) == 0
+
+    def _append_train_loss(self, trainer, pl_module):
+        stored = getattr(pl_module, '_last_train_loss_logs', None) or {}
+        value = self._to_float(stored.get('total_loss'))
+        if value is None:
+            metrics = getattr(trainer, 'callback_metrics', {}) or {}
+            value = self._to_float(metrics.get('train_loss/total_loss'))
+        if value is None:
+            return
+        step = int(getattr(trainer, 'global_step', 0) or 0)
+        if self.train_points and self.train_points[-1]['step'] == step:
+            self.train_points[-1]['loss'] = value
+        else:
+            self.train_points.append({'step': step, 'loss': value})
+
+    def _append_val_loss(self, trainer):
+        metrics = getattr(trainer, 'callback_metrics', {}) or {}
+        value = self._to_float(metrics.get('val_loss'))
+        if value is None:
+            return
+        step = int(getattr(trainer, 'global_step', 0) or 0)
+        epoch = int(getattr(trainer, 'current_epoch', 0) or 0)
+        if self.val_points and self.val_points[-1]['step'] == step:
+            self.val_points[-1].update({'epoch': epoch, 'loss': value})
+        else:
+            self.val_points.append({'step': step, 'epoch': epoch, 'loss': value})
+
+    def _write_history(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+        history = {
+            'train_loss/total_loss': self.train_points,
+            'val_loss': self.val_points,
+        }
+        tmp_path = self.json_path + '.tmp'
+        with open(tmp_path, 'w') as f:
+            json.dump(history, f, indent=2)
+        os.replace(tmp_path, self.json_path)
+
+    def _write_plot(self, trainer):
+        if not self.train_points and not self.val_points:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            print(f'[loss-plot] matplotlib unavailable, skip train_loss.png: {exc}')
+            return
+
+        fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
+        if self.train_points:
+            xs = [p['step'] for p in self.train_points]
+            ys = [p['loss'] for p in self.train_points]
+            ax.plot(xs, ys, label='train_loss/total_loss', color='#1f77b4', linewidth=1.2)
+        if self.val_points:
+            xs = [p['step'] for p in self.val_points]
+            ys = [p['loss'] for p in self.val_points]
+            ax.plot(xs, ys, label='val_loss', color='#d62728', marker='o', linewidth=1.6)
+        ax.set_xlabel('global step')
+        ax.set_ylabel('loss')
+        ax.set_title(f'Loss Curve (epoch {int(getattr(trainer, "current_epoch", 0) or 0)})')
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        tmp_path = self.png_path + '.tmp.png'
+        fig.savefig(tmp_path)
+        plt.close(fig)
+        os.replace(tmp_path, self.png_path)
+
+    def _flush(self, trainer):
+        self._write_history()
+        self._write_plot(trainer)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs):
+        if not self._is_global_zero(trainer):
+            return
+        self._append_train_loss(trainer, pl_module)
+        step = int(getattr(trainer, 'global_step', 0) or 0)
+        if step == 0 or step % self.every_n_steps == 0:
+            self._flush(trainer)
+
+    def on_validation_end(self, trainer, pl_module):
+        if getattr(trainer, 'sanity_checking', False):
+            return
+        if not self._is_global_zero(trainer):
+            return
+        self._append_val_loss(trainer)
+        self._flush(trainer)
+
+    def on_train_end(self, trainer, pl_module):
+        if not self._is_global_zero(trainer):
+            return
+        self._flush(trainer)
+
+
 def _patch_pl_ddp_sync_params_if_missing():
     """兼容某些 torch 版本移除了 DDP 私有方法 `_sync_params` 的情况。"""
     try:
@@ -432,7 +558,12 @@ def main(args):
     # 兼容不同 PL 版本的 Trainer 初始化参数：
     # 1) 老版本依赖 checkpoint_callback=... 来注入 save_function
     # 2) 新版本通常通过 callbacks=[...] 传入 checkpoint callback
+    loss_plot_callback = LossCurvePlotter(
+        artifact_dir,
+        every_n_steps=getattr(args, 'loss_plot_every_n_steps', 50),
+    )
     callbacks = [logmanager_callback, checkpoint_callback] + auxiliary_callbacks + [
+        loss_plot_callback,
         DOEParameterClampCallback()
     ]
     trainer_init_params = inspect.signature(Trainer.__init__).parameters
@@ -510,6 +641,8 @@ if __name__ == '__main__':
                         help='保存 depth-best/hs-best 辅助 checkpoint；默认只记录 best epoch/score，不落盘 ckpt')
     parser.add_argument('--no-save_aux_best_ckpts', dest='save_aux_best_ckpts', action='store_false')
     parser.set_defaults(save_aux_best_ckpts=False)
+    parser.add_argument('--loss_plot_every_n_steps', type=int, default=50,
+                        help='每隔多少个 global step 刷新 artifact_root/train_loss.png')
 
     # --- 核心修改点：动态计算默认的数据集路径 ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
