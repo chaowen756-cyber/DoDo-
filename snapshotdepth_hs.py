@@ -791,12 +791,19 @@ class SnapshotDepthHS(pl.LightningModule):
         decoder_rgb_pinv_lambda = getattr(hparams, 'decoder_rgb_pinv_lambda', 1e-3)
         decoder_rgb_pinv_norm = getattr(hparams, 'decoder_rgb_pinv_norm', 'per_sample_max')
         decoder_rgb_pinv_unscale = getattr(hparams, 'decoder_rgb_pinv_unscale_measurement', True)
+        hs_residual_prior = getattr(hparams, 'hs_residual_prior', False)
+        hs_residual_prior_eps = getattr(hparams, 'hs_residual_prior_eps', 1e-4)
         hparams.decoder_use_depth_input = bool(decoder_use_depth_input)
         hparams.decoder_depth_input_mode = str(decoder_depth_input_mode)
         hparams.decoder_use_rgb_pinv_prior = bool(decoder_use_rgb_pinv_prior)
         hparams.decoder_rgb_pinv_lambda = float(decoder_rgb_pinv_lambda)
         hparams.decoder_rgb_pinv_norm = str(decoder_rgb_pinv_norm)
         hparams.decoder_rgb_pinv_unscale_measurement = bool(decoder_rgb_pinv_unscale)
+        hparams.hs_residual_prior = bool(hs_residual_prior)
+        hparams.hs_residual_prior_eps = float(hs_residual_prior_eps)
+
+        if hparams.hs_residual_prior and not hparams.decoder_use_rgb_pinv_prior:
+            raise ValueError('hs_residual_prior requires decoder_use_rgb_pinv_prior')
 
         if hparams.decoder_use_rgb_pinv_prior:
             if self.optical_model_type != 'dodo_depth':
@@ -811,6 +818,11 @@ class SnapshotDepthHS(pl.LightningModule):
                 raise ValueError(
                     'decoder_rgb_pinv_norm must be one of none/per_sample_max/per_sample_mean_std'
                 )
+            if hparams.hs_residual_prior and hparams.decoder_rgb_pinv_norm == 'per_sample_mean_std':
+                raise ValueError(
+                    'hs_residual_prior requires decoder_rgb_pinv_norm=per_sample_max or none; '
+                    'per_sample_mean_std can produce negative prior values'
+                )
             pinv_prior = self._build_rgb_pinv_prior_matrix(hparams.decoder_rgb_pinv_lambda)
             self.register_buffer('rgb_pinv_prior_matrix', pinv_prior, persistent=False)
         else:
@@ -819,7 +831,7 @@ class SnapshotDepthHS(pl.LightningModule):
         decoder_extra_channels = 0
         if hparams.decoder_use_depth_input:
             decoder_extra_channels += 1
-        if hparams.decoder_use_rgb_pinv_prior:
+        if hparams.decoder_use_rgb_pinv_prior and not hparams.hs_residual_prior:
             decoder_extra_channels += int(hparams.hs_channels)
         hparams.decoder_in_channels = int(hparams.measurement_channels) + decoder_extra_channels
 
@@ -830,6 +842,8 @@ class SnapshotDepthHS(pl.LightningModule):
               f'decoder_use_depth_input={hparams.decoder_use_depth_input}, '
               f'decoder_depth_input_mode={hparams.decoder_depth_input_mode}, '
               f'decoder_use_rgb_pinv_prior={hparams.decoder_use_rgb_pinv_prior}, '
+              f'hs_residual_prior={hparams.hs_residual_prior}, '
+              f'hs_residual_prior_eps={hparams.hs_residual_prior_eps:g}, '
               f'decoder_rgb_pinv_lambda={hparams.decoder_rgb_pinv_lambda:g}, '
               f'decoder_rgb_pinv_norm={hparams.decoder_rgb_pinv_norm}, '
               f'decoder_rgb_pinv_unscale_measurement={hparams.decoder_rgb_pinv_unscale_measurement}, '
@@ -850,6 +864,7 @@ class SnapshotDepthHS(pl.LightningModule):
                 break
 
         images_linear = images
+        rgb_pinv_prior = None
 
         if self.optical_model_type == 'dodo_depth':
             # Apply valid mask to suppress invalid background spectral input
@@ -938,7 +953,6 @@ class SnapshotDepthHS(pl.LightningModule):
             captimgs = captimgs + noise_sigma * torch.randn(captimgs.shape, device=images.device, dtype=images.dtype)
 
             captimgs = crop_boundary(captimgs, self.crop_width)
-            rgb_pinv_prior = None
             if getattr(self.hparams, 'decoder_use_rgb_pinv_prior', False):
                 rgb_pinv_prior = self._rgb_pinv_prior_from_measurement(captimgs)
             pinv_volumes = torch.zeros(
@@ -1005,10 +1019,12 @@ class SnapshotDepthHS(pl.LightningModule):
                 rgb_pinv_prior = self._rgb_pinv_prior_from_measurement(captimgs[:, :3, :, :])
             if rgb_pinv_prior.shape[-2:] != captimgs.shape[-2:]:
                 rgb_pinv_prior = crop_boundary(rgb_pinv_prior, self.crop_width)
-            captimgs = torch.cat([captimgs, rgb_pinv_prior.to(captimgs.dtype)], dim=1)
+            if not getattr(self.hparams, 'hs_residual_prior', False):
+                captimgs = torch.cat([captimgs, rgb_pinv_prior.to(captimgs.dtype)], dim=1)
 
         model_outputs = self.decoder(captimgs=captimgs, pinv_volumes=pinv_volumes, images=images_linear,
-                                     depthmaps=depthmaps)
+                                     depthmaps=depthmaps,
+                                     rgb_pinv_prior=rgb_pinv_prior)
         target_images = crop_boundary(images, 2 * self.crop_width)
         target_depthmaps = crop_boundary(depthmaps, 2 * self.crop_width)
         est_images = crop_boundary(model_outputs.est_images, self.crop_width)
@@ -1544,7 +1560,7 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='DoDo sensor measurement type (amplitude=abs(field), intensity=abs(field)^2)')
         parser.add_argument('--decoder_use_rgb_pinv_prior', dest='decoder_use_rgb_pinv_prior',
                             action='store_true',
-                            help='Concat a 25-channel ridge pseudo-inverse prior X0 computed from RGB measurement')
+                            help='Enable a 25-channel ridge pseudo-inverse prior X0 computed from RGB measurement')
         parser.add_argument('--no-decoder_use_rgb_pinv_prior', dest='decoder_use_rgb_pinv_prior',
                             action='store_false',
                             help='Disable RGB pseudo-inverse prior (default)')
@@ -1553,7 +1569,16 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='Ridge lambda for RGB sensor-response pseudo-inverse prior')
         parser.add_argument('--decoder_rgb_pinv_norm', type=str, default='per_sample_max',
                             choices=['none', 'per_sample_max', 'per_sample_mean_std'],
-                            help='Normalization applied to the 25-channel RGB pseudo-inverse prior before concat')
+                            help='Normalization applied to the 25-channel RGB pseudo-inverse prior')
+        parser.add_argument('--hs_residual_prior', dest='hs_residual_prior',
+                            action='store_true',
+                            help='Use RGB pseudo-inverse prior as HS logit baseline and predict residual logits')
+        parser.add_argument('--no-hs_residual_prior', dest='hs_residual_prior',
+                            action='store_false',
+                            help='Use the RGB pseudo-inverse prior in the legacy concat-input path')
+        parser.set_defaults(hs_residual_prior=False)
+        parser.add_argument('--hs_residual_prior_eps', type=float, default=1e-4,
+                            help='Clamp epsilon before logit(prior) when --hs_residual_prior is enabled')
         parser.add_argument('--decoder_rgb_pinv_unscale_measurement',
                             dest='decoder_rgb_pinv_unscale_measurement', action='store_true',
                             help='Undo fixed_scale forward normalization before applying the RGB pseudo-inverse')

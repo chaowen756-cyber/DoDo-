@@ -19,9 +19,16 @@ class SimpleModelHS(nn.Module):
         # [ARCH-MOD-20260403] 深度浅层 skip 解耦模式。
         depth_shallow_skip_mode = getattr(hparams, 'depth_shallow_skip_mode', 'lowpass')
         decoder_norm = getattr(hparams, 'decoder_norm', 'batch')
+        self.hs_residual_prior = bool(getattr(hparams, 'hs_residual_prior', False))
+        self.hs_residual_prior_eps = float(getattr(hparams, 'hs_residual_prior_eps', 1e-4))
+        if not (0.0 < self.hs_residual_prior_eps < 0.5):
+            raise ValueError(
+                f"hs_residual_prior_eps must be in (0, 0.5), got {self.hs_residual_prior_eps}"
+            )
 
         # ================= 参数配置 =================
         hs_channels = hparams.hs_channels  # 25
+        self.hs_channels = hs_channels
         measurement_channels = getattr(hparams, 'measurement_channels', hs_channels) or hs_channels
         decoder_in_channels = getattr(hparams, 'decoder_in_channels', measurement_channels)
         depth_ch = 1
@@ -66,7 +73,10 @@ class SimpleModelHS(nn.Module):
             )
 
         # ================= 2. 核心骨干 (MambaDualHeadUNet) =================
-        print(f"Building Backbone with Scheme: {mamba_scheme} (Mamba), decoder_norm={decoder_norm}")
+        print(
+            f"Building Backbone with Scheme: {mamba_scheme} (Mamba), "
+            f"decoder_norm={decoder_norm}, hs_residual_prior={self.hs_residual_prior}"
+        )
 
         self.backbone = MambaDualHeadUNet(
             in_channels=base_ch, # 32
@@ -84,6 +94,8 @@ class SimpleModelHS(nn.Module):
         self._init_weights()
         if hasattr(self.backbone, 'init_depth_conditioning_identity'):
             self.backbone.init_depth_conditioning_identity()
+        if self.hs_residual_prior:
+            self._init_hs_residual_head_identity()
 
     def _init_weights(self):
         for m in self.modules():
@@ -96,12 +108,14 @@ class SimpleModelHS(nn.Module):
                     nn.init.constant_(m.weight, 1)
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear): # Mamba 内部可能有 Linear
-                nn.init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+
+    def _init_hs_residual_head_identity(self):
+        nn.init.constant_(self.backbone.hs_out.weight, 0)
+        if self.backbone.hs_out.bias is not None:
+            nn.init.constant_(self.backbone.hs_out.bias, 0)
 
     def forward(self, captimgs, pinv_volumes, *args, **kwargs):
+        rgb_pinv_prior = kwargs.get('rgb_pinv_prior', None)
         if captimgs.shape[1] != self._expected_measurement_channels:
             raise ValueError(
                 f"captimgs.shape[1]={captimgs.shape[1]} does not match "
@@ -141,7 +155,20 @@ class SimpleModelHS(nn.Module):
             dtype=depth_prob.dtype,
         )
         est_depthmaps = torch.sum(depth_prob * depth_bin_values, dim=1)
-        est_images = self.sigmoid(hs_logits)
+        if self.hs_residual_prior:
+            if rgb_pinv_prior is None:
+                raise ValueError('hs_residual_prior=True requires rgb_pinv_prior')
+            expected_prior_shape = (b_sz, self.hs_channels, h_sz, w_sz)
+            if tuple(rgb_pinv_prior.shape) != expected_prior_shape:
+                raise ValueError(
+                    f"rgb_pinv_prior shape {tuple(rgb_pinv_prior.shape)} does not match "
+                    f"expected {expected_prior_shape}"
+                )
+            prior = rgb_pinv_prior.to(device=hs_logits.device, dtype=hs_logits.dtype)
+            prior = prior.clamp(self.hs_residual_prior_eps, 1.0 - self.hs_residual_prior_eps)
+            est_images = torch.sigmoid(torch.logit(prior) + hs_logits)
+        else:
+            est_images = self.sigmoid(hs_logits)
 
         outputs = OutputsContainer(
             est_images=est_images,

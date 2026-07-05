@@ -31,14 +31,14 @@ class DoubleConv(nn.Module):
 
 class MambaEncoderBlock(nn.Module):
     """封装 VSSBlock 和下采样"""
-    def __init__(self, in_channels, out_channels, use_mamba=True):
+    def __init__(self, in_channels, out_channels, use_mamba=True, norm_type='batch'):
         super().__init__()
         self.use_mamba = use_mamba
         if use_mamba:
             self.channel_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
             self.feature_extract = VSSBlock(out_channels)
         else:
-            self.feature_extract = DoubleConv(in_channels, out_channels)
+            self.feature_extract = DoubleConv(in_channels, out_channels, norm_type=norm_type)
             
         self.downsample = nn.MaxPool2d(2)
 
@@ -83,12 +83,20 @@ class MambaDualHeadUNet(nn.Module):
 
         # L1: 32 -> 64
         use_mamba_l1 = False if scheme == 'hybrid' else True
-        self.encoders.append(MambaEncoderBlock(dims[0], dims[1], use_mamba=use_mamba_l1))
+        self.encoders.append(MambaEncoderBlock(
+            dims[0], dims[1], use_mamba=use_mamba_l1, norm_type=norm_type
+        ))
 
         # L2-L4: Mamba
-        self.encoders.append(MambaEncoderBlock(dims[1], dims[2], use_mamba=True)) # 64->128
-        self.encoders.append(MambaEncoderBlock(dims[2], dims[3], use_mamba=True)) # 128->256
-        self.encoders.append(MambaEncoderBlock(dims[3], dims[4], use_mamba=True)) # 256->512
+        self.encoders.append(MambaEncoderBlock(
+            dims[1], dims[2], use_mamba=True, norm_type=norm_type
+        )) # 64->128
+        self.encoders.append(MambaEncoderBlock(
+            dims[2], dims[3], use_mamba=True, norm_type=norm_type
+        )) # 128->256
+        self.encoders.append(MambaEncoderBlock(
+            dims[3], dims[4], use_mamba=True, norm_type=norm_type
+        )) # 256->512
 
         # Bottleneck: 512 -> 1024
         self.bottleneck = nn.Sequential(
@@ -197,7 +205,7 @@ class MambaDualHeadUNet(nn.Module):
         elif self.depth_shallow_skip_mode == 'lowpass':
             depth_skip_l1 = self.depth_skip_lowpass(skips[0])
             depth_skip_l1 = self.depth_skip_proj(depth_skip_l1)
-            depth_skip_l1 = depth_skip_l1 * torch.sigmoid(self.depth_skip_gate)
+            depth_skip_l1 = depth_skip_l1 * self.depth_skip_gate
         else:
             raise ValueError(f"Unknown depth_shallow_skip_mode: {self.depth_shallow_skip_mode}")
 
