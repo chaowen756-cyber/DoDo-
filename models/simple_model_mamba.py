@@ -20,6 +20,7 @@ class SimpleModelHS(nn.Module):
         depth_shallow_skip_mode = getattr(hparams, 'depth_shallow_skip_mode', 'lowpass')
         decoder_norm = getattr(hparams, 'decoder_norm', 'batch')
         detach_depth_guidance_for_hs = bool(getattr(hparams, 'detach_depth_guidance_for_hs', False))
+        isolate_hs_decoder_gradients = bool(getattr(hparams, 'isolate_hs_decoder_gradients', False))
         self.hs_residual_prior = bool(getattr(hparams, 'hs_residual_prior', False))
         self.hs_residual_prior_eps = float(getattr(hparams, 'hs_residual_prior_eps', 1e-4))
         if not (0.0 < self.hs_residual_prior_eps < 0.5):
@@ -78,6 +79,7 @@ class SimpleModelHS(nn.Module):
             f"Building Backbone with Scheme: {mamba_scheme} (Mamba), "
             f"decoder_norm={decoder_norm}, "
             f"detach_depth_guidance_for_hs={detach_depth_guidance_for_hs}, "
+            f"isolate_hs_decoder_gradients={isolate_hs_decoder_gradients}, "
             f"hs_residual_prior={self.hs_residual_prior}"
         )
 
@@ -89,6 +91,7 @@ class SimpleModelHS(nn.Module):
             norm_type=decoder_norm,
             depth_bins=depth_bins,
             detach_depth_guidance_for_hs=detach_depth_guidance_for_hs,
+            isolate_hs_decoder_gradients=isolate_hs_decoder_gradients,
         )
 
         # ================= 3. 激活函数 =================
