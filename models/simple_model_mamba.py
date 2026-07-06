@@ -19,6 +19,7 @@ class SimpleModelHS(nn.Module):
         # [ARCH-MOD-20260403] 深度浅层 skip 解耦模式。
         depth_shallow_skip_mode = getattr(hparams, 'depth_shallow_skip_mode', 'lowpass')
         decoder_norm = getattr(hparams, 'decoder_norm', 'batch')
+        detach_depth_guidance_for_hs = bool(getattr(hparams, 'detach_depth_guidance_for_hs', False))
         self.hs_residual_prior = bool(getattr(hparams, 'hs_residual_prior', False))
         self.hs_residual_prior_eps = float(getattr(hparams, 'hs_residual_prior_eps', 1e-4))
         if not (0.0 < self.hs_residual_prior_eps < 0.5):
@@ -75,7 +76,9 @@ class SimpleModelHS(nn.Module):
         # ================= 2. 核心骨干 (MambaDualHeadUNet) =================
         print(
             f"Building Backbone with Scheme: {mamba_scheme} (Mamba), "
-            f"decoder_norm={decoder_norm}, hs_residual_prior={self.hs_residual_prior}"
+            f"decoder_norm={decoder_norm}, "
+            f"detach_depth_guidance_for_hs={detach_depth_guidance_for_hs}, "
+            f"hs_residual_prior={self.hs_residual_prior}"
         )
 
         self.backbone = MambaDualHeadUNet(
@@ -85,6 +88,7 @@ class SimpleModelHS(nn.Module):
             depth_shallow_skip_mode=depth_shallow_skip_mode,
             norm_type=decoder_norm,
             depth_bins=depth_bins,
+            detach_depth_guidance_for_hs=detach_depth_guidance_for_hs,
         )
 
         # ================= 3. 激活函数 =================

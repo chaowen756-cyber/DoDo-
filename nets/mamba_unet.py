@@ -70,13 +70,14 @@ class DepthGuidedFiLM(nn.Module):
 class MambaDualHeadUNet(nn.Module):
     def __init__(self, in_channels=32, out_hs_channels=25, scheme='hybrid',
                  depth_shallow_skip_mode='lowpass', norm_type='batch',
-                 depth_bins: int = 16):
+                 depth_bins: int = 16, detach_depth_guidance_for_hs=False):
         super().__init__()
 
         # [32, 64, 128, 256, 512, 1024]
         dims = [32, 64, 128, 256, 512, 1024]
         self.enc_channels = dims
         self.depth_bins = int(depth_bins)
+        self.detach_depth_guidance_for_hs = bool(detach_depth_guidance_for_hs)
 
         # ================= Encoder =================
         self.encoders = nn.ModuleList()
@@ -215,28 +216,43 @@ class MambaDualHeadUNet(nn.Module):
         # 此时 d1 已经是 [B, 64, H, W]，直接输出
         depth_logits = self.depth_out(d1)
         depth_prob = torch.softmax(depth_logits, dim=1)
+
+        # Optionally keep HS depth conditioning but block HS losses from
+        # updating the depth decoder/head through the guidance path.
+        if self.detach_depth_guidance_for_hs:
+            d4_for_hs = d4.detach()
+            d3_for_hs = d3.detach()
+            d2_for_hs = d2.detach()
+            d1_for_hs = d1.detach()
+            depth_prob_for_hs = depth_prob.detach()
+        else:
+            d4_for_hs = d4
+            d3_for_hs = d3
+            d2_for_hs = d2
+            d1_for_hs = d1
+            depth_prob_for_hs = depth_prob
         
         # --- Decoder (HS) ---
         h4 = self.up_hs_4(bot)
         h4 = torch.cat([h4, skips[3]], dim=1)
         h4 = self.conv_hs_4(h4)
-        h4 = self.depth_guidance_4(h4, d4)
+        h4 = self.depth_guidance_4(h4, d4_for_hs)
         
         h3 = self.up_hs_3(h4)
         h3 = torch.cat([h3, skips[2]], dim=1)
         h3 = self.conv_hs_3(h3)
-        h3 = self.depth_guidance_3(h3, d3)
+        h3 = self.depth_guidance_3(h3, d3_for_hs)
         
         h2 = self.up_hs_2(h3)
         h2 = torch.cat([h2, skips[1]], dim=1)
         h2 = self.conv_hs_2(h2)
-        h2 = self.depth_guidance_2(h2, d2)
+        h2 = self.depth_guidance_2(h2, d2_for_hs)
         
         h1 = self.up_hs_1(h2)
         h1 = torch.cat([h1, skips[0]], dim=1)
         h1 = self.conv_hs_1(h1)
-        h1 = self.depth_guidance_1(h1, d1)
-        h1 = self.depth_prob_guidance(h1, depth_prob)
+        h1 = self.depth_guidance_1(h1, d1_for_hs)
+        h1 = self.depth_prob_guidance(h1, depth_prob_for_hs)
         
         hs_logits = self.hs_out(h1)
         

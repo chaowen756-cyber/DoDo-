@@ -793,6 +793,7 @@ class SnapshotDepthHS(pl.LightningModule):
         decoder_rgb_pinv_unscale = getattr(hparams, 'decoder_rgb_pinv_unscale_measurement', True)
         hs_residual_prior = getattr(hparams, 'hs_residual_prior', False)
         hs_residual_prior_eps = getattr(hparams, 'hs_residual_prior_eps', 1e-4)
+        detach_depth_guidance_for_hs = getattr(hparams, 'detach_depth_guidance_for_hs', False)
         hparams.decoder_use_depth_input = bool(decoder_use_depth_input)
         hparams.decoder_depth_input_mode = str(decoder_depth_input_mode)
         hparams.decoder_use_rgb_pinv_prior = bool(decoder_use_rgb_pinv_prior)
@@ -801,6 +802,7 @@ class SnapshotDepthHS(pl.LightningModule):
         hparams.decoder_rgb_pinv_unscale_measurement = bool(decoder_rgb_pinv_unscale)
         hparams.hs_residual_prior = bool(hs_residual_prior)
         hparams.hs_residual_prior_eps = float(hs_residual_prior_eps)
+        hparams.detach_depth_guidance_for_hs = bool(detach_depth_guidance_for_hs)
 
         if hparams.hs_residual_prior and not hparams.decoder_use_rgb_pinv_prior:
             raise ValueError('hs_residual_prior requires decoder_use_rgb_pinv_prior')
@@ -844,6 +846,7 @@ class SnapshotDepthHS(pl.LightningModule):
               f'decoder_use_rgb_pinv_prior={hparams.decoder_use_rgb_pinv_prior}, '
               f'hs_residual_prior={hparams.hs_residual_prior}, '
               f'hs_residual_prior_eps={hparams.hs_residual_prior_eps:g}, '
+              f'detach_depth_guidance_for_hs={hparams.detach_depth_guidance_for_hs}, '
               f'decoder_rgb_pinv_lambda={hparams.decoder_rgb_pinv_lambda:g}, '
               f'decoder_rgb_pinv_norm={hparams.decoder_rgb_pinv_norm}, '
               f'decoder_rgb_pinv_unscale_measurement={hparams.decoder_rgb_pinv_unscale_measurement}, '
@@ -1579,6 +1582,13 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.set_defaults(hs_residual_prior=False)
         parser.add_argument('--hs_residual_prior_eps', type=float, default=1e-4,
                             help='Clamp epsilon before logit(prior) when --hs_residual_prior is enabled')
+        parser.add_argument('--detach_depth_guidance_for_hs',
+                            dest='detach_depth_guidance_for_hs', action='store_true',
+                            help='Keep HS depth guidance values but detach them so HS loss does not update the depth decoder/head through guidance')
+        parser.add_argument('--no-detach_depth_guidance_for_hs',
+                            dest='detach_depth_guidance_for_hs', action='store_false',
+                            help='Allow HS loss gradients to flow into the depth decoder through HS depth guidance')
+        parser.set_defaults(detach_depth_guidance_for_hs=False)
         parser.add_argument('--decoder_rgb_pinv_unscale_measurement',
                             dest='decoder_rgb_pinv_unscale_measurement', action='store_true',
                             help='Undo fixed_scale forward normalization before applying the RGB pseudo-inverse')
