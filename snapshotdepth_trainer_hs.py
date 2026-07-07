@@ -269,13 +269,26 @@ def _strip_deprecated_trainer_args(args):
                 setattr(args, key, None)
 
 
+def _scene_folders_from_range(start, end):
+    start = int(start)
+    end = int(end)
+    if start < 1 or end < start:
+        raise ValueError(f'Invalid scene range: start={start}, end={end}')
+    return [f'deploy {i}' for i in range(start, end + 1)]
+
+
 def prepare_data(hparams):
     """
     为高光谱数据准备训练和验证的 DataLoader。
     """
-    all_scene_folders = [f'deploy {i}' for i in range(1, 19)]
-    train_folders = all_scene_folders[:15]
-    val_folders = all_scene_folders[15:]
+    train_folders = _scene_folders_from_range(
+        getattr(hparams, 'train_scene_start', 1),
+        getattr(hparams, 'train_scene_end', 15),
+    )
+    val_folders = _scene_folders_from_range(
+        getattr(hparams, 'val_scene_start', 16),
+        getattr(hparams, 'val_scene_end', 18),
+    )
 
     # For DoDo mode, train always uses randcrop (measurement fixed at 128x128, crop needed for valid patches)
     optical_model = getattr(hparams, 'optical_model', 'legacy_camera')
@@ -286,6 +299,8 @@ def prepare_data(hparams):
 
     print(f"训练集文件夹数量: {len(train_folders)}")
     print(f"验证集文件夹数量: {len(val_folders)}")
+    print(f"[data] train scene folders: {train_folders[0]} ... {train_folders[-1]}")
+    print(f"[data] val scene folders: {val_folders[0]} ... {val_folders[-1]}")
 
     patch_index_path = getattr(hparams, 'patch_index_path', '')
     if patch_index_path == 'auto':
@@ -650,6 +665,14 @@ if __name__ == '__main__':
     parser.add_argument('--data_root', type=str,
                         default=default_data_path,
                         help="包含 'deploy X' 文件夹的数据集根目录")
+    parser.add_argument('--train_scene_start', type=int, default=1,
+                        help='训练集起始 deploy 编号，默认 1')
+    parser.add_argument('--train_scene_end', type=int, default=15,
+                        help='训练集结束 deploy 编号，默认 15')
+    parser.add_argument('--val_scene_start', type=int, default=16,
+                        help='验证集起始 deploy 编号，默认 16')
+    parser.add_argument('--val_scene_end', type=int, default=18,
+                        help='验证集结束 deploy 编号，默认 18')
 
     parser.add_argument('--use_exr_cache', dest='use_exr_cache', action='store_true',
                         help='启用 EXR 原始读取缓存（严格等价：仅缓存 read_exr 输出）')
