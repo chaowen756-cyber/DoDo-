@@ -381,6 +381,23 @@ def prepare_data(hparams):
         hs_norm_mode=getattr(hparams, 'hs_norm_mode', 'scene_max'),
         hs_norm_scale=getattr(hparams, 'hs_norm_scale', 0.0),
         hs_sanity_threshold=getattr(hparams, 'hs_sanity_threshold', 10000.0),
+        baek_augment=getattr(hparams, 'baek_augment', False),
+        baek_scale_half_probability=getattr(
+            hparams, 'baek_scale_half_probability', 0.30
+        ),
+        baek_depth_shift_m=getattr(hparams, 'baek_depth_shift_m', 0.20),
+        baek_depth_shift_probability=getattr(
+            hparams, 'baek_depth_shift_probability', 0.50
+        ),
+        baek_illuminant_probability=getattr(
+            hparams, 'baek_illuminant_probability', 0.80
+        ),
+        baek_exposure_min=getattr(hparams, 'baek_exposure_min', 0.90),
+        baek_exposure_max=getattr(hparams, 'baek_exposure_max', 1.10),
+        baek_max_clip_ratio=getattr(hparams, 'baek_max_clip_ratio', 0.001),
+        baek_illuminant_retries=getattr(
+            hparams, 'baek_illuminant_retries', 8
+        ),
     )
 
     val_dataset = HyperspectralDepthDataset(
@@ -483,6 +500,16 @@ def main(args):
                                     cwd=os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(artifact_dir, 'git_status.txt'), 'w') as f:
             f.write(git_status.stdout if git_status.stdout else '(clean or not a git repo)\n')
+        git_revision = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            check=True,
+        )
+        with open(os.path.join(artifact_dir, 'git_commit.txt'), 'w') as f:
+            f.write(git_revision.stdout.strip() + '\n')
     except Exception:
         with open(os.path.join(artifact_dir, 'git_status.txt'), 'w') as f:
             f.write('(git status unavailable)\n')

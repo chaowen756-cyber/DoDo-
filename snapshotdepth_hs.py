@@ -200,6 +200,38 @@ class SnapshotDepthHS(pl.LightningModule):
         if valid_mask.ndim == 4:
             valid_mask = valid_mask.squeeze(1) # 确保 mask 是 [B, H, W]
 
+        if 'aug_clip_ratio' in samples:
+            augmentation_metrics = {
+                'augmentation/clip_ratio': samples['aug_clip_ratio'].float().mean(),
+                'augmentation/scale_half_ratio': (
+                    samples['aug_scale_factor'].float() < 0.75
+                ).float().mean(),
+                'augmentation/depth_shift_abs_m': samples[
+                    'aug_depth_shift_m'
+                ].float().abs().mean(),
+                'augmentation/illuminant_ratio': samples[
+                    'aug_illuminant_applied'
+                ].float().mean(),
+                'augmentation/illuminant_requested_ratio': samples[
+                    'aug_illuminant_requested'
+                ].float().mean(),
+                'augmentation/illuminant_fallback_ratio': samples[
+                    'aug_illuminant_fallback'
+                ].float().mean(),
+                'augmentation/illuminant_attempts': samples[
+                    'aug_illuminant_attempts'
+                ].float().mean(),
+                'augmentation/exposure': samples['aug_exposure'].float().mean(),
+            }
+            for metric_name, metric_value in augmentation_metrics.items():
+                self.log(
+                    metric_name,
+                    metric_value,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                )
+
         # 2. 合并 Mask 和 边界裁剪 (depth_conf)
         # 你原来的 depth_conf 是为了裁剪边缘效应
         boundary_mask = torch.ones_like(target_depthmaps)
@@ -1397,6 +1429,25 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--num_workers', type=int, default=8)
         parser.add_argument('--randcrop', default=False, action='store_true')
         parser.add_argument('--augment', default=False, action='store_true')
+        parser.add_argument(
+            '--baek_augment',
+            action='store_true',
+            help='启用同步缩放/翻转、米制深度平移和29种CIE光源增强',
+        )
+        parser.add_argument(
+            '--baek_scale_half_probability', type=float, default=0.30
+        )
+        parser.add_argument('--baek_depth_shift_m', type=float, default=0.20)
+        parser.add_argument(
+            '--baek_depth_shift_probability', type=float, default=0.50
+        )
+        parser.add_argument(
+            '--baek_illuminant_probability', type=float, default=0.80
+        )
+        parser.add_argument('--baek_exposure_min', type=float, default=0.90)
+        parser.add_argument('--baek_exposure_max', type=float, default=1.10)
+        parser.add_argument('--baek_max_clip_ratio', type=float, default=0.001)
+        parser.add_argument('--baek_illuminant_retries', type=int, default=8)
         parser.add_argument('--patch_filter', dest='patch_filter', action='store_true',
                             help='训练时对随机裁剪 patch 做质量筛选（轻量版：仅在 depth/mask 上重采样判定）')
         parser.add_argument('--no-patch_filter', dest='patch_filter', action='store_false',

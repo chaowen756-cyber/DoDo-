@@ -4,6 +4,7 @@ import hashlib
 import math
 import json
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset
 from typing import Tuple, List, Optional, Dict
@@ -11,6 +12,11 @@ from kornia.augmentation import CenterCrop
 # 假设 transform 能够处理多通道输入 (C, H, W)，如果你的 GenericRandomTransform 
 # 内部写死了只处理单通道深度图，可能需要微调，但通常 Kornia/TorchVision 都能处理多通道。
 from .generic_transform import GenericRandomTransform
+from .baek_augmentation import (
+    CIE_ILLUMINANT_NAMES,
+    apply_cie_illuminant,
+    translate_metric_depth,
+)
 from util.helper import metric_to_ips
 
 import OpenEXR
@@ -149,7 +155,16 @@ class HyperspectralDepthDataset(Dataset):
                  patch_index_hs_jitter: int = 8,
                  hs_norm_mode: str = 'scene_max',
                  hs_norm_scale: float = 0.0,
-                 hs_sanity_threshold: float = 10000.0):
+                 hs_sanity_threshold: float = 10000.0,
+                 baek_augment: bool = False,
+                 baek_scale_half_probability: float = 0.30,
+                 baek_depth_shift_m: float = 0.20,
+                 baek_depth_shift_probability: float = 0.50,
+                 baek_illuminant_probability: float = 0.80,
+                 baek_exposure_min: float = 0.90,
+                 baek_exposure_max: float = 1.10,
+                 baek_max_clip_ratio: float = 0.001,
+                 baek_illuminant_retries: int = 8):
         
         super().__init__()
         self.is_training = is_training
@@ -188,13 +203,51 @@ class HyperspectralDepthDataset(Dataset):
         self.hs_norm_mode = str(hs_norm_mode or 'scene_max')
         self.hs_norm_scale = float(hs_norm_scale or 0.0)
         self.hs_sanity_threshold = float(hs_sanity_threshold or 10000.0)
+        self.baek_augment = bool(baek_augment and self.is_training)
+        self.baek_scale_half_probability = float(baek_scale_half_probability)
+        self.baek_depth_shift_m = float(baek_depth_shift_m)
+        self.baek_depth_shift_probability = float(baek_depth_shift_probability)
+        self.baek_illuminant_probability = float(baek_illuminant_probability)
+        self.baek_exposure_min = float(baek_exposure_min)
+        self.baek_exposure_max = float(baek_exposure_max)
+        self.baek_max_clip_ratio = float(baek_max_clip_ratio)
+        self.baek_illuminant_retries = max(1, int(baek_illuminant_retries))
+        for name, probability in (
+            ('baek_scale_half_probability', self.baek_scale_half_probability),
+            ('baek_depth_shift_probability', self.baek_depth_shift_probability),
+            ('baek_illuminant_probability', self.baek_illuminant_probability),
+        ):
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError(f'{name} must be in [0, 1], got {probability}')
+        if self.baek_depth_shift_m < 0.0:
+            raise ValueError('baek_depth_shift_m must be non-negative')
+        if not 0.0 < self.baek_exposure_min <= self.baek_exposure_max:
+            raise ValueError('Baek exposure range must be positive and ordered')
+        if not 0.0 <= self.baek_max_clip_ratio <= 1.0:
+            raise ValueError('baek_max_clip_ratio must be in [0, 1]')
+        if self.baek_augment:
+            if self.hs_channels != 25:
+                raise ValueError('Baek CIE augmentation requires hs_channels=25')
+            if self.hs_norm_mode != 'fixed_scale' or self.hs_norm_scale <= 0.0:
+                raise ValueError(
+                    'Baek augmentation requires fixed global HS normalization scale'
+                )
         self.patch_index_by_id: Dict[str, Dict[str, torch.Tensor]] = {}
         self.patch_index_meta: Dict = {}
-        self.patch_index_windows: List[Tuple[str, int, int]] = []
+        self.patch_index_windows: List[Tuple[str, int, int, bool]] = []
         self.patch_index_category_bits = dict(STRATIFIED_CATEGORY_BITS)
         self.patch_index_scene_thresholds: Dict[str, Dict[str, float]] = {}
         self.stratified_category_schedule: Dict[str, List[str]] = {}
         self._hs_scene_scale_cache: Dict[str, float] = {}
+
+        if self.baek_augment:
+            print(
+                '[Baek Augment] enabled: scale={1.0,0.5}, depth_shift='
+                f'{{-{self.baek_depth_shift_m:.2f},0,+{self.baek_depth_shift_m:.2f}}}m, '
+                f'illuminants={len(CIE_ILLUMINANT_NAMES)}, exposure='
+                f'[{self.baek_exposure_min:.2f},{self.baek_exposure_max:.2f}], '
+                f'max_clip={self.baek_max_clip_ratio:.4f}'
+            )
 
         self.use_exr_cache = use_exr_cache
         if not exr_cache_dir:
@@ -232,6 +285,8 @@ class HyperspectralDepthDataset(Dataset):
             self.patch_filter
             or self.eval_patch_index
             or self.enumerate_patch_index
+            or (self.is_training and self.patch_index_path and self.patch_index_weighted)
+            or (self.baek_augment and self.patch_index_path)
         ) and self.patch_index_path:
             self._load_patch_index(self.patch_index_path)
         if self.is_training and self.patch_category_mix:
@@ -310,10 +365,20 @@ class HyperspectralDepthDataset(Dataset):
         if not (len(scene_ids) == len(tops) == len(lefts)):
             raise ValueError("patch index 字段长度不一致")
 
-        if 'scores' in data.files:
-            scores = data['scores'].astype(np.float32)
+        if 'quality_scores' in data.files:
+            quality_scores = data['quality_scores'].astype(np.float32)
+        elif 'scores' in data.files:
+            quality_scores = data['scores'].astype(np.float32)
         else:
-            scores = np.ones(len(tops), dtype=np.float32)
+            quality_scores = np.ones(len(tops), dtype=np.float32)
+        if 'sampling_weight' in data.files:
+            sampling_weights = data['sampling_weight'].astype(np.float32)
+        else:
+            sampling_weights = quality_scores.copy()
+        if 'scale_05_eligible' in data.files:
+            scale_half_eligible = data['scale_05_eligible'].astype(bool)
+        else:
+            scale_half_eligible = np.zeros(len(tops), dtype=bool)
         if 'category_masks' in data.files:
             category_masks = data['category_masks'].astype(np.uint8)
         else:
@@ -358,17 +423,28 @@ class HyperspectralDepthDataset(Dataset):
             idx = np.nonzero(scene_ids == scene_id)[0]
             if idx.size == 0:
                 continue
-            scene_scores = np.maximum(scores[idx], 1e-6)
+            scene_sampling_weights = np.maximum(sampling_weights[idx], 1e-6)
             self.patch_index_by_id[scene_id] = {
                 'tops': torch.from_numpy(tops[idx].copy()).long(),
                 'lefts': torch.from_numpy(lefts[idx].copy()).long(),
-                'scores': torch.from_numpy(scene_scores.copy()).float(),
+                'scores': torch.from_numpy(scene_sampling_weights.copy()).float(),
+                'quality_scores': torch.from_numpy(
+                    quality_scores[idx].copy()
+                ).float(),
+                'scale_half_eligible': torch.from_numpy(
+                    scale_half_eligible[idx].copy()
+                ).bool(),
                 'category_masks': torch.from_numpy(category_masks[idx].copy()).to(torch.uint8),
             }
             if self.eval_patch_index or self.enumerate_patch_index:
                 for i in idx.tolist():
                     self.patch_index_windows.append(
-                        (scene_id, int(tops[i]), int(lefts[i]))
+                        (
+                            scene_id,
+                            int(tops[i]),
+                            int(lefts[i]),
+                            bool(scale_half_eligible[i]),
+                        )
                     )
             loaded += int(idx.size)
 
@@ -376,7 +452,10 @@ class HyperspectralDepthDataset(Dataset):
             f"[Patch Index] loaded {loaded} windows from {patch_index_path}; "
             f"matched_scenes={len(self.patch_index_by_id)}/{len(self.sample_pairs)}, "
             f"jitter={self.patch_index_jitter}, strict={self.patch_index_strict}, "
-            f"weighted={self.patch_index_weighted}, use_meta_thresholds={self.patch_index_use_meta_thresholds}, "
+            f"weighted={self.patch_index_weighted}, "
+            f"sampling_weight_field={'sampling_weight' in data.files}, "
+            f"scale05_eligible={int(scale_half_eligible.sum())}, "
+            f"use_meta_thresholds={self.patch_index_use_meta_thresholds}, "
             f"min_valid_ratio={self.min_valid_ratio:.3f}, "
             f"min_depth_range_ips={self.min_depth_range_ips:.3f}, "
             f"center_valid_ratio={self.min_center_valid_ratio:.3f}"
@@ -601,36 +680,182 @@ class HyperspectralDepthDataset(Dataset):
         top: int,
         left: int,
         hs_cache_key: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        spatial_scale: float = 1.0,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+    ]:
         crop_h, crop_w = self.image_size
+        if spatial_scale not in (0.5, 1.0):
+            raise ValueError(f'Unsupported Baek spatial scale: {spatial_scale}')
+        source_h = int(round(crop_h / spatial_scale))
+        source_w = int(round(crop_w / spatial_scale))
+        source_top = top - (source_h - crop_h) // 2
+        source_left = left - (source_w - crop_w) // 2
+        if (
+            source_top < 0
+            or source_left < 0
+            or source_top + source_h > hs_image.shape[0]
+            or source_left + source_w > hs_image.shape[1]
+        ):
+            raise ValueError(
+                f'Invalid source window for scale={spatial_scale}: '
+                f'top={source_top}, left={source_left}, size={source_h}x{source_w}'
+            )
+
         hs_patch = np.asarray(
-            hs_image[top:top + crop_h, left:left + crop_w, :self.hs_channels],
+            hs_image[
+                source_top:source_top + source_h,
+                source_left:source_left + source_w,
+                :self.hs_channels,
+            ],
             dtype=np.float32,
         )
-        hs_patch = self._normalize_hs_patch(hs_patch, hs_image, hs_cache_key)
-        hs_tensor = torch.from_numpy(hs_patch).permute(2, 0, 1).unsqueeze(0).float()
 
         if depth_map.ndim == 3:
-            depth_patch = depth_map[top:top + crop_h, left:left + crop_w, 0]
+            depth_patch = depth_map[
+                source_top:source_top + source_h,
+                source_left:source_left + source_w,
+                0,
+            ]
         else:
-            depth_patch = depth_map[top:top + crop_h, left:left + crop_w]
-        depth_patch = np.asarray(depth_patch, dtype=np.float32) / 1000.0
+            depth_patch = depth_map[
+                source_top:source_top + source_h,
+                source_left:source_left + source_w,
+            ]
+        depth_patch = np.asarray(depth_patch, dtype=np.float32).copy() / 1000.0
         valid_mask = (depth_patch > self.min_depth - 1e-3).astype(np.float32)
 
-        depth_raw_tensor = torch.from_numpy(depth_patch).float()
-        valid_mask_bool = depth_raw_tensor >= self.min_depth - 1e-3
-        depth_metric_raw = torch.clamp(depth_raw_tensor, self.min_depth, self.max_depth)
-        depth_safe = torch.where(
-            valid_mask_bool,
-            depth_raw_tensor,
-            torch.tensor(self.min_depth),
-        )
-        ips_depth = metric_to_ips(depth_safe, self.min_depth, self.max_depth)
+        if self.baek_augment:
+            hs_patch = np.array(hs_patch, dtype=np.float32, copy=True)
+            finite_valid = np.isfinite(hs_patch) & (
+                hs_patch < self.hs_sanity_threshold
+            )
+            safe_max = float(np.max(hs_patch[finite_valid])) if np.any(finite_valid) else 1.0
+            hs_patch = np.nan_to_num(
+                hs_patch,
+                nan=0.0,
+                posinf=safe_max,
+                neginf=0.0,
+            )
+            hs_patch = np.clip(hs_patch, 0.0, safe_max)
+            hs_tensor = torch.from_numpy(hs_patch).permute(2, 0, 1).unsqueeze(0)
+        else:
+            hs_patch = self._normalize_hs_patch(hs_patch, hs_image, hs_cache_key)
+            hs_tensor = torch.from_numpy(hs_patch).permute(2, 0, 1).unsqueeze(0)
 
-        depth_tensor = torch.clamp(ips_depth, 0.0, 1.0).unsqueeze(0).unsqueeze(0).float()
-        depth_metric_tensor = depth_metric_raw.unsqueeze(0).unsqueeze(0).float()
-        mask_tensor = torch.from_numpy(valid_mask).unsqueeze(0).unsqueeze(0).float()
-        return hs_tensor, depth_tensor, depth_metric_tensor, mask_tensor
+        depth_raw_tensor = torch.from_numpy(depth_patch).unsqueeze(0).unsqueeze(0)
+        mask_tensor = torch.from_numpy(valid_mask).unsqueeze(0).unsqueeze(0)
+        if spatial_scale != 1.0:
+            hs_tensor = F.interpolate(
+                hs_tensor.float(),
+                size=self.image_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+            depth_raw_tensor = F.interpolate(
+                depth_raw_tensor.float(), size=self.image_size, mode='nearest'
+            )
+            mask_tensor = F.interpolate(
+                mask_tensor.float(), size=self.image_size, mode='nearest'
+            )
+
+        illuminant_index = -1
+        illuminant_requested = False
+        illuminant_attempts = 0
+        exposure = 1.0
+        clip_ratio = 0.0
+        requested_shift = 0.0
+        applied_shift = 0.0
+        if self.baek_augment:
+            exposure = self.baek_exposure_min + float(torch.rand(1).item()) * (
+                self.baek_exposure_max - self.baek_exposure_min
+            )
+            hs_raw_tensor = hs_tensor.float()
+            illuminant_requested = bool(
+                torch.rand(1).item() < self.baek_illuminant_probability
+            )
+            hs_normalized = None
+            if illuminant_requested:
+                for attempt in range(self.baek_illuminant_retries):
+                    candidate_index = int(
+                        torch.randint(0, len(CIE_ILLUMINANT_NAMES), (1,)).item()
+                    )
+                    candidate = apply_cie_illuminant(
+                        hs_raw_tensor, candidate_index, exposure
+                    ) / self.hs_norm_scale
+                    candidate_clip_ratio = float(
+                        ((candidate < 0.0) | (candidate > 1.0))
+                        .float()
+                        .mean()
+                        .item()
+                    )
+                    illuminant_attempts = attempt + 1
+                    if candidate_clip_ratio <= self.baek_max_clip_ratio:
+                        illuminant_index = candidate_index
+                        hs_normalized = candidate
+                        break
+            if hs_normalized is None:
+                hs_normalized = apply_cie_illuminant(
+                    hs_raw_tensor, -1, exposure
+                ) / self.hs_norm_scale
+            clip_ratio = float(
+                ((hs_normalized < 0.0) | (hs_normalized > 1.0))
+                .float()
+                .mean()
+                .item()
+            )
+            hs_tensor = hs_normalized.clamp(0.0, 1.0)
+
+            if torch.rand(1).item() < self.baek_depth_shift_probability:
+                direction = -1.0 if torch.rand(1).item() < 0.5 else 1.0
+                requested_shift = direction * self.baek_depth_shift_m
+
+        valid_mask_bool = mask_tensor > 0.5
+        depth_metric_tensor = torch.where(
+            valid_mask_bool,
+            depth_raw_tensor.clamp(self.min_depth, self.max_depth),
+            torch.full_like(depth_raw_tensor, self.min_depth),
+        )
+        if self.baek_augment:
+            depth_metric_tensor, applied_shift = translate_metric_depth(
+                depth_metric_tensor,
+                mask_tensor,
+                requested_shift,
+                self.min_depth,
+                self.max_depth,
+            )
+        ips_depth = metric_to_ips(
+            depth_metric_tensor, self.min_depth, self.max_depth
+        )
+
+        depth_tensor = torch.clamp(ips_depth, 0.0, 1.0).float()
+        augmentation = {
+            'aug_scale_factor': torch.tensor(float(spatial_scale)),
+            'aug_depth_shift_requested_m': torch.tensor(float(requested_shift)),
+            'aug_depth_shift_m': torch.tensor(float(applied_shift)),
+            'aug_illuminant_index': torch.tensor(float(illuminant_index)),
+            'aug_illuminant_requested': torch.tensor(
+                float(illuminant_requested)
+            ),
+            'aug_illuminant_applied': torch.tensor(float(illuminant_index >= 0)),
+            'aug_illuminant_attempts': torch.tensor(float(illuminant_attempts)),
+            'aug_illuminant_fallback': torch.tensor(
+                float(illuminant_requested and illuminant_index < 0)
+            ),
+            'aug_exposure': torch.tensor(float(exposure)),
+            'aug_clip_ratio': torch.tensor(float(clip_ratio)),
+        }
+        return (
+            hs_tensor.float(),
+            depth_tensor,
+            depth_metric_tensor.float(),
+            mask_tensor.float(),
+            augmentation,
+        )
 
     def _depth_mask_tensors_from_arrays(
         self, depth_map: np.ndarray, top: int, left: int
@@ -723,8 +948,13 @@ class HyperspectralDepthDataset(Dataset):
         )
 
     def _sample_patch_index_window(
-        self, sample_id: str, full_h: int, full_w: int, category: Optional[str] = None
-    ) -> Optional[Tuple[int, int, int, int, Optional[str]]]:
+        self,
+        sample_id: str,
+        full_h: int,
+        full_w: int,
+        category: Optional[str] = None,
+        require_scale_half: bool = False,
+    ) -> Optional[Tuple[int, int, int, int, Optional[str], bool]]:
         index = self.patch_index_by_id.get(sample_id)
         if not index:
             return None
@@ -743,6 +973,19 @@ class HyperspectralDepthDataset(Dataset):
             if candidate_indices.numel() == 0:
                 raise RuntimeError(f'No {category} patch candidates for {sample_id}')
 
+        use_scale_half = bool(require_scale_half)
+        if use_scale_half:
+            eligible = index['scale_half_eligible'][candidate_indices]
+            candidate_indices = candidate_indices[eligible]
+            if candidate_indices.numel() == 0:
+                use_scale_half = False
+                candidate_indices = torch.arange(tops.numel())
+                if category is not None:
+                    bit = int(self.patch_index_category_bits[category])
+                    candidate_indices = torch.nonzero(
+                        (index['category_masks'] & bit) != 0, as_tuple=False
+                    ).flatten()
+
         if self.patch_index_weighted:
             probs = index['scores'][candidate_indices]
             local_pick = int(torch.multinomial(probs, 1).item())
@@ -754,7 +997,7 @@ class HyperspectralDepthDataset(Dataset):
         base_left = int(lefts[pick].item())
         top, left = base_top, base_left
 
-        jitter = self.patch_index_jitter
+        jitter = 0 if use_scale_half else self.patch_index_jitter
         if category in ('hs_bright', 'hs_complex'):
             jitter = min(jitter, self.patch_index_hs_jitter)
         if jitter > 0:
@@ -764,7 +1007,7 @@ class HyperspectralDepthDataset(Dataset):
         crop_h, crop_w = self.image_size
         top = max(0, min(top, max(0, full_h - crop_h)))
         left = max(0, min(left, max(0, full_w - crop_w)))
-        return top, left, base_top, base_left, category
+        return top, left, base_top, base_left, category, use_scale_half
 
     def _window_passes_stratified_category(
         self,
@@ -835,9 +1078,14 @@ class HyperspectralDepthDataset(Dataset):
         self,
         idx: int,
         sample: Dict[str, str],
-        eval_window: Optional[Tuple[int, int]],
+        eval_window: Optional[Tuple[int, int, bool]],
     ) -> Optional[Dict[str, torch.Tensor]]:
-        if self.is_training and not self.patch_filter:
+        if (
+            self.is_training
+            and not self.patch_filter
+            and not self.baek_augment
+            and not self.patch_index_by_id
+        ):
             return None
         if str(self.hs_norm_mode or 'scene_max') not in ('fixed_scale', 'scene_max'):
             return None
@@ -860,15 +1108,36 @@ class HyperspectralDepthDataset(Dataset):
             )
 
         full_h, full_w = depth_map.shape[:2]
+        use_scale_half = False
         if self.is_training and eval_window is not None:
-            top, left = eval_window
+            top, left, scale_half_eligible = eval_window
+            use_scale_half = bool(
+                self.baek_augment
+                and scale_half_eligible
+                and torch.rand(1).item() < self.baek_scale_half_probability
+            )
         elif self.is_training:
             category = self._stratified_category_for_index(sample_id, idx)
+            request_scale_half = bool(
+                self.baek_augment
+                and torch.rand(1).item() < self.baek_scale_half_probability
+            )
             indexed_window = self._sample_patch_index_window(
-                sample_id, full_h, full_w, category=category
+                sample_id,
+                full_h,
+                full_w,
+                category=category,
+                require_scale_half=request_scale_half,
             )
             if indexed_window is not None:
-                top, left, base_top, base_left, category = indexed_window
+                (
+                    top,
+                    left,
+                    base_top,
+                    base_left,
+                    category,
+                    use_scale_half,
+                ) = indexed_window
                 use_retry_sampler = False
                 if category is not None and self.patch_index_strict:
                     depth_try, mask_try = self._depth_mask_tensors_from_arrays(
@@ -895,9 +1164,11 @@ class HyperspectralDepthDataset(Dataset):
                             top, left = base_top, base_left
                         else:
                             top, left = self._sample_random_crop_window(full_h, full_w)
+                            use_scale_half = False
                             use_retry_sampler = True
             else:
                 top, left = self._sample_random_crop_window(full_h, full_w)
+                use_scale_half = False
                 use_retry_sampler = True
 
             if use_retry_sampler:
@@ -915,23 +1186,31 @@ class HyperspectralDepthDataset(Dataset):
                     ):
                         break
                     top, left = self._sample_random_crop_window(full_h, full_w)
+                use_scale_half = False
         else:
             if eval_window is not None:
-                top, left = eval_window
+                top, left = eval_window[:2]
             else:
                 crop_h, crop_w = self.image_size
                 top = max(0, (full_h - crop_h) // 2)
                 left = max(0, (full_w - crop_w) // 2)
 
-        hs_tensor, depth_tensor, depth_metric_tensor, mask_tensor = self._patch_tensors_from_arrays(
+        (
+            hs_tensor,
+            depth_tensor,
+            depth_metric_tensor,
+            mask_tensor,
+            augmentation,
+        ) = self._patch_tensors_from_arrays(
             hs_image,
             depth_map,
             top,
             left,
             self._cache_file_path(hs_path),
+            spatial_scale=0.5 if use_scale_half else 1.0,
         )
 
-        if self.is_training and self.augment:
+        if self.is_training and (self.augment or self.baek_augment):
             do_vflip = bool(torch.rand(1).item() < 0.5)
             do_hflip = bool(torch.rand(1).item() < 0.5)
             hs_tensor = self._apply_random_flips(hs_tensor, do_vflip, do_hflip)
@@ -939,20 +1218,25 @@ class HyperspectralDepthDataset(Dataset):
             depth_metric_tensor = self._apply_random_flips(depth_metric_tensor, do_vflip, do_hflip)
             mask_tensor = self._apply_random_flips(mask_tensor, do_vflip, do_hflip)
 
-        return {
+        item = {
             'id': sample_id,
             'hs_image': hs_tensor.squeeze(0),
             'depth_map': depth_tensor.squeeze(0).squeeze(0),
             'depth_metric': depth_metric_tensor.squeeze(0).squeeze(0),
             'mask': mask_tensor.squeeze(0).squeeze(0),
         }
+        if self.baek_augment:
+            item.update(augmentation)
+        return item
 
     def __getitem__(self, idx):
         eval_window = None
         if (self.eval_patch_index or self.enumerate_patch_index) and self.patch_index_windows:
-            scene_id, top, left = self.patch_index_windows[idx % len(self.patch_index_windows)]
+            scene_id, top, left, scale_half_eligible = self.patch_index_windows[
+                idx % len(self.patch_index_windows)
+            ]
             sample = self.sample_by_id[scene_id]
-            eval_window = (top, left)
+            eval_window = (top, left, scale_half_eligible)
         else:
             if self.samples_per_epoch > 0:
                 idx = idx % len(self.sample_pairs)
@@ -1188,7 +1472,7 @@ class HyperspectralDepthDataset(Dataset):
 
         else:
             if eval_window is not None:
-                top, left = eval_window
+                top, left = eval_window[:2]
                 hs_tensor = hs_window_tensor(top, left) if defer_hs_norm else self._crop_window(hs_tensor, top, left)
                 depth_tensor = self._crop_window(depth_tensor, top, left)
                 depth_metric_tensor = self._crop_window(depth_metric_tensor, top, left)
