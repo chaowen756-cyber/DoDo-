@@ -1,6 +1,9 @@
 # Number 18: Baek 增强与深度分布均衡
 
-本分支保持 number17 的模型、loss、DOE、固定验证块和无噪声设置不变，只修改训练数据分布。
+本分支保持 number16/17 两阶段方案中的模型、loss、DOE、固定验证块和无噪声设置不变，只修改训练数据分布。
+
+- Stage A 沿用 number16：随机初始化，不传 `--init_ckpt_path`，不开启 13B，联合优化 CNN 与光学，训练 12 epoch。
+- Stage B 沿用 number17：只加载胜出 Stage A 的 `joint-best`，开启 13B，冻结光学并使用 Baek 学习率衰减，训练 30 epoch。
 
 ## 实现口径
 
@@ -24,7 +27,7 @@ bash scripts/run_number18_baek_balanced.sh stage-a-augment
 bash scripts/run_number18_baek_balanced.sh stage-a-combined
 ```
 
-Stage A 各运行 12 epoch。比较固定验证集后，仅对最佳变体运行 Stage B：
+Stage A 各自从零运行 12 epoch。完成 block-val 与独立 OOD-val 评估后，仅对最佳变体运行 Stage B：
 
 ```bash
 INIT_CKPT=/path/to/stageA/joint-best-epoch=XXX.ckpt \

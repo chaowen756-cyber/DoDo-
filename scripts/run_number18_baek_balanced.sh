@@ -13,7 +13,6 @@ SOURCE_TRAIN_INDEX="${SOURCE_TRAIN_INDEX:-${DATA_ROOT}/.patch_index/train_patch1
 VAL_INDEX="${VAL_INDEX:-${DATA_ROOT}/.patch_index/val_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_v1.npz}"
 BALANCED_INDEX="${BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
 BALANCE_REPORT="${BALANCE_REPORT:-${BALANCED_INDEX%.npz}.json}"
-NUMBER17_CKPT="${NUMBER17_CKPT:-${EXPERIMENT_ROOT}/number_17_13b_finetune_from_number16_blockval10_nooverlap_test14_18_2gpu/artifacts/checkpoints/joint-best-epoch=029.ckpt}"
 
 build_index() {
   cd "${ROOT_DIR}"
@@ -55,19 +54,48 @@ variant_args() {
 run_training() {
   local experiment_name="$1"
   local max_epochs="$2"
-  local init_ckpt="$3"
-  local variant="$4"
+  local variant="$3"
+  local stage="$4"
+  local init_ckpt="${5:-}"
   local experiment_dir="${EXPERIMENT_ROOT}/${experiment_name}"
   local -a extra_args
+  local -a stage_args
   mapfile -t extra_args < <(variant_args "${variant}")
+
+  case "${stage}" in
+    stage_a)
+      stage_args=(
+        --optimize_optics
+        --cnn_lr 1e-4
+        --optics_lr 1e-7
+        --lr_decay_strategy none
+      )
+      ;;
+    stage_b)
+      if [[ -z "${init_ckpt}" || ! -f "${init_ckpt}" ]]; then
+        echo "Stage B initial checkpoint not found: ${init_ckpt}" >&2
+        exit 1
+      fi
+      stage_args=(
+        --init_ckpt_path "${init_ckpt}"
+        --isolate_hs_decoder_gradients
+        --no-optimize_optics
+        --cnn_lr 1e-4
+        --optics_lr 0.0
+        --lr_decay_strategy baek
+        --cnn_lr_decay_epochs 20
+        --optics_lr_decay_epochs 10
+      )
+      ;;
+    *)
+      echo "Unknown training stage: ${stage}" >&2
+      exit 2
+      ;;
+  esac
 
   if [[ ! -f "${BALANCED_INDEX}" ]]; then
     echo "Balanced index not found: ${BALANCED_INDEX}" >&2
     echo "Run: $0 build-index" >&2
-    exit 1
-  fi
-  if [[ ! -f "${init_ckpt}" ]]; then
-    echo "Initial checkpoint not found: ${init_ckpt}" >&2
     exit 1
   fi
   if [[ -e "${experiment_dir}/artifacts/command.txt" && "${ALLOW_EXISTING:-0}" != "1" ]]; then
@@ -81,8 +109,6 @@ run_training() {
     --experiment_name "${experiment_name}" \
     --default_root_dir "${experiment_dir}/lightning" \
     --artifact_root "${experiment_dir}/artifacts" \
-    --init_ckpt_path "${init_ckpt}" \
-    --isolate_hs_decoder_gradients \
     --require_artifact_root \
     --save_aux_best_ckpts \
     --data_root "${DATA_ROOT}" \
@@ -155,13 +181,8 @@ run_training() {
     --checkpoint_monitor val_loss \
     --checkpoint_mode min \
     --val_check_interval 0.25 \
-    --no-optimize_optics \
-    --cnn_lr 1e-4 \
-    --optics_lr 0.0 \
-    --lr_decay_strategy baek \
-    --cnn_lr_decay_epochs 20 \
-    --optics_lr_decay_epochs 10 \
     --max_epochs "${max_epochs}" \
+    "${stage_args[@]}" \
     "${extra_args[@]}"
 }
 
@@ -170,13 +191,13 @@ case "${1:-}" in
     build_index
     ;;
   stage-a-balanced)
-    run_training number_18a_balanced_only_stageA_12ep "${MAX_EPOCHS:-12}" "${NUMBER17_CKPT}" balanced
+    run_training number_18a_balanced_only_stageA_12ep "${MAX_EPOCHS:-12}" balanced stage_a
     ;;
   stage-a-augment)
-    run_training number_18b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" "${NUMBER17_CKPT}" augment
+    run_training number_18b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" augment stage_a
     ;;
   stage-a-combined)
-    run_training number_18c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" "${NUMBER17_CKPT}" combined
+    run_training number_18c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" combined stage_a
     ;;
   stage-b)
     if [[ -z "${INIT_CKPT:-}" ]]; then
@@ -184,7 +205,7 @@ case "${1:-}" in
       exit 2
     fi
     VARIANT="${VARIANT:-combined}"
-    run_training "number_18d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${INIT_CKPT}" "${VARIANT}"
+    run_training "number_18d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
     ;;
   *)
     echo "Usage: $0 {build-index|stage-a-balanced|stage-a-augment|stage-a-combined|stage-b}" >&2
