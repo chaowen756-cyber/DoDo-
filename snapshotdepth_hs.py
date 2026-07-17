@@ -162,23 +162,30 @@ class SnapshotDepthHS(pl.LightningModule):
             self.camera.clamp_parameters_()
             self._clamp_hook_count += 1
             if self._clamp_hook_count == 1:
-                print('[doe_diag] clamp_parameters_() executed (first call)')
+                print('[optics_diag] clamp_parameters_() executed (first call)')
 
     def configure_optimizers(self):
         param_groups = []
-        optics_params = list(self.camera.parameters())
+        # Frozen surrogate weights remain part of the camera state_dict, but must
+        # never enter the optimizer. Only trainable optical design variables do.
+        optics_params = [p for p in self.camera.parameters() if p.requires_grad]
         if self.hparams.optimize_optics and len(optics_params) > 0:
             param_groups.append({'params': optics_params, 'lr': self.hparams.optics_lr, 'name': 'optics'})
         param_groups.append({'params': self.decoder.parameters(), 'lr': self.hparams.cnn_lr, 'name': 'cnn'})
         optimizer = torch.optim.Adam(param_groups)
 
-        # DOE param group identity diagnostics
-        if self.hparams.optimize_optics and hasattr(self.camera, 'doe1') and hasattr(self.camera.doe1, 'zernike_coeffs'):
-            zc = self.camera.doe1.zernike_coeffs
-            if isinstance(zc, nn.Parameter):
-                in_optics = any(zc is p for pg in optimizer.param_groups if pg.get('name') == 'optics' for p in pg['params'])
-                print(f'[doe_diag] doe1.zernike_coeffs.requires_grad={zc.requires_grad}, '
-                      f'in optics param group (by identity)={in_optics}')
+        if self.hparams.optimize_optics and hasattr(self.camera, 'optical_design_named_parameters'):
+            for name, parameter in self.camera.optical_design_named_parameters():
+                in_optics = any(
+                    parameter is p
+                    for pg in optimizer.param_groups
+                    if pg.get('name') == 'optics'
+                    for p in pg['params']
+                )
+                print(
+                    f'[optics_diag] {name}.requires_grad={parameter.requires_grad}, '
+                    f'in optics param group (by identity)={in_optics}'
+                )
         return optimizer
 
 
@@ -251,25 +258,40 @@ class SnapshotDepthHS(pl.LightningModule):
         # 3. 计算 Loss (传入 final_mask)
         data_loss, loss_logs = self.__compute_loss(outputs, outputs.target_depthmaps, outputs.target_images, final_mask)
 
-        # --- DOE diagnostics (first training step only) ---
+        # --- Optical-design diagnostics (first training step only) ---
         if not self._doe_diag_done and self.hparams.optimize_optics and self.optical_model_type == 'dodo_depth':
             self._doe_diag_done = True
-            if hasattr(self.camera, 'doe1') and hasattr(self.camera.doe1, 'zernike_coeffs'):
-                zc = self.camera.doe1.zernike_coeffs
-                print(f'[doe_diag] doe1.zernike_coeffs.requires_grad={zc.requires_grad}')
-                # Register backward hook to capture grad stats
-                def _make_doe_grad_hook():
-                    def hook(grad):
-                        if grad is not None:
-                            gnorm = grad.norm().item()
-                            gfinite = torch.isfinite(grad).all().item()
-                            print(f'[doe_diag] doe1.zernike_coeffs.grad norm={gnorm:.6f}, finite={gfinite}')
-                            self._doe_grad_norms.append(gnorm)
-                        else:
-                            print('[doe_diag] WARNING: doe1.zernike_coeffs.grad is None after backward')
-                    return hook
-                zc.register_hook(_make_doe_grad_hook())
-                print(f'[doe_diag] registered backward hook on doe1.zernike_coeffs')
+            if hasattr(self.camera, 'optical_design_named_parameters'):
+                for design_name, design_parameter in self.camera.optical_design_named_parameters():
+                    print(
+                        f'[optics_diag] {design_name}.requires_grad='
+                        f'{design_parameter.requires_grad}'
+                    )
+
+                    def _make_design_grad_hook(parameter_name):
+                        def hook(grad):
+                            if grad is not None:
+                                gnorm = grad.norm().item()
+                                gfinite = torch.isfinite(grad).all().item()
+                                print(
+                                    f'[optics_diag] {parameter_name}.grad '
+                                    f'norm={gnorm:.6f}, finite={gfinite}'
+                                )
+                                self._doe_grad_norms.append(gnorm)
+                            else:
+                                print(
+                                    f'[optics_diag] WARNING: {parameter_name}.grad '
+                                    f'is None after backward'
+                                )
+                        return hook
+
+                    if design_parameter.requires_grad:
+                        design_parameter.register_hook(
+                            _make_design_grad_hook(design_name)
+                        )
+                        print(
+                            f'[optics_diag] registered backward hook on {design_name}'
+                        )
             # Verify optimizer param group membership by identity
             if hasattr(self.trainer, 'optimizers') and self.trainer.optimizers:
                 opt = self.trainer.optimizers[0]
@@ -278,10 +300,10 @@ class SnapshotDepthHS(pl.LightningModule):
                     if pg.get('name') == 'optics':
                         found_optics = True
                         n_params = len(pg['params'])
-                        print(f'[doe_diag] optics param group has {n_params} params')
+                        print(f'[optics_diag] optics param group has {n_params} params')
                         break
                 if not found_optics:
-                    print('[doe_diag] WARNING: no optics param group found in optimizer')
+                    print('[optics_diag] WARNING: no optics param group found in optimizer')
 
         # --- Effect diagnostics (periodic, forward-pass only) ---
         if self.global_step % 50 == 0:
@@ -331,6 +353,16 @@ class SnapshotDepthHS(pl.LightningModule):
                     'diag/captimgs_mean': capt.mean(),
                     'diag/captimgs_std': capt.std(),
                 })
+            if (
+                self.optical_model_type == 'dodo_depth'
+                and getattr(self.camera, 'optical_element_type', 'doe')
+                == 'tio2_metasurface'
+            ):
+                metasurface_diag = self.camera.doe1.diagnostics()
+                misc_logs.update({
+                    f'optics/metasurface_{key}': value
+                    for key, value in metasurface_diag.items()
+                })
         if self.hparams.optimize_optics and self.optical_model_type == 'legacy_camera':
              misc_logs.update({
                 'optics/heightmap_max': self.camera.heightmap1d().max(),
@@ -378,17 +410,17 @@ class SnapshotDepthHS(pl.LightningModule):
                     if p.grad is not None:
                         total_norm += p.grad.norm().item() ** 2
                 grad_norms[f'{head_name}_head'] = total_norm ** 0.5
-        # DOE zernike grad
-        if hasattr(self, 'camera') and hasattr(self.camera, 'doe1') and hasattr(self.camera.doe1, 'zernike_coeffs'):
-            zc = self.camera.doe1.zernike_coeffs
-            if isinstance(zc, nn.Parameter) and zc.grad is not None:
-                gnorm = zc.grad.norm().item()
-                gfinite = torch.isfinite(zc.grad).all().item()
-                grad_norms['doe_zernike'] = gnorm
-                grad_norms['doe_zernike_finite'] = float(gfinite)
-            else:
-                grad_norms['doe_zernike'] = 0.0
-                grad_norms['doe_zernike_finite'] = 0.0
+        # DOE or metasurface optical-design gradients.
+        if hasattr(self, 'camera') and hasattr(self.camera, 'optical_design_named_parameters'):
+            for design_name, parameter in self.camera.optical_design_named_parameters():
+                if parameter.grad is not None:
+                    gnorm = parameter.grad.norm().item()
+                    gfinite = torch.isfinite(parameter.grad).all().item()
+                    grad_norms[design_name] = gnorm
+                    grad_norms[f'{design_name}_finite'] = float(gfinite)
+                else:
+                    grad_norms[design_name] = 0.0
+                    grad_norms[f'{design_name}_finite'] = 0.0
         # Log all grad norms
         for k, v in grad_norms.items():
             self.log(f'diag/grad_{k}', v if isinstance(v, float) else float(v), on_step=True)
@@ -749,6 +781,10 @@ class SnapshotDepthHS(pl.LightningModule):
             soft_diopter_eps = getattr(hparams, 'soft_diopter_eps', 1e-8)
             soft_diopter_bandwidth_scale = getattr(hparams, 'soft_diopter_bandwidth_scale', 1.0)
             dodo_sensor_measurement = getattr(hparams, 'dodo_sensor_measurement', 'amplitude')
+            dodo_optical_element = getattr(hparams, 'dodo_optical_element', 'doe')
+            metasurface_checkpoint_path = getattr(
+                hparams, 'metasurface_checkpoint_path', ''
+            )
             # Determine measurement_channels from sensing mode
             if dodo_sensing_mode == 'rgb':
                 hparams.measurement_channels = 3
@@ -778,16 +814,53 @@ class SnapshotDepthHS(pl.LightningModule):
                 soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
                 sensor_measurement=dodo_sensor_measurement,
                 skip_prop2=dodo_skip_prop2,
+                optical_element_type=dodo_optical_element,
+                metasurface_checkpoint_path=metasurface_checkpoint_path,
+                metasurface_polarization=getattr(
+                    hparams, 'metasurface_polarization', 'x'
+                ),
+                metasurface_geometry_seed=getattr(
+                    hparams, 'metasurface_geometry_seed', 123
+                ),
+                metasurface_init_logit_range=getattr(
+                    hparams, 'metasurface_init_logit_range', 1.0
+                ),
+                metasurface_mlp_chunk_size=getattr(
+                    hparams, 'metasurface_mlp_chunk_size', 16384
+                ),
+                metasurface_use_activation_checkpoint=getattr(
+                    hparams, 'metasurface_use_activation_checkpoint', True
+                ),
+                metasurface_clamp_amplitude=getattr(
+                    hparams, 'metasurface_clamp_amplitude', True
+                ),
+                metasurface_cache_frozen=getattr(
+                    hparams, 'metasurface_cache_frozen', True
+                ),
             )
-            print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
+            print(f'[dodo_depth] optical_element={dodo_optical_element}, '
+                  f'doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
                   f'forward_norm={dodo_forward_norm}, '
                   f'forward_scale={dodo_forward_scale:g}, '
                   f'skip_prop2={dodo_skip_prop2}, '
                   f'depth_layering={depth_layering_mode}, '
                   f'sensor_measurement={dodo_sensor_measurement}, '
-                  f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
-                  f'doe1.zernike_coeffs.requires_grad='
-                  f'{self.camera.doe1.zernike_coeffs.requires_grad}')
+                  f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}')
+            if dodo_optical_element == 'tio2_metasurface':
+                checkpoint_epoch = getattr(self.camera.doe1, 'checkpoint_epoch', None)
+                print(
+                    f'[metasurface] checkpoint={metasurface_checkpoint_path}, '
+                    f'epoch={checkpoint_epoch}, '
+                    f'polarization={self.camera.doe1.polarization}, '
+                    f'geometry_trainable={self.camera.doe1.length_raw.requires_grad}, '
+                    f'mlp_weights_trainable='
+                    f'{any(p.requires_grad for p in self.camera.doe1.surrogate.parameters())}'
+                )
+            elif hasattr(self.camera.doe1, 'zernike_coeffs'):
+                print(
+                    f'[dodo_depth] doe1.zernike_coeffs.requires_grad='
+                    f'{self.camera.doe1.zernike_coeffs.requires_grad}'
+                )
             # measurement_channels = 3 (RGB sensing output)
             if not hasattr(hparams, 'measurement_channels') or hparams.measurement_channels is None:
                 hparams.measurement_channels = 3
@@ -1405,6 +1478,80 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='Soft diopter triangular bandwidth multiplier')
         parser.add_argument('--dodo_doe_type', type=str, default='Zeros',
                             help='DoDo DOE 类型（Zeros=frozen, New=trainable Zernike）')
+        parser.add_argument(
+            '--dodo_optical_element',
+            type=str,
+            default='doe',
+            choices=['doe', 'tio2_metasurface'],
+            help='DoDo 第一光学元件：传统 DOE 或固定 x/y 偏振 TiO2 超表面',
+        )
+        parser.add_argument(
+            '--metasurface_checkpoint_path',
+            type=str,
+            default='',
+            help='TiO2 FDTD SIREN model.ckpt；使用 tio2_metasurface 时必填',
+        )
+        parser.add_argument(
+            '--metasurface_polarization',
+            type=str,
+            default='x',
+            choices=['x', 'y'],
+            help='标量超表面采用的固定线偏振响应（第一版推荐 x/txx）',
+        )
+        parser.add_argument(
+            '--metasurface_geometry_seed',
+            type=int,
+            default=123,
+            help='L/W 全局几何图的确定性初始化种子',
+        )
+        parser.add_argument(
+            '--metasurface_init_logit_range',
+            type=float,
+            default=1.0,
+            help='L/W sigmoid 原始参数的均匀初始化范围 [-r,r]',
+        )
+        parser.add_argument(
+            '--metasurface_mlp_chunk_size',
+            type=int,
+            default=16384,
+            help='TiO2 SIREN 分块推理大小',
+        )
+        parser.add_argument(
+            '--metasurface_use_activation_checkpoint',
+            dest='metasurface_use_activation_checkpoint',
+            action='store_true',
+            help='Stage A 使用原生非重入 activation checkpoint 节省 MLP 显存',
+        )
+        parser.add_argument(
+            '--no-metasurface_use_activation_checkpoint',
+            dest='metasurface_use_activation_checkpoint',
+            action='store_false',
+        )
+        parser.set_defaults(metasurface_use_activation_checkpoint=True)
+        parser.add_argument(
+            '--metasurface_clamp_amplitude',
+            dest='metasurface_clamp_amplitude',
+            action='store_true',
+            help='将 SIREN 预测透射振幅限制到物理范围 [0,1]',
+        )
+        parser.add_argument(
+            '--no-metasurface_clamp_amplitude',
+            dest='metasurface_clamp_amplitude',
+            action='store_false',
+        )
+        parser.set_defaults(metasurface_clamp_amplitude=True)
+        parser.add_argument(
+            '--metasurface_cache_frozen',
+            dest='metasurface_cache_frozen',
+            action='store_true',
+            help='Stage B 缓存冻结后的 25 波段复透射图',
+        )
+        parser.add_argument(
+            '--no-metasurface_cache_frozen',
+            dest='metasurface_cache_frozen',
+            action='store_false',
+        )
+        parser.set_defaults(metasurface_cache_frozen=True)
         parser.add_argument('--dodo_use_second_doe', dest='dodo_use_second_doe', action='store_true',
                             help='启用 DoDo 第二 DOE')
         parser.add_argument('--no-dodo_use_second_doe', dest='dodo_use_second_doe', action='store_false')

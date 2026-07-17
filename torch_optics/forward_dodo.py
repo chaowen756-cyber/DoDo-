@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from torch_optics.doe import DOELayer, DOEFreeLayer
+from torch_optics.metasurface import TiO2ScalarMetasurface
 from torch_optics.propagation import PropagationLayer
 from torch_optics.sensing import SensingLayer
 
@@ -47,6 +48,7 @@ def _normalize_once(y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 _VALID_FORMATS = {"nchw", "nhwc"}
 _DEPTH_LAYERING_MODES = {"hard_depth", "hard_meter", "soft_diopter"}
+_OPTICAL_ELEMENT_TYPES = {"doe", "tio2_metasurface"}
 
 
 class SoftDiopterBinner(nn.Module):
@@ -259,9 +261,25 @@ class DepthAwareDoDoForwardModel(nn.Module):
         soft_diopter_bandwidth_scale: float = 1.0,
         sensor_measurement: str = "amplitude",
         skip_prop2: bool = False,
+        optical_element_type: str = "doe",
+        metasurface_checkpoint_path: str = "",
+        metasurface_polarization: str = "x",
+        metasurface_geometry_seed: int = 123,
+        metasurface_init_logit_range: float = 1.0,
+        metasurface_mlp_chunk_size: int = 16384,
+        metasurface_use_activation_checkpoint: bool = True,
+        metasurface_clamp_amplitude: bool = True,
+        metasurface_cache_frozen: bool = True,
     ):
         super().__init__()
         self.skip_prop2 = bool(skip_prop2)
+        optical_element_type = str(optical_element_type).lower()
+        if optical_element_type not in _OPTICAL_ELEMENT_TYPES:
+            raise ValueError(
+                f"optical_element_type must be one of {_OPTICAL_ELEMENT_TYPES}, "
+                f"got '{optical_element_type}'"
+            )
+        self.optical_element_type = optical_element_type
         if depth_min >= depth_max:
             raise ValueError(f"depth_min ({depth_min}) must be < depth_max ({depth_max})")
         if num_depth_layers < 1:
@@ -323,7 +341,23 @@ class DepthAwareDoDoForwardModel(nn.Module):
             for k in range(num_depth_layers)
         ])
 
-        if free:
+        if self.optical_element_type == "tio2_metasurface":
+            if free:
+                raise ValueError("free=True is incompatible with tio2_metasurface")
+            self.doe1 = TiO2ScalarMetasurface(
+                checkpoint_path=metasurface_checkpoint_path,
+                spatial_size=mss,
+                wave_lengths=self.prop1_layers[0].wave_lengths,
+                trainable_geometry=train_c,
+                polarization=metasurface_polarization,
+                geometry_seed=metasurface_geometry_seed,
+                init_logit_range=metasurface_init_logit_range,
+                mlp_chunk_size=metasurface_mlp_chunk_size,
+                use_activation_checkpoint=metasurface_use_activation_checkpoint,
+                clamp_amplitude=metasurface_clamp_amplitude,
+                cache_frozen=metasurface_cache_frozen,
+            )
+        elif free:
             self.doe1 = DOEFreeLayer(
                 Mdoe=mss, Mesce=minput, n_terms=n_terms,
                 doe_type=doe_type_a, trainable=train_c,
@@ -352,6 +386,15 @@ class DepthAwareDoDoForwardModel(nn.Module):
             self.doe1.clamp_parameters_()
         if self.use_second_doe and hasattr(self.doe2, "clamp_parameters_"):
             self.doe2.clamp_parameters_()
+
+    def optical_design_named_parameters(self):
+        if hasattr(self.doe1, "design_named_parameters"):
+            yield from self.doe1.design_named_parameters()
+            return
+        if hasattr(self.doe1, "zernike_coeffs"):
+            parameter = self.doe1.zernike_coeffs
+            if isinstance(parameter, nn.Parameter):
+                yield "doe_zernike", parameter
 
     def _to_nchw(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_format == "nhwc":
@@ -428,6 +471,17 @@ class DepthAwareDoDoForwardModel(nn.Module):
             if binner_debug is not None:
                 stage_diag.append(("depth_weight_sum", _tensor_stats(binner_debug["weight_sum"].detach())))
 
+        # The metasurface geometry is global and shared by every scene/depth layer.
+        # Build its wavelength-dependent transmission once, then reuse the same
+        # autograd graph for all depth layers.
+        optical_transmission = None
+        if self.optical_element_type == "tio2_metasurface":
+            optical_transmission = self.doe1.complex_transmission()
+            if debug_stages:
+                stage_diag.append(
+                    ("metasurface_transmission", _tensor_stats_real(optical_transmission))
+                )
+
         for k in range(self.num_depth_layers):
             if self.depth_layering_mode == "soft_diopter":
                 layer_weight = weights[:, k:k + 1, :, :].to(dtype=spectral.dtype)
@@ -448,7 +502,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
             if debug_stages and k == 0:
                 stage_diag.append(('prop1', _tensor_stats_real(x_k)))
 
-            x_k = self.doe1(x_k)
+            if optical_transmission is None:
+                x_k = self.doe1(x_k)
+            else:
+                x_k = self.doe1(x_k, transmission=optical_transmission)
             if debug_stages and k == 0:
                 stage_diag.append(('doe1', _tensor_stats_real(x_k)))
 
