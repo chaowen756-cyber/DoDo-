@@ -164,6 +164,7 @@ run_training() {
     --dodo_nonfinite_policy fail \
     --no-preinverse \
     --decoder_norm group \
+    --encoder_variant eb4 \
     --no-decoder_use_depth_input \
     --decoder_use_rgb_pinv_prior \
     --decoder_rgb_pinv_lambda 1e-3 \
@@ -191,13 +192,13 @@ case "${1:-}" in
     build_index
     ;;
   stage-a-balanced)
-    run_training number_18a_balanced_only_stageA_12ep "${MAX_EPOCHS:-12}" balanced stage_a
+    run_training number_18_eb4a_balanced_only_stageA_12ep "${MAX_EPOCHS:-12}" balanced stage_a
     ;;
   stage-a-augment)
-    run_training number_18b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" augment stage_a
+    run_training number_18_eb4b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" augment stage_a
     ;;
   stage-a-combined)
-    run_training number_18c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" combined stage_a
+    run_training number_18_eb4c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" combined stage_a
     ;;
   stage-b)
     if [[ -z "${INIT_CKPT:-}" ]]; then
@@ -205,7 +206,7 @@ case "${1:-}" in
       exit 2
     fi
     VARIANT="${VARIANT:-combined}"
-    run_training "number_18d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
+    run_training "number_18_eb4d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
     ;;
   *)
     echo "Usage: $0 {build-index|stage-a-balanced|stage-a-augment|stage-a-combined|stage-b}" >&2

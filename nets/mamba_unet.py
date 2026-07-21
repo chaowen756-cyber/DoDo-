@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from .eb4_encoder import EB4EncoderBlock
 from .mamba_helper import VSSBlock
 
 def _make_norm(channels, norm_type='batch'):
@@ -71,7 +72,9 @@ class MambaDualHeadUNet(nn.Module):
     def __init__(self, in_channels=32, out_hs_channels=25, scheme='hybrid',
                  depth_shallow_skip_mode='lowpass', norm_type='batch',
                  depth_bins: int = 16, detach_depth_guidance_for_hs=False,
-                 isolate_hs_decoder_gradients=False):
+                 isolate_hs_decoder_gradients=False,
+                 encoder_variant='legacy', sensor_response=None,
+                 wavelengths=None):
         super().__init__()
 
         # [32, 64, 128, 256, 512, 1024]
@@ -80,6 +83,17 @@ class MambaDualHeadUNet(nn.Module):
         self.depth_bins = int(depth_bins)
         self.detach_depth_guidance_for_hs = bool(detach_depth_guidance_for_hs)
         self.isolate_hs_decoder_gradients = bool(isolate_hs_decoder_gradients)
+        self.encoder_variant = str(encoder_variant)
+        if self.encoder_variant not in ('legacy', 'eb4'):
+            raise ValueError(f"Unknown encoder_variant: {self.encoder_variant}")
+        if self.encoder_variant == 'eb4':
+            if sensor_response is None or wavelengths is None:
+                raise ValueError('EB4 requires sensor_response and wavelengths')
+            if tuple(sensor_response.shape) != (3, int(out_hs_channels)):
+                raise ValueError(
+                    f'EB4 requires sensor_response shape (3, {out_hs_channels}), '
+                    f'got {tuple(sensor_response.shape)}'
+                )
 
         # ================= Encoder =================
         self.encoders = nn.ModuleList()
@@ -90,16 +104,28 @@ class MambaDualHeadUNet(nn.Module):
             dims[0], dims[1], use_mamba=use_mamba_l1, norm_type=norm_type
         ))
 
-        # L2-L4: Mamba
-        self.encoders.append(MambaEncoderBlock(
-            dims[1], dims[2], use_mamba=True, norm_type=norm_type
-        )) # 64->128
-        self.encoders.append(MambaEncoderBlock(
-            dims[2], dims[3], use_mamba=True, norm_type=norm_type
-        )) # 128->256
-        self.encoders.append(MambaEncoderBlock(
-            dims[3], dims[4], use_mamba=True, norm_type=norm_type
-        )) # 256->512
+        # L2-L4: either the Number18 Mamba blocks or the EB4 ablation blocks.
+        # No other encoder/decoder level is replaced by EB4.
+        if self.encoder_variant == 'eb4':
+            spectral_dims = (8, 16, 32)
+            for block_index, (in_ch, out_ch) in enumerate(zip(dims[1:4], dims[2:5])):
+                self.encoders.append(EB4EncoderBlock(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    sensor_response=sensor_response,
+                    wavelengths=wavelengths,
+                    spectral_dim=spectral_dims[block_index],
+                ))
+        else:
+            self.encoders.append(MambaEncoderBlock(
+                dims[1], dims[2], use_mamba=True, norm_type=norm_type
+            )) # 64->128
+            self.encoders.append(MambaEncoderBlock(
+                dims[2], dims[3], use_mamba=True, norm_type=norm_type
+            )) # 128->256
+            self.encoders.append(MambaEncoderBlock(
+                dims[3], dims[4], use_mamba=True, norm_type=norm_type
+            )) # 256->512
 
         # Bottleneck: 512 -> 1024
         self.bottleneck = nn.Sequential(
@@ -168,15 +194,51 @@ class MambaDualHeadUNet(nn.Module):
         ):
             module.reset_to_identity()
 
-    def forward(self, x):
+    def init_eb4_stable(self):
+        if self.encoder_variant != 'eb4':
+            return
+        for encoder in self.encoders[1:]:
+            encoder.reset_stable_initialization()
+
+    def eb4_diagnostics(self):
+        if self.encoder_variant != 'eb4':
+            return {}
+        return {
+            f'e{level}': self.encoders[level - 1].diagnostics()
+            for level in range(2, 5)
+        }
+
+    def forward(self, x, rgb_measurement=None, spectral_prior=None):
         # x: [B, 32, H, W]
+        if self.encoder_variant == 'eb4':
+            if rgb_measurement is None or spectral_prior is None:
+                raise ValueError('EB4 forward requires rgb_measurement and spectral_prior')
+            if rgb_measurement.ndim != 4 or rgb_measurement.shape[1] != 3:
+                raise ValueError(
+                    f'EB4 RGB measurement must have shape [B,3,H,W], got '
+                    f'{tuple(rgb_measurement.shape)}'
+                )
+            if spectral_prior.ndim != 4 or spectral_prior.shape[1] != self.hs_out.out_channels:
+                raise ValueError(
+                    f'EB4 spectral prior must have shape [B,{self.hs_out.out_channels},H,W], '
+                    f'got {tuple(spectral_prior.shape)}'
+                )
         
         # Encoder
-        skips = []
+        depth_skips = []
+        hs_skips = []
         curr = x
-        for enc in self.encoders:
-            skip, curr = enc(curr)
-            skips.append(skip) 
+        for level, enc in enumerate(self.encoders, start=1):
+            if self.encoder_variant == 'eb4' and level >= 2:
+                depth_skip, hs_skip, curr, _ = enc(
+                    curr, rgb_measurement, spectral_prior
+                )
+            else:
+                shared_skip, curr = enc(curr)
+                depth_skip = shared_skip
+                hs_skip = shared_skip
+            depth_skips.append(depth_skip)
+            hs_skips.append(hs_skip)
             # skips[0]: [64, H, W]
             # skips[1]: [128, H/2, W/2]
             # skips[2]: [256, H/4, W/4]
@@ -186,15 +248,15 @@ class MambaDualHeadUNet(nn.Module):
         
         # --- Decoder (Depth) ---
         d4 = self.up_depth_4(bot)
-        d4 = torch.cat([d4, skips[3]], dim=1) # H/8
+        d4 = torch.cat([d4, depth_skips[3]], dim=1) # H/8
         d4 = self.conv_depth_4(d4)
         
         d3 = self.up_depth_3(d4)
-        d3 = torch.cat([d3, skips[2]], dim=1) # H/4
+        d3 = torch.cat([d3, depth_skips[2]], dim=1) # H/4
         d3 = self.conv_depth_3(d3)
         
         d2 = self.up_depth_2(d3)
-        d2 = torch.cat([d2, skips[1]], dim=1) # H/2
+        d2 = torch.cat([d2, depth_skips[1]], dim=1) # H/2
         d2 = self.conv_depth_2(d2)
         
         d1 = self.up_depth_1(d2)
@@ -202,11 +264,11 @@ class MambaDualHeadUNet(nn.Module):
         # [ARCH-MOD-20260403] 深度头浅层 skip 解耦：避免深度预测过度跟随高光谱纹理。
         # [ARCH-OLD-20260403] d1 = torch.cat([d1, skips[0]], dim=1) # H (原始分辨率)
         if self.depth_shallow_skip_mode == 'full':
-            depth_skip_l1 = skips[0]
+            depth_skip_l1 = depth_skips[0]
         elif self.depth_shallow_skip_mode == 'drop':
-            depth_skip_l1 = torch.zeros_like(skips[0])
+            depth_skip_l1 = torch.zeros_like(depth_skips[0])
         elif self.depth_shallow_skip_mode == 'lowpass':
-            depth_skip_l1 = self.depth_skip_lowpass(skips[0])
+            depth_skip_l1 = self.depth_skip_lowpass(depth_skips[0])
             depth_skip_l1 = self.depth_skip_proj(depth_skip_l1)
             depth_skip_l1 = depth_skip_l1 * self.depth_skip_gate
         else:
@@ -221,10 +283,10 @@ class MambaDualHeadUNet(nn.Module):
 
         if self.isolate_hs_decoder_gradients:
             bot_for_hs = bot.detach()
-            skips_for_hs = [skip.detach() for skip in skips]
+            skips_for_hs = [skip.detach() for skip in hs_skips]
         else:
             bot_for_hs = bot
-            skips_for_hs = skips
+            skips_for_hs = hs_skips
 
         # Optionally keep HS depth conditioning but block HS losses from
         # updating the depth decoder/head through the guidance path.
