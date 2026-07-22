@@ -152,6 +152,10 @@ run_training() {
     --n_depths 16 \
     --soft_diopter_eps 1e-8 \
     --soft_diopter_bandwidth_scale 1.0 \
+    --dodo_image_formation psf_convolution \
+    --dodo_psf_layer_mask baek_hard \
+    --dodo_psf_mask_blur_sigma 1.0 \
+    --dodo_psf_boundary linear_zero \
     --dodo_doe_type New \
     --no-dodo_use_second_doe \
     --dodo_skip_prop2 \
@@ -191,13 +195,13 @@ case "${1:-}" in
     build_index
     ;;
   stage-a-balanced)
-    run_training number_18a_balanced_only_stageA_12ep "${MAX_EPOCHS:-12}" balanced stage_a
+    run_training psfconv_number_18a_balanced_only_stageA_12ep "${MAX_EPOCHS:-12}" balanced stage_a
     ;;
   stage-a-augment)
-    run_training number_18b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" augment stage_a
+    run_training psfconv_number_18b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" augment stage_a
     ;;
   stage-a-combined)
-    run_training number_18c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" combined stage_a
+    run_training psfconv_number_18c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" combined stage_a
     ;;
   stage-b)
     if [[ -z "${INIT_CKPT:-}" ]]; then
@@ -205,7 +209,7 @@ case "${1:-}" in
       exit 2
     fi
     VARIANT="${VARIANT:-combined}"
-    run_training "number_18d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
+    run_training "psfconv_number_18d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
     ;;
   *)
     echo "Usage: $0 {build-index|stage-a-balanced|stage-a-augment|stage-a-combined|stage-b}" >&2

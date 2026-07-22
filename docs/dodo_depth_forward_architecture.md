@@ -1,5 +1,7 @@
 # DoDo Depth 高光谱重建前向架构说明
 
+> 本文档主要描述原有 `whole_field` 前向。`psf卷积` 分支新增的 Baek 式深度-波长 PSF 卷积模型、兼容策略和运行参数见 `docs/psf_convolution_forward.md`。
+
 本文档梳理当前项目中 `optical_model=dodo_depth` 这条训练链路，从 Baek 数据集原始 EXR 读取、patch 预处理、深度分层光学前向、sensor 测量归一化，到 Mamba U-Net 双头网络输出与 loss/validation 指标。公式尽量按代码中的真实实现书写，形状默认对应你近期训练命令中的主配置：
 
 | 项 | 当前典型设置 |

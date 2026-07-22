@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch_optics.doe import DOELayer, DOEFreeLayer
 from torch_optics.propagation import PropagationLayer
@@ -47,6 +48,9 @@ def _normalize_once(y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 _VALID_FORMATS = {"nchw", "nhwc"}
 _DEPTH_LAYERING_MODES = {"hard_depth", "hard_meter", "soft_diopter"}
+_IMAGE_FORMATION_MODES = {"whole_field", "psf_convolution"}
+_PSF_LAYER_MASK_MODES = {"current", "baek_hard"}
+_PSF_BOUNDARY_MODES = {"linear_zero", "circular"}
 
 
 class SoftDiopterBinner(nn.Module):
@@ -259,6 +263,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
         soft_diopter_bandwidth_scale: float = 1.0,
         sensor_measurement: str = "amplitude",
         skip_prop2: bool = False,
+        image_formation_mode: str = "whole_field",
+        psf_layer_mask_mode: str = "baek_hard",
+        psf_mask_blur_sigma: float = 1.0,
+        psf_boundary_mode: str = "linear_zero",
     ):
         super().__init__()
         self.skip_prop2 = bool(skip_prop2)
@@ -278,6 +286,34 @@ class DepthAwareDoDoForwardModel(nn.Module):
         self.use_second_doe = use_second_doe
         self.input_format = fmt_in
         self.output_format = fmt_out
+
+        image_formation_mode = image_formation_mode.lower()
+        if image_formation_mode not in _IMAGE_FORMATION_MODES:
+            raise ValueError(
+                f"image_formation_mode must be one of {_IMAGE_FORMATION_MODES}, "
+                f"got '{image_formation_mode}'")
+        psf_layer_mask_mode = psf_layer_mask_mode.lower()
+        if psf_layer_mask_mode not in _PSF_LAYER_MASK_MODES:
+            raise ValueError(
+                f"psf_layer_mask_mode must be one of {_PSF_LAYER_MASK_MODES}, "
+                f"got '{psf_layer_mask_mode}'")
+        psf_boundary_mode = psf_boundary_mode.lower()
+        if psf_boundary_mode not in _PSF_BOUNDARY_MODES:
+            raise ValueError(
+                f"psf_boundary_mode must be one of {_PSF_BOUNDARY_MODES}, "
+                f"got '{psf_boundary_mode}'")
+        psf_mask_blur_sigma = float(psf_mask_blur_sigma)
+        if psf_mask_blur_sigma < 0:
+            raise ValueError(
+                f"psf_mask_blur_sigma must be >= 0, got {psf_mask_blur_sigma}")
+        if image_formation_mode == "psf_convolution" and sensor_measurement.lower() != "intensity":
+            raise ValueError(
+                "psf_convolution forms an incoherent intensity image and therefore requires "
+                "sensor_measurement='intensity'")
+        self.image_formation_mode = image_formation_mode
+        self.psf_layer_mask_mode = psf_layer_mask_mode
+        self.psf_mask_blur_sigma = psf_mask_blur_sigma
+        self.psf_boundary_mode = psf_boundary_mode
         depth_layering_mode = depth_layering_mode.lower()
         if depth_layering_mode not in _DEPTH_LAYERING_MODES:
             raise ValueError(
@@ -346,12 +382,48 @@ class DepthAwareDoDoForwardModel(nn.Module):
                                             sensing_mode=sensing_mode,
                                             measurement_channels=measurement_channels,
                                             sensor_measurement=sensor_measurement)
+        # Frozen-optics inference/Stage-B training can reuse this bank.  It is
+        # intentionally a plain attribute, not a persistent buffer, so the new
+        # image-formation mode does not change checkpoint state-dict keys.
+        self._cached_psf_bank = None
+        self._cached_psf_key = None
 
     def clamp_parameters_(self):
         if hasattr(self.doe1, "clamp_parameters_"):
             self.doe1.clamp_parameters_()
         if self.use_second_doe and hasattr(self.doe2, "clamp_parameters_"):
             self.doe2.clamp_parameters_()
+        self.clear_psf_cache()
+
+    def clear_psf_cache(self):
+        self._cached_psf_bank = None
+        self._cached_psf_key = None
+
+    def _apply(self, fn):
+        self.clear_psf_cache()
+        return super()._apply(fn)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self.clear_psf_cache()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self.clear_psf_cache()
 
     def _to_nchw(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_format == "nhwc":
@@ -363,6 +435,375 @@ class DepthAwareDoDoForwardModel(nn.Module):
             return y.permute(0, 2, 3, 1).contiguous()
         return y
 
+    def _prepare_inputs(
+        self,
+        spectral: torch.Tensor,
+        depth: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+    ):
+        if spectral.ndim != 4:
+            raise ValueError(f"spectral must be 4D (B,H,W,C) or (B,C,H,W), got {spectral.ndim}D")
+        if depth.ndim not in (3, 4):
+            raise ValueError(f"depth must be 3D (B,H,W) or 4D (B,1,H,W), got {depth.ndim}D")
+
+        spectral = self._to_nchw(spectral).to(torch.float32)
+        if depth.ndim == 3:
+            depth = depth.unsqueeze(1)
+        depth = depth.to(device=spectral.device, dtype=torch.float32)
+
+        batch_s, channels, height_s, width_s = spectral.shape
+        batch_d, depth_channels, height_d, width_d = depth.shape
+        if depth_channels != 1:
+            raise ValueError(f"depth must have one channel, got shape {tuple(depth.shape)}")
+        if batch_s != batch_d:
+            raise ValueError(f"spectral batch size ({batch_s}) != depth batch size ({batch_d})")
+        if height_s != height_d or width_s != width_d:
+            raise ValueError(
+                f"spectral spatial size ({height_s}x{width_s}) != "
+                f"depth spatial size ({height_d}x{width_d})")
+        expected_bands = int(self.prop3.wave_lengths.numel())
+        if channels != expected_bands:
+            raise ValueError(f"spectral must have {expected_bands} bands, got {channels}")
+
+        if valid_mask is not None:
+            if valid_mask.ndim == 3:
+                valid_mask = valid_mask.unsqueeze(1)
+            if valid_mask.ndim != 4 or valid_mask.shape[1] != 1:
+                raise ValueError(
+                    f"valid_mask must be 3D [B,H,W] or 4D [B,1,H,W], "
+                    f"got {tuple(valid_mask.shape)}")
+            if valid_mask.shape[0] != batch_s or valid_mask.shape[-2:] != (height_s, width_s):
+                raise ValueError(
+                    f"valid_mask shape {tuple(valid_mask.shape)} is incompatible with "
+                    f"spectral/depth shape batch={batch_s}, spatial={height_s}x{width_s}")
+            valid_mask = valid_mask.to(device=spectral.device, dtype=torch.float32)
+
+        return spectral, depth, valid_mask
+
+    def _current_depth_weights(
+        self,
+        depth: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+        return_debug: bool,
+    ):
+        if self.depth_layering_mode == "soft_diopter":
+            result = self.diopter_binner(
+                depth,
+                valid_mask=valid_mask,
+                return_debug=return_debug,
+            )
+            if return_debug:
+                weights, _, debug = result
+                return weights, debug
+            weights, _ = result
+            return weights, None
+
+        # Preserve the legacy hard-mode behavior exactly: valid_mask is not
+        # applied here because the caller historically masked spectral input.
+        depth_clamped = torch.clamp(depth, self.depth_min, self.depth_max)
+        layer_weights = []
+        for k in range(self.num_depth_layers):
+            lo = self.bin_edges[k]
+            hi = self.bin_edges[k + 1]
+            if k < self.num_depth_layers - 1:
+                layer_weight = ((depth_clamped >= lo) & (depth_clamped < hi)).to(torch.float32)
+            else:
+                layer_weight = ((depth_clamped >= lo) & (depth_clamped <= hi)).to(torch.float32)
+            layer_weights.append(layer_weight)
+        weights = torch.cat(layer_weights, dim=1)
+        debug = {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+        return weights, debug
+
+    def _gaussian_blur_layer_weights(self, weights: torch.Tensor) -> torch.Tensor:
+        sigma = self.psf_mask_blur_sigma
+        if sigma <= 0:
+            return weights
+        radius = max(1, int(3.0 * sigma + 0.5))
+        coords = torch.arange(-radius, radius + 1, device=weights.device, dtype=weights.dtype)
+        kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 2 * radius + 1, 2 * radius + 1)
+
+        batch, layers, height, width = weights.shape
+        flattened = weights.reshape(batch * layers, 1, height, width)
+        flattened = F.pad(flattened, (radius, radius, radius, radius), mode="replicate")
+        blurred = F.conv2d(flattened, kernel_2d)
+        return blurred.reshape(batch, layers, height, width)
+
+    def _baek_depth_weights(
+        self,
+        depth: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+        return_debug: bool,
+    ):
+        finite_positive = torch.isfinite(depth) & (depth > 0)
+        if valid_mask is not None:
+            valid = finite_positive & (valid_mask > 0)
+        else:
+            valid = finite_positive
+
+        depth_safe = torch.where(
+            finite_positive,
+            depth.clamp(min=self.depth_min, max=self.depth_max),
+            torch.full_like(depth, self.depth_min),
+        )
+        if self.depth_layering_mode == "soft_diopter":
+            inverse_depth = 1.0 / depth_safe
+            centers_u = self.diopter_binner.centers_u.to(
+                device=depth.device, dtype=depth.dtype).view(1, self.num_depth_layers, 1, 1)
+            layer_index = torch.argmin(torch.abs(inverse_depth - centers_u), dim=1)
+        else:
+            layer_index = torch.bucketize(
+                depth_safe[:, 0], self.bin_edges[1:-1].to(depth.device))
+
+        weights = F.one_hot(layer_index, num_classes=self.num_depth_layers)
+        weights = weights.permute(0, 3, 1, 2).to(dtype=depth.dtype)
+        weights = weights * valid.to(dtype=depth.dtype)
+        weights = self._gaussian_blur_layer_weights(weights)
+        weights = weights * valid.to(dtype=depth.dtype)
+        weight_sum = weights.sum(dim=1, keepdim=True)
+        weights = torch.where(
+            valid,
+            weights / weight_sum.clamp_min(1e-8),
+            torch.zeros_like(weights),
+        )
+        debug = {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+        return weights, debug
+
+    def _psf_depth_weights(
+        self,
+        depth: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+        return_debug: bool,
+    ):
+        if self.psf_layer_mask_mode == "baek_hard":
+            return self._baek_depth_weights(depth, valid_mask, return_debug)
+        weights, debug = self._current_depth_weights(depth, valid_mask, return_debug)
+        finite_positive = torch.isfinite(depth) & (depth > 0)
+        valid = finite_positive if valid_mask is None else (finite_positive & (valid_mask > 0))
+        if self.psf_mask_blur_sigma > 0:
+            weights = self._gaussian_blur_layer_weights(weights)
+        weights = weights * valid.to(dtype=weights.dtype)
+        weights = torch.where(
+            valid,
+            weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8),
+            torch.zeros_like(weights),
+        )
+        if return_debug:
+            debug = {"weight_sum": weights.sum(dim=1, keepdim=True)}
+        return weights, debug
+
+    def _propagate_to_sensor(self, field: torch.Tensor, depth_index: int) -> torch.Tensor:
+        field = self.prop1_layers[depth_index](field)
+        field = self.doe1(field)
+        if not self.skip_prop2:
+            field = self.prop2(field)
+        if self.use_second_doe:
+            field = self.doe2(field)
+        return self.prop3(field)
+
+    def _optics_are_frozen(self) -> bool:
+        return not any(parameter.requires_grad for parameter in self.parameters())
+
+    def _generate_psf_bank(
+        self,
+        height: int,
+        width: int,
+        device: torch.device,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        expected_size = self.prop1_layers[0].Mp
+        if height != expected_size or width != expected_size:
+            raise ValueError(
+                f"PSF convolution expects spatial size {expected_size}x{expected_size}, "
+                f"got {height}x{width}")
+
+        cache_key = (device.type, device.index, height, width)
+        can_cache = bool(use_cache and self._optics_are_frozen())
+        if can_cache and self._cached_psf_key == cache_key and self._cached_psf_bank is not None:
+            return self._cached_psf_bank
+
+        bands = int(self.prop3.wave_lengths.numel())
+        impulse = torch.zeros((1, bands, height, width), device=device, dtype=torch.float32)
+        impulse[:, :, height // 2, width // 2] = 1.0
+
+        psfs = []
+        for depth_index in range(self.num_depth_layers):
+            sensor_field = self._propagate_to_sensor(impulse, depth_index)
+            psf = torch.abs(sensor_field).to(torch.float32) ** 2
+            psf = psf / psf.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+            psfs.append(psf.squeeze(0))
+        psf_bank = torch.stack(psfs, dim=0)
+
+        if can_cache:
+            self._cached_psf_bank = psf_bank.detach()
+            self._cached_psf_key = cache_key
+            return self._cached_psf_bank
+        return psf_bank
+
+    def psf_bank(
+        self,
+        spatial_size: Tuple[int, int] = (128, 128),
+        device: Optional[torch.device] = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        if device is None:
+            device = self.z_centers.device
+        return self._generate_psf_bank(
+            int(spatial_size[0]), int(spatial_size[1]), torch.device(device), use_cache=use_cache)
+
+    def _sensor_response_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        sensing = self.sensing_unnorm
+        if sensing.sensing_mode == "rgb":
+            response = torch.stack([sensing.sensor_r, sensing.sensor_g, sensing.sensor_b], dim=0)
+        else:
+            response = sensing.response.transpose(0, 1)
+        return response.to(device=device, dtype=dtype)
+
+    def _apply_measurement_norm(self, y_sum: torch.Tensor) -> torch.Tensor:
+        if self.measurement_norm_mode == "none":
+            return y_sum
+        if self.measurement_norm_mode == "per_sample_max":
+            y_max = torch.amax(y_sum, dim=(1, 2, 3), keepdim=True)
+            return y_sum / (y_max + 1e-8)
+        if self.measurement_norm_mode == "fixed_scale":
+            return torch.clamp(
+                y_sum / (self.measurement_norm_scale.to(y_sum.device) + 1e-8), 0.0, 1.0)
+        return _normalize_once(y_sum)
+
+    def _forward_whole_field(
+        self,
+        spectral: torch.Tensor,
+        weights: torch.Tensor,
+        binner_debug: Optional[dict],
+        debug_stages: bool,
+    ) -> torch.Tensor:
+        y_sum = None
+        stage_diag = [] if debug_stages else None
+        if debug_stages:
+            stage_diag.append(("image_formation_mode", {"mode": "whole_field"}))
+            stage_diag.append(("depth_layering_mode", {"mode": self.depth_layering_mode}))
+            if binner_debug is not None:
+                stage_diag.append(("depth_weight_sum", _tensor_stats(binner_debug["weight_sum"].detach())))
+
+        for k in range(self.num_depth_layers):
+            layer_weight = weights[:, k:k + 1].to(dtype=spectral.dtype)
+            x_k = spectral * layer_weight
+            if debug_stages and k == 0:
+                stage_diag.append(("input_masked", _tensor_stats(x_k)))
+
+            x_k = self.prop1_layers[k](x_k)
+            if debug_stages and k == 0:
+                stage_diag.append(("prop1", _tensor_stats_real(x_k)))
+            x_k = self.doe1(x_k)
+            if debug_stages and k == 0:
+                stage_diag.append(("doe1", _tensor_stats_real(x_k)))
+            if not self.skip_prop2:
+                x_k = self.prop2(x_k)
+            if debug_stages and k == 0 and not self.skip_prop2:
+                stage_diag.append(("prop2", _tensor_stats_real(x_k)))
+            if self.use_second_doe:
+                x_k = self.doe2(x_k)
+                if debug_stages and k == 0:
+                    stage_diag.append(("doe2", _tensor_stats_real(x_k)))
+            x_k = self.prop3(x_k)
+            if debug_stages and k == 0:
+                stage_diag.append(("prop3", _tensor_stats_real(x_k)))
+
+            y_k = self.sensing_unnorm(x_k)
+            if debug_stages and k == 0:
+                stage_diag.append(("sensing", _tensor_stats_real(y_k)))
+            y_sum = y_k if y_sum is None else y_sum + y_k
+
+        if debug_stages:
+            stage_diag.append(("y_sum_before_norm", _tensor_stats_real(y_sum)))
+        y = self._apply_measurement_norm(y_sum)
+        if debug_stages:
+            stage_diag.append(("y_after_norm", _tensor_stats_real(y)))
+            self._last_stage_diag = stage_diag
+        return y
+
+    def _forward_psf_convolution(
+        self,
+        spectral: torch.Tensor,
+        weights: torch.Tensor,
+        binner_debug: Optional[dict],
+        debug_stages: bool,
+    ) -> torch.Tensor:
+        batch, _, height, width = spectral.shape
+        psf_bank = self._generate_psf_bank(height, width, spectral.device, use_cache=True)
+        response = self._sensor_response_matrix(spectral.device, spectral.dtype)
+        y_sum = torch.zeros(
+            (batch, response.shape[0], height, width),
+            device=spectral.device,
+            dtype=spectral.dtype,
+        )
+
+        if self.psf_boundary_mode == "linear_zero":
+            kernel_height, kernel_width = psf_bank.shape[-2:]
+            fft_size = (height + kernel_height - 1, width + kernel_width - 1)
+            spectral_fft = torch.fft.rfft2(spectral, s=fft_size, dim=(-2, -1))
+        else:
+            fft_size = (height, width)
+            spectral_fft = torch.fft.rfft2(spectral, dim=(-2, -1))
+
+        stage_diag = [] if debug_stages else None
+        if debug_stages:
+            stage_diag.append(("image_formation_mode", {"mode": "psf_convolution"}))
+            stage_diag.append(("depth_layering_mode", {"mode": self.depth_layering_mode}))
+            stage_diag.append(("psf_layer_mask_mode", {"mode": self.psf_layer_mask_mode}))
+            stage_diag.append(("psf_boundary_mode", {"mode": self.psf_boundary_mode}))
+            if binner_debug is not None:
+                stage_diag.append(("depth_weight_sum", _tensor_stats(binner_debug["weight_sum"].detach())))
+            stage_diag.append(("psf_bank", _tensor_stats(psf_bank.detach())))
+            stage_diag.append((
+                "psf_energy",
+                _tensor_stats(psf_bank.detach().sum(dim=(-2, -1))),
+            ))
+
+        for k in range(self.num_depth_layers):
+            psf_k = psf_bank[k]
+            if self.psf_boundary_mode == "linear_zero":
+                psf_fft = torch.fft.rfft2(psf_k, s=fft_size, dim=(-2, -1))
+                mixed_fft = torch.einsum(
+                    "bcxy,cxy,oc->boxy",
+                    spectral_fft,
+                    psf_fft,
+                    response.to(dtype=psf_fft.dtype),
+                )
+                full = torch.fft.irfft2(
+                    mixed_fft, s=fft_size, dim=(-2, -1))
+                start_y = psf_k.shape[-2] // 2
+                start_x = psf_k.shape[-1] // 2
+                blurred_sensor = full[..., start_y:start_y + height, start_x:start_x + width]
+            else:
+                psf_origin = torch.fft.ifftshift(psf_k, dim=(-2, -1))
+                psf_fft = torch.fft.rfft2(psf_origin, dim=(-2, -1))
+                mixed_fft = torch.einsum(
+                    "bcxy,cxy,oc->boxy",
+                    spectral_fft,
+                    psf_fft,
+                    response.to(dtype=psf_fft.dtype),
+                )
+                blurred_sensor = torch.fft.irfft2(
+                    mixed_fft, s=fft_size, dim=(-2, -1))
+
+            # Baek et al. Eq. (3): depth occupancy is applied after each
+            # wavelength-dependent PSF convolution.
+            layered_sensor = blurred_sensor * weights[:, k:k + 1].to(dtype=blurred_sensor.dtype)
+            y_sum = y_sum + layered_sensor
+            if debug_stages and k == 0:
+                stage_diag.append(("blurred_sensor", _tensor_stats(blurred_sensor)))
+                stage_diag.append(("layered_sensor", _tensor_stats(layered_sensor)))
+
+        if debug_stages:
+            stage_diag.append(("y_sum_before_norm", _tensor_stats_real(y_sum)))
+        y = self._apply_measurement_norm(y_sum)
+        if debug_stages:
+            stage_diag.append(("y_after_norm", _tensor_stats_real(y)))
+            self._last_stage_diag = stage_diag
+        return y
+
     def forward(
         self,
         spectral: torch.Tensor,
@@ -370,127 +811,17 @@ class DepthAwareDoDoForwardModel(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
         debug_stages: bool = False,
     ) -> torch.Tensor:
-        # Input validation
-        if spectral.ndim != 4:
-            raise ValueError(f"spectral must be 4D (B,H,W,C) or (B,C,H,W), got {spectral.ndim}D")
-        if depth.ndim not in (3, 4):
-            raise ValueError(f"depth must be 3D (B,H,W) or 4D (B,1,H,W), got {depth.ndim}D")
-
-        spectral = self._to_nchw(spectral).to(torch.float32)  # (B, C, H, W)
-
-        # Normalize depth shape to (B, 1, H, W)
-        if depth.ndim == 3:
-            depth = depth.unsqueeze(1)
-        depth = depth.to(torch.float32)
-
-        B_s, _, H_s, W_s = spectral.shape
-        B_d, _, H_d, W_d = depth.shape
-        if B_s != B_d:
-            raise ValueError(f"spectral batch size ({B_s}) != depth batch size ({B_d})")
-        if H_s != H_d or W_s != W_d:
-            raise ValueError(f"spectral spatial size ({H_s}x{W_s}) != depth spatial size ({H_d}x{W_d})")
-
-        if valid_mask is not None:
-            if valid_mask.ndim == 3:
-                valid_mask = valid_mask.unsqueeze(1)
-            if valid_mask.ndim != 4 or valid_mask.shape[1] != 1:
-                raise ValueError(f"valid_mask must be 3D [B,H,W] or 4D [B,1,H,W], got {tuple(valid_mask.shape)}")
-            if valid_mask.shape[0] != B_s or valid_mask.shape[-2:] != (H_s, W_s):
-                raise ValueError(
-                    f"valid_mask shape {tuple(valid_mask.shape)} is incompatible with "
-                    f"spectral/depth shape batch={B_s}, spatial={H_s}x{W_s}")
-            valid_mask = valid_mask.to(device=depth.device)
-
-        if self.depth_layering_mode == "soft_diopter":
-            result = self.diopter_binner(
-                depth,
-                valid_mask=valid_mask,
-                return_debug=debug_stages,
-            )
-            if debug_stages:
-                weights, z_centers, binner_debug = result
-            else:
-                weights, z_centers = result
-                binner_debug = None
-            _ = z_centers
+        spectral, depth, valid_mask = self._prepare_inputs(spectral, depth, valid_mask)
+        if self.image_formation_mode == "psf_convolution":
+            weights, binner_debug = self._psf_depth_weights(
+                depth, valid_mask, return_debug=debug_stages)
+            y = self._forward_psf_convolution(
+                spectral, weights, binner_debug, debug_stages)
         else:
-            # Clamp out-of-range depths to nearest meter-space bin for legacy hard modes.
-            depth = torch.clamp(depth, self.depth_min, self.depth_max)
-            edges = self.bin_edges  # (K+1,)
-            weights = None
-            binner_debug = None
-
-        y_sum = None
-        stage_diag = [] if debug_stages else None
-
-        if debug_stages:
-            stage_diag.append(("depth_layering_mode", {"mode": self.depth_layering_mode}))
-            if binner_debug is not None:
-                stage_diag.append(("depth_weight_sum", _tensor_stats(binner_debug["weight_sum"].detach())))
-
-        for k in range(self.num_depth_layers):
-            if self.depth_layering_mode == "soft_diopter":
-                layer_weight = weights[:, k:k + 1, :, :].to(dtype=spectral.dtype)
-            else:
-                lo = edges[k]
-                hi = edges[k + 1]
-                if k < self.num_depth_layers - 1:
-                    layer_weight = ((depth >= lo) & (depth < hi)).to(torch.float32)
-                else:
-                    layer_weight = ((depth >= lo) & (depth <= hi)).to(torch.float32)
-
-            x_k = spectral * layer_weight  # broadcast (B,C,H,W) * (B,1,H,W)
-
-            if debug_stages and k == 0:
-                stage_diag.append(('input_masked', _tensor_stats(x_k)))
-
-            x_k = self.prop1_layers[k](x_k)
-            if debug_stages and k == 0:
-                stage_diag.append(('prop1', _tensor_stats_real(x_k)))
-
-            x_k = self.doe1(x_k)
-            if debug_stages and k == 0:
-                stage_diag.append(('doe1', _tensor_stats_real(x_k)))
-
-            if not self.skip_prop2:
-                x_k = self.prop2(x_k)
-            if debug_stages and k == 0 and not self.skip_prop2:
-                stage_diag.append(('prop2', _tensor_stats_real(x_k)))
-
-            if self.use_second_doe:
-                x_k = self.doe2(x_k)
-                if debug_stages and k == 0:
-                    stage_diag.append(('doe2', _tensor_stats_real(x_k)))
-
-            x_k = self.prop3(x_k)
-            if debug_stages and k == 0:
-                stage_diag.append(('prop3', _tensor_stats_real(x_k)))
-
-            y_k = self.sensing_unnorm(x_k)  # unnormalized (B, 3, H, W)
-            if debug_stages and k == 0:
-                stage_diag.append(('sensing', _tensor_stats_real(y_k)))
-
-            y_sum = y_k if y_sum is None else y_sum + y_k
-
-        if debug_stages:
-            stage_diag.append(('y_sum_before_norm', _tensor_stats_real(y_sum)))
-
-        if self.measurement_norm_mode == "none":
-            y = y_sum
-        elif self.measurement_norm_mode == "per_sample_max":
-            b = y_sum.shape[0]
-            y_flat = y_sum.view(b, -1)
-            y_max = y_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-            y = y_sum / (y_max + 1e-8)
-        elif self.measurement_norm_mode == "fixed_scale":
-            y = torch.clamp(y_sum / (self.measurement_norm_scale.to(y_sum.device) + 1e-8), 0.0, 1.0)
-        else:
-            y = _normalize_once(y_sum)
-
-        if debug_stages:
-            stage_diag.append(('y_after_norm', _tensor_stats_real(y)))
-            self._last_stage_diag = stage_diag
-
+            weights, binner_debug = self._current_depth_weights(
+                depth, valid_mask, return_debug=debug_stages)
+            y = self._forward_whole_field(
+                spectral, weights, binner_debug, debug_stages)
         return self._from_nchw(y)
 
 
@@ -511,6 +842,10 @@ def Forward_DM_Spiral_Depth(
     soft_diopter_bandwidth_scale=1.0,
     sensor_measurement="amplitude",
     skip_prop2=False,
+    image_formation_mode="whole_field",
+    psf_layer_mask_mode="baek_hard",
+    psf_mask_blur_sigma=1.0,
+    psf_boundary_mode="linear_zero",
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=depth_min,
@@ -532,6 +867,10 @@ def Forward_DM_Spiral_Depth(
         soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
         sensor_measurement=sensor_measurement,
         skip_prop2=skip_prop2,
+        image_formation_mode=image_formation_mode,
+        psf_layer_mask_mode=psf_layer_mask_mode,
+        psf_mask_blur_sigma=psf_mask_blur_sigma,
+        psf_boundary_mode=psf_boundary_mode,
     )
 
 

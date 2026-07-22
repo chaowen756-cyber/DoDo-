@@ -749,6 +749,11 @@ class SnapshotDepthHS(pl.LightningModule):
             soft_diopter_eps = getattr(hparams, 'soft_diopter_eps', 1e-8)
             soft_diopter_bandwidth_scale = getattr(hparams, 'soft_diopter_bandwidth_scale', 1.0)
             dodo_sensor_measurement = getattr(hparams, 'dodo_sensor_measurement', 'amplitude')
+            dodo_image_formation = getattr(hparams, 'dodo_image_formation', 'whole_field')
+            dodo_psf_layer_mask = getattr(hparams, 'dodo_psf_layer_mask', 'baek_hard')
+            dodo_psf_mask_blur_sigma = float(
+                getattr(hparams, 'dodo_psf_mask_blur_sigma', 1.0))
+            dodo_psf_boundary = getattr(hparams, 'dodo_psf_boundary', 'linear_zero')
             # Determine measurement_channels from sensing mode
             if dodo_sensing_mode == 'rgb':
                 hparams.measurement_channels = 3
@@ -778,12 +783,20 @@ class SnapshotDepthHS(pl.LightningModule):
                 soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
                 sensor_measurement=dodo_sensor_measurement,
                 skip_prop2=dodo_skip_prop2,
+                image_formation_mode=dodo_image_formation,
+                psf_layer_mask_mode=dodo_psf_layer_mask,
+                psf_mask_blur_sigma=dodo_psf_mask_blur_sigma,
+                psf_boundary_mode=dodo_psf_boundary,
             )
             print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
                   f'forward_norm={dodo_forward_norm}, '
                   f'forward_scale={dodo_forward_scale:g}, '
                   f'skip_prop2={dodo_skip_prop2}, '
+                  f'image_formation={dodo_image_formation}, '
                   f'depth_layering={depth_layering_mode}, '
+                  f'psf_layer_mask={dodo_psf_layer_mask}, '
+                  f'psf_mask_sigma={dodo_psf_mask_blur_sigma:g}, '
+                  f'psf_boundary={dodo_psf_boundary}, '
                   f'sensor_measurement={dodo_sensor_measurement}, '
                   f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
                   f'doe1.zernike_coeffs.requires_grad='
@@ -793,7 +806,8 @@ class SnapshotDepthHS(pl.LightningModule):
                 hparams.measurement_channels = 3
             print(f'[dodo_depth] DepthAwareDoDoForwardModel: depth_layers={n_depth_layers}, '
                   f'measurement_channels={hparams.measurement_channels}, '
-                  f'depth_layering_mode={depth_layering_mode}')
+                  f'depth_layering_mode={depth_layering_mode}, '
+                  f'image_formation_mode={dodo_image_formation}')
         else:
             mask_diameter = hparams.focal_length / hparams.f_number
             wavelengths = np.linspace(hparams.start_wl, hparams.end_wl, hparams.hs_channels)
@@ -1403,6 +1417,17 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='Soft diopter weight normalization epsilon')
         parser.add_argument('--soft_diopter_bandwidth_scale', type=float, default=1.0,
                             help='Soft diopter triangular bandwidth multiplier')
+        parser.add_argument('--dodo_image_formation', type=str, default='whole_field',
+                            choices=['whole_field', 'psf_convolution'],
+                            help='DoDo image formation: legacy whole-field propagation or Baek-style PSF convolution')
+        parser.add_argument('--dodo_psf_layer_mask', type=str, default='baek_hard',
+                            choices=['current', 'baek_hard'],
+                            help='PSF path depth masks: current layering weights or Baek hard occupancy masks')
+        parser.add_argument('--dodo_psf_mask_blur_sigma', type=float, default=1.0,
+                            help='Gaussian sigma in pixels for PSF-path depth occupancy masks; 0 disables blur')
+        parser.add_argument('--dodo_psf_boundary', type=str, default='linear_zero',
+                            choices=['linear_zero', 'circular'],
+                            help='PSF convolution boundary model; linear_zero avoids circular FFT wrap-around')
         parser.add_argument('--dodo_doe_type', type=str, default='Zeros',
                             help='DoDo DOE 类型（Zeros=frozen, New=trainable Zernike）')
         parser.add_argument('--dodo_use_second_doe', dest='dodo_use_second_doe', action='store_true',
