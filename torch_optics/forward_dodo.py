@@ -729,7 +729,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         weights: torch.Tensor,
         binner_debug: Optional[dict],
         debug_stages: bool,
-    ) -> torch.Tensor:
+        return_psf: bool = False,
+    ):
         batch, _, height, width = spectral.shape
         psf_bank = self._generate_psf_bank(height, width, spectral.device, use_cache=True)
         response = self._sensor_response_matrix(spectral.device, spectral.dtype)
@@ -802,6 +803,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if debug_stages:
             stage_diag.append(("y_after_norm", _tensor_stats_real(y)))
             self._last_stage_diag = stage_diag
+        if return_psf:
+            return y, psf_bank
         return y
 
     def forward(
@@ -810,19 +813,24 @@ class DepthAwareDoDoForwardModel(nn.Module):
         depth: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
         debug_stages: bool = False,
-    ) -> torch.Tensor:
+        return_psf: bool = False,
+    ):
         spectral, depth, valid_mask = self._prepare_inputs(spectral, depth, valid_mask)
+        psf_bank = None
         if self.image_formation_mode == "psf_convolution":
             weights, binner_debug = self._psf_depth_weights(
                 depth, valid_mask, return_debug=debug_stages)
-            y = self._forward_psf_convolution(
-                spectral, weights, binner_debug, debug_stages)
+            y, psf_bank = self._forward_psf_convolution(
+                spectral, weights, binner_debug, debug_stages, return_psf=True)
         else:
             weights, binner_debug = self._current_depth_weights(
                 depth, valid_mask, return_debug=debug_stages)
             y = self._forward_whole_field(
                 spectral, weights, binner_debug, debug_stages)
-        return self._from_nchw(y)
+        y = self._from_nchw(y)
+        if return_psf:
+            return y, psf_bank
+        return y
 
 
 def Forward_DM_Spiral_Depth(

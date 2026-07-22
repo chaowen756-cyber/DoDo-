@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
+from util.psf_regularization import psf_energy_concentration_loss
 
 
 def _make_model(
@@ -153,6 +154,23 @@ def test_psf_forward_is_linear_without_measurement_normalization(frozen_psf_mode
         summed_outputs = frozen_psf_model(first, depth) + frozen_psf_model(second, depth)
 
     torch.testing.assert_close(summed_input, summed_outputs, atol=2e-6, rtol=2e-5)
+
+
+def test_forward_can_return_same_live_psf_bank_for_regularization():
+    model = _make_model(train_c=True, doe_type_a="New").eval()
+    spectral = torch.zeros((1, 25, 128, 128))
+    spectral[:, :, 64, 64] = 1.0
+    depth = torch.ones((1, 1, 128, 128))
+
+    output, psf = model(spectral, depth, return_psf=True)
+    loss, _ = psf_energy_concentration_loss(
+        psf, radius=16.0, outside_budget=0.5, softness=1.5)
+    loss.backward()
+
+    torch.testing.assert_close(output[0], psf[0], atol=1e-7, rtol=1e-5)
+    assert model.doe1.zernike_coeffs.grad is not None
+    assert torch.isfinite(model.doe1.zernike_coeffs.grad).all()
+    assert model.doe1.zernike_coeffs.grad.norm().item() > 0
 
 
 def test_baek_equation_applies_depth_mask_after_convolution(monkeypatch):

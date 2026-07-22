@@ -8,6 +8,12 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-${ROOT_DIR}/experiments}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export CUDA_VISIBLE_DEVICES
+STAGE_A_OPTICS_LR="${STAGE_A_OPTICS_LR:-1e-5}"
+DODO_PSF_ENERGY_WEIGHT="${DODO_PSF_ENERGY_WEIGHT:-0.02}"
+DODO_PSF_ENERGY_RADIUS="${DODO_PSF_ENERGY_RADIUS:-16.0}"
+DODO_PSF_ENERGY_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTSIDE_BUDGET:-0.5}"
+DODO_PSF_ENERGY_SOFTNESS="${DODO_PSF_ENERGY_SOFTNESS:-1.5}"
+DODO_PSF_ENERGY_WARMUP_EPOCHS="${DODO_PSF_ENERGY_WARMUP_EPOCHS:-2}"
 
 SOURCE_TRAIN_INDEX="${SOURCE_TRAIN_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_nooverlap_v1.npz}"
 VAL_INDEX="${VAL_INDEX:-${DATA_ROOT}/.patch_index/val_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_v1.npz}"
@@ -67,7 +73,7 @@ run_training() {
       stage_args=(
         --optimize_optics
         --cnn_lr 1e-4
-        --optics_lr 1e-7
+        --optics_lr "${STAGE_A_OPTICS_LR}"
         --lr_decay_strategy none
       )
       ;;
@@ -156,6 +162,11 @@ run_training() {
     --dodo_psf_layer_mask baek_hard \
     --dodo_psf_mask_blur_sigma 1.0 \
     --dodo_psf_boundary linear_zero \
+    --dodo_psf_energy_weight "${DODO_PSF_ENERGY_WEIGHT}" \
+    --dodo_psf_energy_radius "${DODO_PSF_ENERGY_RADIUS}" \
+    --dodo_psf_energy_outside_budget "${DODO_PSF_ENERGY_OUTSIDE_BUDGET}" \
+    --dodo_psf_energy_softness "${DODO_PSF_ENERGY_SOFTNESS}" \
+    --dodo_psf_energy_warmup_epochs "${DODO_PSF_ENERGY_WARMUP_EPOCHS}" \
     --dodo_doe_type New \
     --no-dodo_use_second_doe \
     --dodo_skip_prop2 \
@@ -201,7 +212,7 @@ case "${1:-}" in
     run_training psfconv_number_18b_baek_augment_only_stageA_12ep "${MAX_EPOCHS:-12}" augment stage_a
     ;;
   stage-a-combined)
-    run_training psfconv_number_18c_baek_balanced_stageA_12ep "${MAX_EPOCHS:-12}" combined stage_a
+    run_training "${STAGE_A_COMBINED_NAME:-psfconv_number_18c_baek_balanced_stageA_12ep}" "${MAX_EPOCHS:-12}" combined stage_a
     ;;
   stage-b)
     if [[ -z "${INIT_CKPT:-}" ]]; then

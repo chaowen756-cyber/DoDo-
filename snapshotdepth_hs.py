@@ -27,6 +27,7 @@ from models.simple_model_mamba import SimpleModelHS as SimpleModel
 from optics import hyperspectral_camera as camera
 from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
 from util.hs_loss import CombinedLoss
+from util.psf_regularization import epoch_warmup_weight, psf_energy_concentration_loss
 
 # 导入项目原有的辅助工具
 from solvers.image_reconstruction import apply_tikhonov_inverse
@@ -626,7 +627,13 @@ class SnapshotDepthHS(pl.LightningModule):
             ('image_loss_l1', 'train_loss/image_loss_l1'),
             ('metric_depth_loss', 'train_loss/metric_depth_loss'),
             ('psf_loss', 'train_loss/psf_loss'),
+            ('psf_loss_weight', 'train_loss/psf_loss_weight'),
+            ('psf_loss_weighted', 'train_loss/psf_loss_weighted'),
             ('psf_out_of_fov_max', 'train_loss/psf_out_of_fov_max'),
+            ('psf_energy_outside_mean', 'train_loss/psf_energy_outside_mean'),
+            ('psf_energy_outside_p90', 'train_loss/psf_energy_outside_p90'),
+            ('psf_energy_inside_mean', 'train_loss/psf_energy_inside_mean'),
+            ('psf_energy_active_fraction', 'train_loss/psf_energy_active_fraction'),
             ('background_hs_loss', 'train_loss/background_hs_loss'),
         ]:
             if stored and key_internal in stored:
@@ -722,7 +729,9 @@ class SnapshotDepthHS(pl.LightningModule):
                 print('[dodo_depth] preinverse forced to False')
                 hparams.preinverse = False
             if getattr(hparams, 'psf_loss_weight', 0.0) > 0:
-                print('[dodo_depth] psf_loss_weight forced to 0.0')
+                print(
+                    '[dodo_depth] legacy psf_loss_weight forced to 0.0; '
+                    'DoDo PSF convolution uses dodo_psf_energy_weight instead')
                 hparams.psf_loss_weight = 0.0
 
         if self.optical_model_type == 'dodo_depth':
@@ -754,6 +763,26 @@ class SnapshotDepthHS(pl.LightningModule):
             dodo_psf_mask_blur_sigma = float(
                 getattr(hparams, 'dodo_psf_mask_blur_sigma', 1.0))
             dodo_psf_boundary = getattr(hparams, 'dodo_psf_boundary', 'linear_zero')
+            dodo_psf_energy_weight = float(
+                getattr(hparams, 'dodo_psf_energy_weight', 0.02))
+            dodo_psf_energy_radius = float(
+                getattr(hparams, 'dodo_psf_energy_radius', 16.0))
+            dodo_psf_energy_outside_budget = float(
+                getattr(hparams, 'dodo_psf_energy_outside_budget', 0.5))
+            dodo_psf_energy_softness = float(
+                getattr(hparams, 'dodo_psf_energy_softness', 1.5))
+            dodo_psf_energy_warmup_epochs = int(
+                getattr(hparams, 'dodo_psf_energy_warmup_epochs', 2))
+            if dodo_psf_energy_weight < 0:
+                raise ValueError('dodo_psf_energy_weight must be >= 0')
+            if dodo_psf_energy_radius <= 0:
+                raise ValueError('dodo_psf_energy_radius must be > 0')
+            if not 0.0 <= dodo_psf_energy_outside_budget <= 1.0:
+                raise ValueError('dodo_psf_energy_outside_budget must be in [0, 1]')
+            if dodo_psf_energy_softness < 0:
+                raise ValueError('dodo_psf_energy_softness must be >= 0')
+            if dodo_psf_energy_warmup_epochs < 0:
+                raise ValueError('dodo_psf_energy_warmup_epochs must be >= 0')
             # Determine measurement_channels from sensing mode
             if dodo_sensing_mode == 'rgb':
                 hparams.measurement_channels = 3
@@ -797,6 +826,11 @@ class SnapshotDepthHS(pl.LightningModule):
                   f'psf_layer_mask={dodo_psf_layer_mask}, '
                   f'psf_mask_sigma={dodo_psf_mask_blur_sigma:g}, '
                   f'psf_boundary={dodo_psf_boundary}, '
+                  f'psf_energy=(weight={dodo_psf_energy_weight:g}, '
+                  f'radius={dodo_psf_energy_radius:g}px, '
+                  f'outside_budget={dodo_psf_energy_outside_budget:g}, '
+                  f'softness={dodo_psf_energy_softness:g}px, '
+                  f'warmup_epochs={dodo_psf_energy_warmup_epochs}), '
                   f'sensor_measurement={dodo_sensor_measurement}, '
                   f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
                   f'doe1.zernike_coeffs.requires_grad='
@@ -933,8 +967,16 @@ class SnapshotDepthHS(pl.LightningModule):
 
             # DepthAwareDoDoForwardModel: input_format='nchw', output_format='nchw'
             # output: (B, 3, H, W)
-            captimgs = self.camera(images_linear, depth_metric, valid_mask=valid_mask)
-            psf = None
+            if self.camera.image_formation_mode == 'psf_convolution':
+                captimgs, psf = self.camera(
+                    images_linear,
+                    depth_metric,
+                    valid_mask=valid_mask,
+                    return_psf=True,
+                )
+            else:
+                captimgs = self.camera(images_linear, depth_metric, valid_mask=valid_mask)
+                psf = None
 
             # NaN/Inf guard: dodo optical model can produce non-finite output for near-zero input
             if not torch.isfinite(captimgs).all():
@@ -1092,6 +1134,36 @@ class SnapshotDepthHS(pl.LightningModule):
         return self.hparams.depth_loss_weight * depth_loss + \
             self.hparams.image_loss_weight * image_loss + \
             self.hparams.psf_loss_weight * psf_loss
+
+    def _dodo_psf_energy_weight(self):
+        """Epoch-wise 0 -> half -> full warm-up for the DOE-only regularizer."""
+        target_weight = float(getattr(self.hparams, 'dodo_psf_energy_weight', 0.02))
+        if target_weight < 0.0:
+            raise ValueError(f'dodo_psf_energy_weight must be >= 0, got {target_weight}')
+        if target_weight == 0.0 or not bool(getattr(self.hparams, 'optimize_optics', False)):
+            return 0.0
+        if self.optical_model_type != 'dodo_depth':
+            return 0.0
+        if getattr(self.camera, 'image_formation_mode', None) != 'psf_convolution':
+            return 0.0
+
+        warmup_epochs = int(getattr(self.hparams, 'dodo_psf_energy_warmup_epochs', 2))
+        # Use LightningModule's public compatibility property.  The training
+        # environment runs PyTorch Lightning 1.0.2, which attaches the active
+        # trainer as ``self.trainer`` and does not populate ``self._trainer``.
+        # Reading the private attribute therefore pinned every training step to
+        # epoch zero and silently disabled this regularizer for the whole run.
+        current_epoch = int(self.current_epoch)
+        effective_weight = epoch_warmup_weight(
+            target_weight, current_epoch, warmup_epochs)
+        if current_epoch > 0 and effective_weight <= 0.0:
+            raise RuntimeError(
+                'DoDo PSF energy regularization is enabled during Stage A, '
+                f'but its effective weight is {effective_weight} at epoch '
+                f'{current_epoch}. Refusing to continue with a silently '
+                'disabled optical regularizer.'
+            )
+        return effective_weight
     
 #     def __compute_loss(self, outputs, target_depthmaps, target_images, depth_conf):
 #         est_images = outputs.est_images
@@ -1270,10 +1342,38 @@ class SnapshotDepthHS(pl.LightningModule):
         # --- PSF Loss ---
         psf_loss = torch.tensor(0.0, device=depth_loss.device)
         psf_out_of_fov_max = torch.tensor(0.0, device=depth_loss.device)
+        psf_energy_outside_mean = torch.tensor(0.0, device=depth_loss.device)
+        psf_energy_outside_p90 = torch.tensor(0.0, device=depth_loss.device)
+        psf_energy_inside_mean = torch.tensor(0.0, device=depth_loss.device)
+        psf_energy_active_fraction = torch.tensor(0.0, device=depth_loss.device)
+        effective_psf_loss_weight = 0.0
 
         if self.hparams.psf_loss_weight > 0 and self.optical_model_type == 'legacy_camera':
             psf_out_of_fov_sum, psf_out_of_fov_max = self.camera.psf_out_of_fov_energy(self.hparams.psf_size)
             psf_loss = psf_out_of_fov_sum / self.hparams.hs_channels
+            effective_psf_loss_weight = float(self.hparams.psf_loss_weight)
+        elif (
+            self.optical_model_type == 'dodo_depth'
+            and getattr(self.camera, 'image_formation_mode', None) == 'psf_convolution'
+        ):
+            if outputs.psf is None:
+                raise RuntimeError(
+                    'PSF convolution must return its live PSF bank when the DoDo '
+                    'energy regularizer is configured.'
+                )
+            psf_loss, psf_stats = psf_energy_concentration_loss(
+                outputs.psf,
+                radius=float(getattr(self.hparams, 'dodo_psf_energy_radius', 16.0)),
+                outside_budget=float(
+                    getattr(self.hparams, 'dodo_psf_energy_outside_budget', 0.5)),
+                softness=float(getattr(self.hparams, 'dodo_psf_energy_softness', 1.5)),
+            )
+            psf_energy_outside_mean = psf_stats['outside_mean']
+            psf_energy_outside_p90 = psf_stats['outside_p90']
+            psf_out_of_fov_max = psf_stats['outside_max']
+            psf_energy_inside_mean = psf_stats['inside_mean']
+            psf_energy_active_fraction = psf_stats['active_fraction']
+            effective_psf_loss_weight = self._dodo_psf_energy_weight()
 
         # --- Background HS Loss (opt-in) ---
         bg_hs_loss_weight = float(getattr(self.hparams, 'background_hs_loss_weight', 0.0))
@@ -1288,7 +1388,7 @@ class SnapshotDepthHS(pl.LightningModule):
         # --- 2. 加权 ---
         weighted_depth_loss = self.hparams.depth_loss_weight * depth_loss
         weighted_image_loss = self.hparams.image_loss_weight * image_loss
-        weighted_psf_loss = self.hparams.psf_loss_weight * psf_loss
+        weighted_psf_loss = effective_psf_loss_weight * psf_loss
         weighted_depth_smooth_loss = depth_smooth_weight * depth_smooth_loss
         weighted_metric_depth_loss = metric_depth_loss_weight * metric_depth_loss
 
@@ -1306,7 +1406,14 @@ class SnapshotDepthHS(pl.LightningModule):
             'image_loss_total': image_loss,
             'image_loss_l1': image_l1,
             'psf_loss': psf_loss,
+            'psf_loss_weight': torch.tensor(
+                effective_psf_loss_weight, device=depth_loss.device),
+            'psf_loss_weighted': weighted_psf_loss,
             'psf_out_of_fov_max': psf_out_of_fov_max,
+            'psf_energy_outside_mean': psf_energy_outside_mean,
+            'psf_energy_outside_p90': psf_energy_outside_p90,
+            'psf_energy_inside_mean': psf_energy_inside_mean,
+            'psf_energy_active_fraction': psf_energy_active_fraction,
             'background_hs_loss': bg_hs_loss,
         }
     
@@ -1545,6 +1652,29 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--depth_loss_weight', type=float, default=0.03)
         parser.add_argument('--image_loss_weight', type=float, default=1.0)
         parser.add_argument('--psf_loss_weight', type=float, default=1.0)
+        parser.add_argument(
+            '--dodo_psf_energy_weight', type=float, default=0.02,
+            help=(
+                'DoDo PSF-convolution energy-regularizer target weight. '
+                'Effective weight is warmed up per dodo_psf_energy_warmup_epochs.'
+            ),
+        )
+        parser.add_argument(
+            '--dodo_psf_energy_radius', type=float, default=16.0,
+            help='PSF concentration target radius in sensor pixels.',
+        )
+        parser.add_argument(
+            '--dodo_psf_energy_outside_budget', type=float, default=0.5,
+            help='Allowed normalized PSF energy fraction outside the target radius.',
+        )
+        parser.add_argument(
+            '--dodo_psf_energy_softness', type=float, default=1.5,
+            help='Logistic radial-mask transition width in pixels; 0 selects a hard mask.',
+        )
+        parser.add_argument(
+            '--dodo_psf_energy_warmup_epochs', type=int, default=2,
+            help='Epochs used for PSF energy weight warm-up: epoch 0=0, epoch N=full.',
+        )
         parser.add_argument('--depth_smooth_weight', type=float, default=0.01,
                     help='深度平滑正则权重（抑制颜色纹理串扰）')
         parser.add_argument('--metric_depth_loss_weight', type=float, default=0.0,
