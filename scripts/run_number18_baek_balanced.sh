@@ -9,23 +9,45 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export CUDA_VISIBLE_DEVICES
 STAGE_A_OPTICS_LR="${STAGE_A_OPTICS_LR:-1e-5}"
-DODO_PSF_ENERGY_WEIGHT="${DODO_PSF_ENERGY_WEIGHT:-0.02}"
+DODO_PSF_ENERGY_WEIGHT="${DODO_PSF_ENERGY_WEIGHT:-0.03}"
 DODO_PSF_ENERGY_RADIUS="${DODO_PSF_ENERGY_RADIUS:-16.0}"
-DODO_PSF_ENERGY_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTSIDE_BUDGET:-0.5}"
+DODO_PSF_ENERGY_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTSIDE_BUDGET:-0.20}"
+DODO_PSF_ENERGY_OUTER_RADIUS="${DODO_PSF_ENERGY_OUTER_RADIUS:-24.0}"
+DODO_PSF_ENERGY_OUTER_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTER_OUTSIDE_BUDGET:-0.05}"
+DODO_PSF_ENERGY_INITIAL_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_INITIAL_OUTSIDE_BUDGET:-0.35}"
+DODO_PSF_ENERGY_INITIAL_OUTER_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_INITIAL_OUTER_OUTSIDE_BUDGET:-0.15}"
+DODO_PSF_ENERGY_TIGHTENING_EPOCHS="${DODO_PSF_ENERGY_TIGHTENING_EPOCHS:-3}"
+DODO_PSF_ENERGY_CVAR_FRACTION="${DODO_PSF_ENERGY_CVAR_FRACTION:-0.10}"
+DODO_PSF_ENERGY_CVAR_WEIGHT="${DODO_PSF_ENERGY_CVAR_WEIGHT:-0.5}"
 DODO_PSF_ENERGY_SOFTNESS="${DODO_PSF_ENERGY_SOFTNESS:-1.5}"
-DODO_PSF_ENERGY_WARMUP_EPOCHS="${DODO_PSF_ENERGY_WARMUP_EPOCHS:-2}"
-DODO_OPTICAL_HALO="${DODO_OPTICAL_HALO:-32}"
-DODO_PSF_SPECTRAL_SEPARATION_WEIGHT="${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT:-0.01}"
-DODO_PSF_SPECTRAL_SEPARATION_MARGIN="${DODO_PSF_SPECTRAL_SEPARATION_MARGIN:-0.95}"
-DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS="${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS:-2}"
+DODO_PSF_ENERGY_WARMUP_EPOCHS="${DODO_PSF_ENERGY_WARMUP_EPOCHS:-0}"
+DODO_OPTICAL_HALO="${DODO_OPTICAL_HALO:-64}"
+DODO_PSF_MTF_WEIGHT="${DODO_PSF_MTF_WEIGHT:-0.25}"
+DODO_PSF_SPECTRAL_SEPARATION_WEIGHT="${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT:-0.02}"
+DODO_PSF_SPECTRAL_SEPARATION_MARGIN="${DODO_PSF_SPECTRAL_SEPARATION_MARGIN:-0.90}"
+DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS="${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS:-0}"
+DODO_PSF_DEPTH_SEPARATION_WEIGHT="${DODO_PSF_DEPTH_SEPARATION_WEIGHT:-0.005}"
+DODO_PSF_DEPTH_SEPARATION_MARGIN="${DODO_PSF_DEPTH_SEPARATION_MARGIN:-0.90}"
 DODO_ZERNIKE_MODE="${DODO_ZERNIKE_MODE:-free}"
 DODO_ZERNIKE_TERMS="${DODO_ZERNIKE_TERMS:-150}"
 DODO_ZERNIKE_BASIS_PATH="${DODO_ZERNIKE_BASIS_PATH:-${ROOT_DIR}/torch_optics/assets/zernike_volume1_128_Nterms_150.npy}"
+DODO_ZERNIKE_INIT_CHECKPOINT="${DODO_ZERNIKE_INIT_CHECKPOINT:-${ROOT_DIR}/experiments/number_18e_optics_lr1e-5_stageA_12ep/artifacts/checkpoints/joint-best-epoch=011.ckpt}"
+DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH="${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH:-${ROOT_DIR}/torch_optics/assets/Base_zernike_128x128_nopadd.mat}"
+DODO_ZERNIKE_LOW_ORDER_TERMS="${DODO_ZERNIKE_LOW_ORDER_TERMS:-15}"
+DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH="${DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH:-5}"
+DODO_ZERNIKE_HIGH_ORDER_LR_RATIO="${DODO_ZERNIKE_HIGH_ORDER_LR_RATIO:-0.2}"
+DODO_ZERNIKE_HIGH_ORDER_WEIGHT="${DODO_ZERNIKE_HIGH_ORDER_WEIGHT:-0.0001}"
+DODO_ZERNIKE_COEFFICIENT_LIMIT="${DODO_ZERNIKE_COEFFICIENT_LIMIT:-2.0}"
+SAM_LOSS_WEIGHT="${SAM_LOSS_WEIGHT:-0.02}"
+MSE_LOSS_WEIGHT="${MSE_LOSS_WEIGHT:-0.5}"
+SPATIAL_GRADIENT_LOSS_WEIGHT="${SPATIAL_GRADIENT_LOSS_WEIGHT:-0.05}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-2}"
 
 SOURCE_TRAIN_INDEX="${SOURCE_TRAIN_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_nooverlap_v1.npz}"
 VAL_INDEX="${VAL_INDEX:-${DATA_ROOT}/.patch_index/val_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_v1.npz}"
 BASE_BALANCED_INDEX="${BASE_BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
-BALANCED_INDEX="${BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_halo32_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
+BALANCED_INDEX="${BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_halo${DODO_OPTICAL_HALO}_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
 BALANCE_REPORT="${BALANCE_REPORT:-${BASE_BALANCED_INDEX%.npz}.json}"
 
 build_index() {
@@ -97,9 +119,9 @@ run_training() {
       fi
       stage_args=(
         --init_ckpt_path "${init_ckpt}"
-        --isolate_hs_decoder_gradients
+        --no-isolate_hs_decoder_gradients
         --no-optimize_optics
-        --cnn_lr 1e-4
+        --cnn_lr 5e-5
         --optics_lr 0.0
         --lr_decay_strategy baek
         --cnn_lr_decay_epochs 20
@@ -120,6 +142,16 @@ run_training() {
   if [[ "${DODO_ZERNIKE_MODE}" == "free" && ! -f "${DODO_ZERNIKE_BASIS_PATH}" ]]; then
     echo "Zernike basis not found: ${DODO_ZERNIKE_BASIS_PATH}" >&2
     exit 1
+  fi
+  if [[ "${stage}" == "stage_a" ]]; then
+    for required_zernike_file in \
+      "${DODO_ZERNIKE_INIT_CHECKPOINT}" \
+      "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}"; do
+      if [[ ! -f "${required_zernike_file}" ]]; then
+        echo "Zernike initialization file not found: ${required_zernike_file}" >&2
+        exit 1
+      fi
+    done
   fi
   if [[ -e "${experiment_dir}/artifacts/command.txt" && "${ALLOW_EXISTING:-0}" != "1" ]]; then
     echo "Experiment already exists: ${experiment_dir}" >&2
@@ -182,16 +214,33 @@ run_training() {
     --dodo_psf_energy_weight "${DODO_PSF_ENERGY_WEIGHT}" \
     --dodo_psf_energy_radius "${DODO_PSF_ENERGY_RADIUS}" \
     --dodo_psf_energy_outside_budget "${DODO_PSF_ENERGY_OUTSIDE_BUDGET}" \
+    --dodo_psf_energy_outer_radius "${DODO_PSF_ENERGY_OUTER_RADIUS}" \
+    --dodo_psf_energy_outer_outside_budget "${DODO_PSF_ENERGY_OUTER_OUTSIDE_BUDGET}" \
+    --dodo_psf_energy_initial_outside_budget "${DODO_PSF_ENERGY_INITIAL_OUTSIDE_BUDGET}" \
+    --dodo_psf_energy_initial_outer_outside_budget "${DODO_PSF_ENERGY_INITIAL_OUTER_OUTSIDE_BUDGET}" \
+    --dodo_psf_energy_tightening_epochs "${DODO_PSF_ENERGY_TIGHTENING_EPOCHS}" \
+    --dodo_psf_energy_cvar_fraction "${DODO_PSF_ENERGY_CVAR_FRACTION}" \
+    --dodo_psf_energy_cvar_weight "${DODO_PSF_ENERGY_CVAR_WEIGHT}" \
     --dodo_psf_energy_softness "${DODO_PSF_ENERGY_SOFTNESS}" \
     --dodo_psf_energy_warmup_epochs "${DODO_PSF_ENERGY_WARMUP_EPOCHS}" \
     --dodo_optical_halo "${DODO_OPTICAL_HALO}" \
     --dodo_psf_spectral_separation_weight "${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT}" \
     --dodo_psf_spectral_separation_margin "${DODO_PSF_SPECTRAL_SEPARATION_MARGIN}" \
     --dodo_psf_spectral_separation_warmup_epochs "${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS}" \
+    --dodo_psf_mtf_weight "${DODO_PSF_MTF_WEIGHT}" \
+    --dodo_psf_depth_separation_weight "${DODO_PSF_DEPTH_SEPARATION_WEIGHT}" \
+    --dodo_psf_depth_separation_margin "${DODO_PSF_DEPTH_SEPARATION_MARGIN}" \
     --dodo_doe_type New \
     --dodo_zernike_mode "${DODO_ZERNIKE_MODE}" \
     --dodo_zernike_terms "${DODO_ZERNIKE_TERMS}" \
     --dodo_zernike_basis_path "${DODO_ZERNIKE_BASIS_PATH}" \
+    --dodo_zernike_init_checkpoint "${DODO_ZERNIKE_INIT_CHECKPOINT}" \
+    --dodo_zernike_init_legacy_basis_path "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}" \
+    --dodo_zernike_low_order_terms "${DODO_ZERNIKE_LOW_ORDER_TERMS}" \
+    --dodo_zernike_high_order_unlock_epoch "${DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH}" \
+    --dodo_zernike_high_order_lr_ratio "${DODO_ZERNIKE_HIGH_ORDER_LR_RATIO}" \
+    --dodo_zernike_high_order_weight "${DODO_ZERNIKE_HIGH_ORDER_WEIGHT}" \
+    --dodo_zernike_coefficient_limit "${DODO_ZERNIKE_COEFFICIENT_LIMIT}" \
     --no-dodo_use_second_doe \
     --dodo_skip_prop2 \
     --dodo_sensing_mode rgb \
@@ -211,8 +260,12 @@ run_training() {
     --no-hs_residual_prior \
     --noise_sigma_min 0.0 \
     --noise_sigma_max 0.0 \
+    --sam_loss_weight "${SAM_LOSS_WEIGHT}" \
+    --mse_loss_weight "${MSE_LOSS_WEIGHT}" \
+    --spatial_gradient_loss_weight "${SPATIAL_GRADIENT_LOSS_WEIGHT}" \
     --lr_warmup_steps 54 \
-    --batch_sz 16 \
+    --batch_sz "${TRAIN_BATCH_SIZE}" \
+    --accumulate_grad_batches "${ACCUMULATE_GRAD_BATCHES}" \
     --num_workers 16 \
     --gpus 2 \
     --distributed_backend ddp \

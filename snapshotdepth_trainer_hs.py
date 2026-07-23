@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 from argparse import ArgumentParser
+import numpy as np
 import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint,Callback
@@ -17,6 +18,74 @@ from snapshotdepth_hs import SnapshotDepthHS as SnapshotDepth
 from util.log_manager import LogManager
 
 seed_everything(123)
+
+
+def _project_legacy_doe_wavefront(model, checkpoint_path, legacy_basis_path):
+    """Project a legacy DOE height map into the active free-Zernike basis."""
+    from scipy.io import loadmat
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('state_dict', checkpoint)
+    coefficient_keys = [
+        key for key in state_dict
+        if key.endswith('camera.doe1.zernike_coeffs')
+    ]
+    if len(coefficient_keys) != 1:
+        raise ValueError(
+            'Expected exactly one legacy camera.doe1.zernike_coeffs key in '
+            f'{checkpoint_path}, found {coefficient_keys}')
+    source_coefficients = state_dict[coefficient_keys[0]].detach().cpu().numpy()
+    legacy_mat = loadmat(legacy_basis_path)
+    if 'HmBase' not in legacy_mat:
+        raise ValueError(
+            f'Legacy basis {legacy_basis_path} does not contain HmBase')
+    legacy_basis = np.asarray(legacy_mat['HmBase'], dtype=np.float64)
+    if (legacy_basis.ndim == 3
+            and legacy_basis.shape[-1] == source_coefficients.size):
+        legacy_basis = np.transpose(legacy_basis, (2, 0, 1))
+    if legacy_basis.shape[0] != source_coefficients.size:
+        raise ValueError(
+            f'Legacy coefficient/basis mismatch: {source_coefficients.size} '
+            f'vs {legacy_basis.shape}')
+
+    doe1 = getattr(getattr(model, 'camera', None), 'doe1', None)
+    target_parameter = getattr(doe1, 'zernike_coeffs', None)
+    target_basis_tensor = getattr(doe1, 'zernike_basis', None)
+    if not isinstance(target_parameter, torch.nn.Parameter):
+        raise ValueError('Active model has no trainable/free Zernike parameter')
+    target_basis = np.asarray(
+        target_basis_tensor.detach().cpu().numpy(), dtype=np.float64)
+    target_height = np.sum(
+        source_coefficients[:, None, None] * legacy_basis, axis=0)
+    support = np.any(np.abs(target_basis) > 0.0, axis=0)
+    design = target_basis[:, support].T
+    projected, _, rank, _ = np.linalg.lstsq(
+        design, target_height[support], rcond=1e-8)
+    reconstructed = np.sum(projected[:, None, None] * target_basis, axis=0)
+    relative_error = (
+        np.linalg.norm((reconstructed - target_height)[support])
+        / max(np.linalg.norm(target_height[support]), np.finfo(np.float64).eps)
+    )
+    coefficient_limit = float(getattr(doe1, 'coefficient_limit', 1.0))
+    if np.max(np.abs(projected)) > coefficient_limit + 1e-6:
+        raise ValueError(
+            'Projected Zernike coefficient exceeds configured clamp limit: '
+            f'max={np.max(np.abs(projected)):.6g}, '
+            f'limit={coefficient_limit:.6g}')
+    with torch.no_grad():
+        target_parameter.copy_(torch.as_tensor(
+            projected, dtype=target_parameter.dtype,
+            device=target_parameter.device))
+    if relative_error > 1e-5:
+        raise RuntimeError(
+            f'Legacy DOE projection relative error is too high: {relative_error}')
+    print(
+        '[doe_init] Projected legacy DOE wavefront into free basis: '
+        f'source_terms={source_coefficients.size}, '
+        f'target_terms={target_parameter.numel()}, rank={rank}, '
+        f'relative_error={relative_error:.3e}, '
+        f'coefficient_max={np.max(np.abs(projected)):.6g}')
+    return relative_error
 
 # DoDo
 class DOEParameterClampCallback(Callback):
@@ -577,10 +646,27 @@ def main(args):
         print(f'[checkpoint] auxiliary best checkpoints disabled; tracking epochs in {best_metric_path}')
 
     model = SnapshotDepth(hparams=args, log_dir=logger.log_dir, artifact_root=artifact_dir)
+    zernike_init_checkpoint = getattr(
+        args, 'dodo_zernike_init_checkpoint', '') or ''
+    generic_init_checkpoint = (
+        getattr(args, 'init_ckpt_path', '')
+        or getattr(args, 'validate_only_ckpt', '')
+    )
+    if zernike_init_checkpoint and not generic_init_checkpoint:
+        legacy_basis_path = getattr(
+            args, 'dodo_zernike_init_legacy_basis_path', '') or ''
+        if not legacy_basis_path:
+            raise ValueError(
+                '--dodo_zernike_init_legacy_basis_path is required with '
+                '--dodo_zernike_init_checkpoint')
+        relative_error = _project_legacy_doe_wavefront(
+            model, zernike_init_checkpoint, legacy_basis_path)
+        args.dodo_zernike_init_projection_error = float(relative_error)
+        args.dodo_zernike_init_checkpoint_loaded = zernike_init_checkpoint
     train_dataloader, val_dataloader = prepare_data(hparams=args)
 
     # --- Load initial checkpoint weights if requested (fresh optimizer) ---
-    init_ckpt = getattr(args, 'init_ckpt_path', '') or getattr(args, 'validate_only_ckpt', '')
+    init_ckpt = generic_init_checkpoint
     if init_ckpt:
         print(f'[init] Loading checkpoint weights from {init_ckpt}')
         checkpoint = torch.load(init_ckpt, map_location='cpu')

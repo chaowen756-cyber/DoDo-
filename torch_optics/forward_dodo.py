@@ -735,8 +735,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
     ):
         batch, _, height, width = spectral.shape
         # The optical PSF sampling grid stays fixed at the calibrated 128x128
-        # sensor grid.  Scene tiles may be larger (for example, a 192x192 tile
-        # with a 32-pixel halo) and are convolved with this fixed kernel.
+        # sensor grid. Scene tiles may be larger (for example, a 256x256 tile
+        # with a 64-pixel halo) and are convolved with this fixed kernel.
         kernel_size = int(self.prop1_layers[0].Mp)
         psf_bank = self._generate_psf_bank(
             kernel_size, kernel_size, spectral.device, use_cache=True)

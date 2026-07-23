@@ -5,8 +5,13 @@ import torch
 
 from snapshotdepth_hs import SnapshotDepthHS
 from util.psf_regularization import (
+    epoch_tightening_value,
     epoch_warmup_weight,
+    multiscale_psf_energy_concentration_loss,
+    psf_mtf_floor_loss,
     psf_energy_concentration_loss,
+    sensor_weighted_depth_psf_separation_loss,
+    sensor_weighted_spectral_psf_separation_loss,
 )
 
 
@@ -15,6 +20,13 @@ def test_epoch_warmup_matches_final_training_schedule():
     assert epoch_warmup_weight(0.02, current_epoch=1, warmup_epochs=2) == 0.01
     assert epoch_warmup_weight(0.02, current_epoch=2, warmup_epochs=2) == 0.02
     assert epoch_warmup_weight(0.02, current_epoch=20, warmup_epochs=2) == 0.02
+
+
+def test_epoch_constraint_budget_tightens_without_zero_weight_window():
+    assert epoch_tightening_value(0.35, 0.20, 0, 3) == pytest.approx(0.35)
+    assert epoch_tightening_value(0.35, 0.20, 1, 3) == pytest.approx(0.30)
+    assert epoch_tightening_value(0.35, 0.20, 3, 3) == pytest.approx(0.20)
+    assert epoch_tightening_value(0.35, 0.20, 20, 3) == pytest.approx(0.20)
 
 
 @pytest.mark.parametrize(
@@ -105,6 +117,57 @@ def test_loss_backpropagates_finite_nonzero_gradient():
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
     assert logits.grad.norm().item() > 0
+
+
+def test_multiscale_energy_penalizes_core_and_tail_and_reports_radii():
+    psf = torch.zeros((1, 2, 64, 64), requires_grad=True)
+    with torch.no_grad():
+        psf[0, 0, 32, 32] = 1.0
+        psf[0, 1, 32, 60] = 1.0
+    loss, stats = multiscale_psf_energy_concentration_loss(
+        psf,
+        radii=(8.0, 16.0),
+        outside_budgets=(0.2, 0.05),
+        softness=0.0,
+        cvar_fraction=0.5,
+        cvar_weight=0.5,
+    )
+    loss.backward()
+    assert loss.item() > 0
+    assert stats['r8_inside_mean'].item() == pytest.approx(0.5)
+    assert stats['r90_max'].item() >= 28.0
+    assert psf.grad is not None
+
+
+def test_mtf_floor_distinguishes_delta_from_broad_psf_and_backpropagates():
+    delta = torch.zeros((1, 1, 64, 64))
+    delta[..., 32, 32] = 1.0
+    broad_logits = torch.zeros((1, 1, 64, 64), requires_grad=True)
+    broad = torch.softmax(broad_logits.flatten(-2), dim=-1).reshape_as(broad_logits)
+    delta_loss, delta_stats = psf_mtf_floor_loss(delta)
+    broad_loss, broad_stats = psf_mtf_floor_loss(broad)
+    broad_loss.backward()
+    assert delta_loss.item() == pytest.approx(0.0, abs=1e-8)
+    assert broad_loss.item() > delta_loss.item()
+    assert delta_stats['mtf_005_mean'].item() > broad_stats['mtf_005_mean'].item()
+    assert broad_logits.grad is not None
+    assert torch.isfinite(broad_logits.grad).all()
+
+
+def test_spectral_offsets_and_depth_hard_negatives_are_differentiable():
+    psf = torch.rand((3, 4, 16, 16), requires_grad=True)
+    response = torch.rand((3, 4))
+    spectral_loss, spectral_stats = (
+        sensor_weighted_spectral_psf_separation_loss(
+            psf, response, margin=0.90, offsets=(1, 2),
+            hard_fraction=0.2, hard_weight=0.5))
+    depth_loss, depth_stats = sensor_weighted_depth_psf_separation_loss(
+        psf, response, margin=0.90, hard_fraction=0.2, hard_weight=0.5)
+    (spectral_loss + depth_loss).backward()
+    assert psf.grad is not None
+    assert torch.isfinite(psf.grad).all()
+    assert 0.0 <= spectral_stats['active_fraction'].item() <= 1.0
+    assert depth_stats['adjacent_cosine_p90'].item() <= 1.0 + 1e-6
 
 
 @pytest.mark.parametrize(

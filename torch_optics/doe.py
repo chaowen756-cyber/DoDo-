@@ -47,7 +47,11 @@ class _BaseDOE(nn.Module):
     def clamp_parameters_(self):
         if hasattr(self, "zernike_coeffs") and isinstance(self.zernike_coeffs, nn.Parameter):
             with torch.no_grad():
-                self.zernike_coeffs.clamp_(-1.0, 1.0)
+                limit = float(getattr(self, "coefficient_limit", 1.0))
+                if limit <= 0:
+                    raise ValueError(
+                        f"coefficient_limit must be > 0, got {limit}")
+                self.zernike_coeffs.clamp_(-limit, limit)
 
     def _phase_modulation(self, x: torch.Tensor, hm: torch.Tensor) -> torch.Tensor:
         c = x.shape[1]
