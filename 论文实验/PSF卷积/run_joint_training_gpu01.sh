@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# End-to-end PSF-convolution experiment on physical GPUs 0 and 1:
+# End-to-end PSF-convolution experiment on physical GPUs 2 and 3:
 # Stage A train -> Stage A scenes 14-18 inference -> Stage B train ->
 # Stage B scenes 14-18 inference.
 
@@ -17,7 +17,8 @@ STAGE_B_MAX_EPOCHS="${STAGE_B_MAX_EPOCHS:-30}"
 INFERENCE_STRIDE="${INFERENCE_STRIDE:-64}"
 ENFORCE_PHYSICAL_GATE="${ENFORCE_PHYSICAL_GATE:-0}"
 
-export CUDA_VISIBLE_DEVICES="0,1"
+PHYSICAL_GPUS=(2 3)
+export CUDA_VISIBLE_DEVICES="2,3"
 export PYTHON_BIN="${PYTHON_BIN:-/home/wenchao/conda_envs/ld_clean/bin/python}"
 export DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/Baek数据集}"
 export EXPERIMENT_ROOT="${RESULT_ROOT}"
@@ -194,14 +195,15 @@ run_inference_14_18() {
   echo
   echo "========== ${stage_label}: scenes 14-18 inference =========="
   echo "Checkpoint: ${checkpoint}"
-  echo "GPU logs: ${log_dir}/gpu0.log and ${log_dir}/gpu1.log"
+  echo "GPU logs: ${log_dir}/gpu2.log and ${log_dir}/gpu3.log"
 
   for worker_index in 0 1; do
     (
       local scene_index
+      local physical_gpu="${PHYSICAL_GPUS[worker_index]}"
       for ((scene_index = worker_index; scene_index < ${#scenes[@]}; scene_index += 2)); do
         infer_scene "${stage_label}" "${checkpoint}" "${experiment_root}" \
-          "${scenes[scene_index]}" "${worker_index}" "${log_dir}/gpu${worker_index}.log"
+          "${scenes[scene_index]}" "${physical_gpu}" "${log_dir}/gpu${physical_gpu}.log"
       done
     ) &
     worker_pids+=("$!")
@@ -210,7 +212,7 @@ run_inference_14_18() {
   local status=0
   for worker_index in 0 1; do
     if ! wait "${worker_pids[worker_index]}"; then
-      echo "${stage_label} inference worker on GPU ${worker_index} failed." >&2
+      echo "${stage_label} inference worker on GPU ${PHYSICAL_GPUS[worker_index]} failed." >&2
       status=1
     fi
   done
@@ -229,7 +231,7 @@ require_file "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}"
 mkdir -p "${PIPELINE_LOG_ROOT}"
 cd "${REPO_ROOT}"
 
-echo "PSF convolution automated pipeline on physical GPUs 0,1"
+echo "PSF convolution automated pipeline on physical GPUs 2,3"
 echo "Zernike: mode=${DODO_ZERNIKE_MODE}, terms=${DODO_ZERNIKE_TERMS}"
 echo "Basis: ${DODO_ZERNIKE_BASIS_PATH}"
 echo "Stage A: ${STAGE_A_NAME}, epochs=${STAGE_A_MAX_EPOCHS}"

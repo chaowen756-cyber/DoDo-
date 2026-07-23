@@ -8,7 +8,7 @@ bash 论文实验/PSF卷积/run_joint_training_gpu01.sh
 ```
 
 脚本自动执行 Stage A 20 epoch、Stage A 场景 14–18 推理、Stage B
-30 epoch、Stage B 场景 14–18 推理，使用物理 GPU 0、1。终端输出通过
+30 epoch、Stage B 场景 14–18 推理，使用物理 GPU 2、3。终端输出通过
 `tee` 实时显示，同时保存在 `论文实验/PSF卷积/pipeline_logs/`。
 
 ## number3 相对 number2 的集中修改
