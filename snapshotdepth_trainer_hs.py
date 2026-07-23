@@ -398,6 +398,7 @@ def prepare_data(hparams):
         baek_illuminant_retries=getattr(
             hparams, 'baek_illuminant_retries', 8
         ),
+        optical_halo=getattr(hparams, 'dodo_optical_halo', 0),
     )
 
     val_dataset = HyperspectralDepthDataset(
@@ -428,6 +429,7 @@ def prepare_data(hparams):
         hs_norm_mode=getattr(hparams, 'hs_norm_mode', 'scene_max'),
         hs_norm_scale=getattr(hparams, 'hs_norm_scale', 0.0),
         hs_sanity_threshold=getattr(hparams, 'hs_sanity_threshold', 10000.0),
+        optical_halo=getattr(hparams, 'dodo_optical_halo', 0),
     )
 
     train_dataloader = DataLoader(train_dataset, batch_size=hparams.batch_sz,

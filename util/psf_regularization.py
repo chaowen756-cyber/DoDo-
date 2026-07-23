@@ -94,3 +94,55 @@ def psf_energy_concentration_loss(
             "active_fraction": (violation > 0).to(psf.dtype).mean().detach(),
         }
     return loss, stats
+
+
+def sensor_weighted_spectral_psf_separation_loss(
+    psf_bank: torch.Tensor,
+    sensor_response: torch.Tensor,
+    margin: float = 0.95,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Penalize overly similar adjacent-wavelength sensor PSF signatures.
+
+    Each wavelength signature contains all sensor channels and spatial PSF
+    samples.  This matches the information that survives spectral collapse in
+    the RGB measurement instead of optimizing bare PSFs that the sensor never
+    observes directly.
+    """
+    if psf_bank.ndim != 4:
+        raise ValueError(
+            "psf_bank must have shape [depth, wavelength, H, W], "
+            f"got {tuple(psf_bank.shape)}")
+    if sensor_response.ndim != 2:
+        raise ValueError(
+            "sensor_response must have shape [sensor_channel, wavelength], "
+            f"got {tuple(sensor_response.shape)}")
+    if sensor_response.shape[1] != psf_bank.shape[1]:
+        raise ValueError(
+            f"sensor wavelengths ({sensor_response.shape[1]}) do not match "
+            f"PSF wavelengths ({psf_bank.shape[1]})")
+    if psf_bank.shape[1] < 2:
+        raise ValueError("spectral PSF separation requires at least two wavelengths")
+    if not -1.0 <= margin <= 1.0:
+        raise ValueError(f"margin must be in [-1, 1], got {margin}")
+    if not torch.isfinite(psf_bank).all() or not torch.isfinite(sensor_response).all():
+        raise ValueError("PSF bank and sensor response must be finite")
+
+    psf = psf_bank.to(dtype=torch.float32)
+    response = sensor_response.to(device=psf.device, dtype=psf.dtype)
+    # [D, L, S, H, W], where S is the number of sensor channels.
+    signatures = psf.unsqueeze(2) * response.t()[None, :, :, None, None]
+    signatures = signatures.flatten(start_dim=2)
+    signatures = F.normalize(signatures, p=2, dim=-1, eps=1e-12)
+    adjacent_cosine = (signatures[:, :-1] * signatures[:, 1:]).sum(dim=-1)
+    violation = F.relu(adjacent_cosine - float(margin))
+    loss = violation.mean()
+
+    with torch.no_grad():
+        stats = {
+            "adjacent_cosine_mean": adjacent_cosine.mean().detach(),
+            "adjacent_cosine_p90": torch.quantile(
+                adjacent_cosine.detach().flatten(), 0.9),
+            "adjacent_cosine_max": adjacent_cosine.max().detach(),
+            "active_fraction": (violation > 0).to(psf.dtype).mean().detach(),
+        }
+    return loss, stats

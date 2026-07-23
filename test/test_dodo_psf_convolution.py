@@ -3,8 +3,10 @@ import types
 import pytest
 import torch
 
+from torch_optics.doe import DOELayer, DOEFreeLayer
 from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
 from util.psf_regularization import psf_energy_concentration_loss
+from util.psf_regularization import sensor_weighted_spectral_psf_separation_loss
 
 
 def _make_model(
@@ -18,6 +20,9 @@ def _make_model(
     psf_layer_mask_mode="baek_hard",
     psf_mask_blur_sigma=1.0,
     psf_boundary_mode="linear_zero",
+    free=False,
+    n_terms=150,
+    zernike_basis_path=None,
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=0.4,
@@ -26,6 +31,9 @@ def _make_model(
         use_second_doe=False,
         doe_type_a=doe_type_a,
         train_c=train_c,
+        free=free,
+        n_terms=n_terms,
+        zernike_basis_path=zernike_basis_path,
         input_format="nchw",
         output_format="nchw",
         assets_dir="torch_optics/assets",
@@ -40,6 +48,38 @@ def _make_model(
         psf_mask_blur_sigma=psf_mask_blur_sigma,
         psf_boundary_mode=psf_boundary_mode,
     )
+
+
+def test_default_zernike_mode_remains_legacy_12_term_mat_basis():
+    model = _make_model(train_c=True, doe_type_a="New")
+
+    assert isinstance(model.doe1, DOELayer)
+    assert model.doe1.zernike_basis.shape == (12, 128, 128)
+    assert model.doe1.zernike_coeffs.shape == (12,)
+
+
+def test_free_zernike_mode_loads_150_term_npy_basis():
+    model = _make_model(
+        train_c=True,
+        doe_type_a="New",
+        free=True,
+        n_terms=150,
+    )
+
+    assert isinstance(model.doe1, DOEFreeLayer)
+    assert model.doe1.zernike_basis.shape == (150, 128, 128)
+    assert model.doe1.zernike_basis.dtype == torch.float32
+    assert model.doe1.zernike_coeffs.shape == (150,)
+    assert model.doe1.zernike_coeffs.requires_grad
+
+    psf = model.psf_bank(use_cache=False)
+    loss, _ = psf_energy_concentration_loss(
+        psf, radius=16.0, outside_budget=0.5, softness=1.5)
+    loss.backward()
+    grad = model.doe1.zernike_coeffs.grad
+    assert grad is not None
+    assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad).item() == 150
 
 
 @pytest.fixture(scope="module")
@@ -141,6 +181,37 @@ def test_center_point_measurement_matches_generated_psf(frozen_psf_model):
         output = frozen_psf_model(spectral, depth)
 
     torch.testing.assert_close(output[0], psf[0], atol=1e-7, rtol=1e-5)
+
+
+def test_larger_scene_tile_uses_fixed_128_psf_and_preserves_center_crop(frozen_psf_model):
+    spectral = torch.zeros((1, 25, 192, 192))
+    spectral[:, :, 96, 96] = 1.0
+    depth = torch.ones((1, 1, 192, 192))
+
+    with torch.no_grad():
+        psf = frozen_psf_model.psf_bank(use_cache=True)
+        output = frozen_psf_model(spectral, depth)
+
+    assert output.shape == (1, 25, 192, 192)
+    torch.testing.assert_close(
+        output[0, :, 32:160, 32:160], psf[0], atol=1e-7, rtol=1e-5)
+
+
+def test_sensor_weighted_spectral_separation_penalizes_identical_neighbors():
+    psf = torch.zeros((2, 3, 8, 8), requires_grad=True)
+    with torch.no_grad():
+        psf[:, :, 4, 4] = 1.0
+    response = torch.ones((3, 3))
+
+    loss, stats = sensor_weighted_spectral_psf_separation_loss(
+        psf, response, margin=0.95)
+    loss.backward()
+
+    torch.testing.assert_close(loss.detach(), torch.tensor(0.05), atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        stats['adjacent_cosine_mean'], torch.tensor(1.0), atol=1e-6, rtol=0)
+    assert psf.grad is not None
+    assert torch.isfinite(psf.grad).all()
 
 
 def test_psf_forward_is_linear_without_measurement_normalization(frozen_psf_model):

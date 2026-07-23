@@ -27,7 +27,11 @@ from models.simple_model_mamba import SimpleModelHS as SimpleModel
 from optics import hyperspectral_camera as camera
 from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
 from util.hs_loss import CombinedLoss
-from util.psf_regularization import epoch_warmup_weight, psf_energy_concentration_loss
+from util.psf_regularization import (
+    epoch_warmup_weight,
+    psf_energy_concentration_loss,
+    sensor_weighted_spectral_psf_separation_loss,
+)
 
 # 导入项目原有的辅助工具
 from solvers.image_reconstruction import apply_tikhonov_inverse
@@ -246,8 +250,19 @@ class SnapshotDepthHS(pl.LightningModule):
         if depth_metric is not None and depth_metric.ndim == 4:
             depth_metric = depth_metric.squeeze(1)
 
+        optical_images = samples.get('hs_optical')
+        optical_depth_metric = samples.get('depth_metric_optical')
+        optical_valid_mask = samples.get('mask_optical')
+        if optical_depth_metric is not None and optical_depth_metric.ndim == 4:
+            optical_depth_metric = optical_depth_metric.squeeze(1)
+        if optical_valid_mask is not None and optical_valid_mask.ndim == 4:
+            optical_valid_mask = optical_valid_mask.squeeze(1)
+
         outputs = self.forward(target_images, target_depthmaps, is_testing=torch.tensor(False),
-                               depth_metric=depth_metric, valid_mask=valid_mask)
+                               depth_metric=depth_metric, valid_mask=valid_mask,
+                               optical_images=optical_images,
+                               optical_depth_metric=optical_depth_metric,
+                               optical_valid_mask=optical_valid_mask)
 
         # 3. 计算 Loss (传入 final_mask)
         data_loss, loss_logs = self.__compute_loss(outputs, outputs.target_depthmaps, outputs.target_images, final_mask)
@@ -430,8 +445,19 @@ class SnapshotDepthHS(pl.LightningModule):
         if depth_metric is not None and depth_metric.ndim == 4:
             depth_metric = depth_metric.squeeze(1)
 
+        optical_images = samples.get('hs_optical')
+        optical_depth_metric = samples.get('depth_metric_optical')
+        optical_valid_mask = samples.get('mask_optical')
+        if optical_depth_metric is not None and optical_depth_metric.ndim == 4:
+            optical_depth_metric = optical_depth_metric.squeeze(1)
+        if optical_valid_mask is not None and optical_valid_mask.ndim == 4:
+            optical_valid_mask = optical_valid_mask.squeeze(1)
+
         outputs = self.forward(target_images, target_depthmaps, is_testing=torch.tensor(False),
-                               depth_metric=depth_metric, valid_mask=valid_mask)
+                               depth_metric=depth_metric, valid_mask=valid_mask,
+                               optical_images=optical_images,
+                               optical_depth_metric=optical_depth_metric,
+                               optical_valid_mask=optical_valid_mask)
 
         est = outputs.est_depthmaps
         tgt = outputs.target_depthmaps
@@ -634,6 +660,20 @@ class SnapshotDepthHS(pl.LightningModule):
             ('psf_energy_outside_p90', 'train_loss/psf_energy_outside_p90'),
             ('psf_energy_inside_mean', 'train_loss/psf_energy_inside_mean'),
             ('psf_energy_active_fraction', 'train_loss/psf_energy_active_fraction'),
+            ('psf_spectral_separation_loss',
+             'train_loss/psf_spectral_separation_loss'),
+            ('psf_spectral_separation_weight',
+             'train_loss/psf_spectral_separation_weight'),
+            ('psf_spectral_separation_weighted',
+             'train_loss/psf_spectral_separation_weighted'),
+            ('psf_spectral_adjacent_cosine_mean',
+             'train_loss/psf_spectral_adjacent_cosine_mean'),
+            ('psf_spectral_adjacent_cosine_p90',
+             'train_loss/psf_spectral_adjacent_cosine_p90'),
+            ('psf_spectral_adjacent_cosine_max',
+             'train_loss/psf_spectral_adjacent_cosine_max'),
+            ('psf_spectral_active_fraction',
+             'train_loss/psf_spectral_active_fraction'),
             ('background_hs_loss', 'train_loss/background_hs_loss'),
         ]:
             if stored and key_internal in stored:
@@ -750,6 +790,22 @@ class SnapshotDepthHS(pl.LightningModule):
                 raise ValueError(f'dodo_depth_layers must be >= 1, got {n_depth_layers}')
             use_second_doe = getattr(hparams, 'dodo_use_second_doe', False)
             dodo_doe_type = getattr(hparams, 'dodo_doe_type', 'Zeros')
+            dodo_zernike_mode = getattr(hparams, 'dodo_zernike_mode', 'legacy12')
+            dodo_zernike_terms = int(getattr(hparams, 'dodo_zernike_terms', 150))
+            dodo_zernike_basis_path = getattr(
+                hparams, 'dodo_zernike_basis_path', None)
+            if dodo_zernike_mode not in ('legacy12', 'free'):
+                raise ValueError(
+                    'dodo_zernike_mode must be legacy12 or free, got '
+                    f'{dodo_zernike_mode!r}')
+            if dodo_zernike_terms < 1:
+                raise ValueError(
+                    f'dodo_zernike_terms must be >= 1, got {dodo_zernike_terms}')
+            if dodo_zernike_basis_path and dodo_zernike_mode != 'free':
+                raise ValueError(
+                    'dodo_zernike_basis_path is only valid when '
+                    '--dodo_zernike_mode free is selected')
+            dodo_use_free_zernike = dodo_zernike_mode == 'free'
             dodo_forward_norm = getattr(hparams, 'dodo_forward_norm', 'legacy_max')
             dodo_forward_scale = float(getattr(hparams, 'dodo_forward_scale', 1.0))
             dodo_sensing_mode = getattr(hparams, 'dodo_sensing_mode', 'rgb')
@@ -773,6 +829,17 @@ class SnapshotDepthHS(pl.LightningModule):
                 getattr(hparams, 'dodo_psf_energy_softness', 1.5))
             dodo_psf_energy_warmup_epochs = int(
                 getattr(hparams, 'dodo_psf_energy_warmup_epochs', 2))
+            # Missing fields identify historical checkpoints.  They retain the
+            # old 128-only optical path and no spectral regularizer.  The
+            # Number18 PSF training launcher explicitly enables halo=32 and
+            # the parser enables the new spectral weight by default.
+            dodo_optical_halo = int(getattr(hparams, 'dodo_optical_halo', 0))
+            dodo_psf_spectral_separation_weight = float(getattr(
+                hparams, 'dodo_psf_spectral_separation_weight', 0.0))
+            dodo_psf_spectral_separation_margin = float(getattr(
+                hparams, 'dodo_psf_spectral_separation_margin', 0.95))
+            dodo_psf_spectral_separation_warmup_epochs = int(getattr(
+                hparams, 'dodo_psf_spectral_separation_warmup_epochs', 2))
             if dodo_psf_energy_weight < 0:
                 raise ValueError('dodo_psf_energy_weight must be >= 0')
             if dodo_psf_energy_radius <= 0:
@@ -783,6 +850,26 @@ class SnapshotDepthHS(pl.LightningModule):
                 raise ValueError('dodo_psf_energy_softness must be >= 0')
             if dodo_psf_energy_warmup_epochs < 0:
                 raise ValueError('dodo_psf_energy_warmup_epochs must be >= 0')
+            if dodo_optical_halo < 0:
+                raise ValueError('dodo_optical_halo must be >= 0')
+            if dodo_optical_halo > 0 and dodo_image_formation != 'psf_convolution':
+                raise ValueError(
+                    'dodo_optical_halo is only supported with '
+                    '--dodo_image_formation psf_convolution')
+            if dodo_psf_spectral_separation_weight < 0:
+                raise ValueError(
+                    'dodo_psf_spectral_separation_weight must be >= 0')
+            if not -1.0 <= dodo_psf_spectral_separation_margin <= 1.0:
+                raise ValueError(
+                    'dodo_psf_spectral_separation_margin must be in [-1, 1]')
+            if dodo_psf_spectral_separation_warmup_epochs < 0:
+                raise ValueError(
+                    'dodo_psf_spectral_separation_warmup_epochs must be >= 0')
+            if (dodo_psf_spectral_separation_weight > 0
+                    and dodo_sensing_mode != 'rgb'):
+                raise ValueError(
+                    'The sensor-weighted spectral PSF separation loss currently '
+                    'requires --dodo_sensing_mode rgb')
             # Determine measurement_channels from sensing mode
             if dodo_sensing_mode == 'rgb':
                 hparams.measurement_channels = 3
@@ -801,6 +888,9 @@ class SnapshotDepthHS(pl.LightningModule):
                 use_second_doe=use_second_doe,
                 doe_type_a=dodo_doe_type,
                 train_c=hparams.optimize_optics,
+                free=dodo_use_free_zernike,
+                n_terms=dodo_zernike_terms,
+                zernike_basis_path=dodo_zernike_basis_path,
                 input_format='nchw',
                 output_format='nchw',
                 measurement_norm_mode=dodo_forward_norm,
@@ -818,6 +908,9 @@ class SnapshotDepthHS(pl.LightningModule):
                 psf_boundary_mode=dodo_psf_boundary,
             )
             print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
+                  f'zernike_mode={dodo_zernike_mode}, '
+                  f'zernike_terms={12 if not dodo_use_free_zernike else dodo_zernike_terms}, '
+                  f'zernike_basis={dodo_zernike_basis_path or "auto"}, '
                   f'forward_norm={dodo_forward_norm}, '
                   f'forward_scale={dodo_forward_scale:g}, '
                   f'skip_prop2={dodo_skip_prop2}, '
@@ -826,11 +919,17 @@ class SnapshotDepthHS(pl.LightningModule):
                   f'psf_layer_mask={dodo_psf_layer_mask}, '
                   f'psf_mask_sigma={dodo_psf_mask_blur_sigma:g}, '
                   f'psf_boundary={dodo_psf_boundary}, '
+                  f'optical_halo={dodo_optical_halo}px '
+                  f'(context={hparams.image_sz + 2 * dodo_optical_halo}px), '
                   f'psf_energy=(weight={dodo_psf_energy_weight:g}, '
                   f'radius={dodo_psf_energy_radius:g}px, '
                   f'outside_budget={dodo_psf_energy_outside_budget:g}, '
                   f'softness={dodo_psf_energy_softness:g}px, '
                   f'warmup_epochs={dodo_psf_energy_warmup_epochs}), '
+                  f'psf_spectral_separation=('
+                  f'weight={dodo_psf_spectral_separation_weight:g}, '
+                  f'margin={dodo_psf_spectral_separation_margin:g}, '
+                  f'warmup_epochs={dodo_psf_spectral_separation_warmup_epochs}), '
                   f'sensor_measurement={dodo_sensor_measurement}, '
                   f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
                   f'doe1.zernike_coeffs.requires_grad='
@@ -937,7 +1036,28 @@ class SnapshotDepthHS(pl.LightningModule):
         self.image_lossfn = CombinedLoss(l1_weight=hparams.l1_loss_weight)
         self.depth_lossfn = torch.nn.L1Loss()
 
-    def forward(self, images, depthmaps, is_testing, depth_metric=None, valid_mask=None):
+    @staticmethod
+    def _center_crop_to_size(tensor, target_height, target_width):
+        height, width = tensor.shape[-2:]
+        if height < target_height or width < target_width:
+            raise ValueError(
+                f'Cannot center-crop {height}x{width} to '
+                f'{target_height}x{target_width}')
+        top = (height - target_height) // 2
+        left = (width - target_width) // 2
+        return tensor[..., top:top + target_height, left:left + target_width]
+
+    def forward(
+        self,
+        images,
+        depthmaps,
+        is_testing,
+        depth_metric=None,
+        valid_mask=None,
+        optical_images=None,
+        optical_depth_metric=None,
+        optical_valid_mask=None,
+    ):
         while images.ndim > 4:
             if images.shape[1] == 1:
                 images = images.squeeze(1)
@@ -953,13 +1073,27 @@ class SnapshotDepthHS(pl.LightningModule):
         rgb_pinv_prior = None
 
         if self.optical_model_type == 'dodo_depth':
-            # Apply valid mask to suppress invalid background spectral input
+            # The center 128x128 tensors remain the reconstruction targets.
+            # Optional larger tensors supply real scene context only to the
+            # optical convolution; the resulting measurement is cropped back
+            # to the target size before entering the decoder.
+            optical_images_linear = images if optical_images is None else optical_images
+            optical_depth = depth_metric if optical_depth_metric is None else optical_depth_metric
+            optical_mask = valid_mask if optical_valid_mask is None else optical_valid_mask
+
+            # Apply target mask for decoder-side guidance inputs.
             if valid_mask is not None:
                 if valid_mask.ndim == 3:
                     valid_mask = valid_mask.unsqueeze(1)  # (B,H,W) -> (B,1,H,W)
                 images_linear = images_linear * valid_mask
 
-            if depth_metric is None:
+            # Apply the context mask before optical image formation.
+            if optical_mask is not None:
+                if optical_mask.ndim == 3:
+                    optical_mask = optical_mask.unsqueeze(1)
+                optical_images_linear = optical_images_linear * optical_mask
+
+            if optical_depth is None:
                 raise ValueError(
                     'dodo_depth requires metric depth input. '
                     'Dataset must provide depth_metric (metric meters).'
@@ -969,22 +1103,29 @@ class SnapshotDepthHS(pl.LightningModule):
             # output: (B, 3, H, W)
             if self.camera.image_formation_mode == 'psf_convolution':
                 captimgs, psf = self.camera(
-                    images_linear,
-                    depth_metric,
-                    valid_mask=valid_mask,
+                    optical_images_linear,
+                    optical_depth,
+                    valid_mask=optical_mask,
                     return_psf=True,
                 )
             else:
+                if optical_images is not None:
+                    raise ValueError(
+                        'Optical halo context is only supported by psf_convolution')
                 captimgs = self.camera(images_linear, depth_metric, valid_mask=valid_mask)
                 psf = None
+
+            target_height, target_width = images.shape[-2:]
+            captimgs = self._center_crop_to_size(
+                captimgs, target_height, target_width)
 
             # NaN/Inf guard: dodo optical model can produce non-finite output for near-zero input
             if not torch.isfinite(captimgs).all():
                 n_nonfinite = (~torch.isfinite(captimgs)).sum().item()
-                mask_ratio = valid_mask.mean().item() if valid_mask is not None else float('nan')
-                spec_sum = images_linear.sum().item()
-                dmetric_min = depth_metric.min().item() if depth_metric is not None else float('nan')
-                dmetric_max = depth_metric.max().item() if depth_metric is not None else float('nan')
+                mask_ratio = optical_mask.mean().item() if optical_mask is not None else float('nan')
+                spec_sum = optical_images_linear.sum().item()
+                dmetric_min = optical_depth.min().item() if optical_depth is not None else float('nan')
+                dmetric_max = optical_depth.max().item() if optical_depth is not None else float('nan')
                 nonfinite_policy = getattr(self.hparams, 'dodo_nonfinite_policy', 'zero')
                 if nonfinite_policy == 'fail':
                     raise RuntimeError(
@@ -1164,6 +1305,26 @@ class SnapshotDepthHS(pl.LightningModule):
                 'disabled optical regularizer.'
             )
         return effective_weight
+
+    def _dodo_psf_spectral_separation_weight(self):
+        """Warm up the sensor-visible adjacent-wavelength separation loss."""
+        target_weight = float(getattr(
+            self.hparams, 'dodo_psf_spectral_separation_weight', 0.0))
+        if target_weight < 0.0:
+            raise ValueError(
+                'dodo_psf_spectral_separation_weight must be >= 0, got '
+                f'{target_weight}')
+        if target_weight == 0.0 or not bool(
+                getattr(self.hparams, 'optimize_optics', False)):
+            return 0.0
+        if (self.optical_model_type != 'dodo_depth'
+                or getattr(self.camera, 'image_formation_mode', None)
+                != 'psf_convolution'):
+            return 0.0
+        warmup_epochs = int(getattr(
+            self.hparams, 'dodo_psf_spectral_separation_warmup_epochs', 2))
+        return epoch_warmup_weight(
+            target_weight, int(self.current_epoch), warmup_epochs)
     
 #     def __compute_loss(self, outputs, target_depthmaps, target_images, depth_conf):
 #         est_images = outputs.est_images
@@ -1347,6 +1508,17 @@ class SnapshotDepthHS(pl.LightningModule):
         psf_energy_inside_mean = torch.tensor(0.0, device=depth_loss.device)
         psf_energy_active_fraction = torch.tensor(0.0, device=depth_loss.device)
         effective_psf_loss_weight = 0.0
+        psf_spectral_separation_loss = torch.tensor(
+            0.0, device=depth_loss.device)
+        psf_spectral_adjacent_cosine_mean = torch.tensor(
+            0.0, device=depth_loss.device)
+        psf_spectral_adjacent_cosine_p90 = torch.tensor(
+            0.0, device=depth_loss.device)
+        psf_spectral_adjacent_cosine_max = torch.tensor(
+            0.0, device=depth_loss.device)
+        psf_spectral_active_fraction = torch.tensor(
+            0.0, device=depth_loss.device)
+        effective_psf_spectral_weight = 0.0
 
         if self.hparams.psf_loss_weight > 0 and self.optical_model_type == 'legacy_camera':
             psf_out_of_fov_sum, psf_out_of_fov_max = self.camera.psf_out_of_fov_energy(self.hparams.psf_size)
@@ -1374,6 +1546,30 @@ class SnapshotDepthHS(pl.LightningModule):
             psf_energy_inside_mean = psf_stats['inside_mean']
             psf_energy_active_fraction = psf_stats['active_fraction']
             effective_psf_loss_weight = self._dodo_psf_energy_weight()
+            if getattr(self.camera.sensing_unnorm, 'sensing_mode', None) == 'rgb':
+                sensor_response = self.camera._sensor_response_matrix(
+                    outputs.psf.device, outputs.psf.dtype)
+                (psf_spectral_separation_loss,
+                 psf_spectral_stats) = (
+                    sensor_weighted_spectral_psf_separation_loss(
+                        outputs.psf,
+                        sensor_response,
+                        margin=float(getattr(
+                            self.hparams,
+                            'dodo_psf_spectral_separation_margin',
+                            0.95)),
+                    )
+                )
+                psf_spectral_adjacent_cosine_mean = psf_spectral_stats[
+                    'adjacent_cosine_mean']
+                psf_spectral_adjacent_cosine_p90 = psf_spectral_stats[
+                    'adjacent_cosine_p90']
+                psf_spectral_adjacent_cosine_max = psf_spectral_stats[
+                    'adjacent_cosine_max']
+                psf_spectral_active_fraction = psf_spectral_stats[
+                    'active_fraction']
+                effective_psf_spectral_weight = (
+                    self._dodo_psf_spectral_separation_weight())
 
         # --- Background HS Loss (opt-in) ---
         bg_hs_loss_weight = float(getattr(self.hparams, 'background_hs_loss_weight', 0.0))
@@ -1389,12 +1585,15 @@ class SnapshotDepthHS(pl.LightningModule):
         weighted_depth_loss = self.hparams.depth_loss_weight * depth_loss
         weighted_image_loss = self.hparams.image_loss_weight * image_loss
         weighted_psf_loss = effective_psf_loss_weight * psf_loss
+        weighted_psf_spectral_loss = (
+            effective_psf_spectral_weight * psf_spectral_separation_loss)
         weighted_depth_smooth_loss = depth_smooth_weight * depth_smooth_loss
         weighted_metric_depth_loss = metric_depth_loss_weight * metric_depth_loss
 
         weighted_bg_hs_loss = bg_hs_loss_weight * bg_hs_loss
 
         total_loss = (weighted_depth_loss + weighted_image_loss + weighted_psf_loss +
+                     weighted_psf_spectral_loss +
                      weighted_depth_smooth_loss + weighted_metric_depth_loss +
                      weighted_bg_hs_loss)
 
@@ -1414,6 +1613,17 @@ class SnapshotDepthHS(pl.LightningModule):
             'psf_energy_outside_p90': psf_energy_outside_p90,
             'psf_energy_inside_mean': psf_energy_inside_mean,
             'psf_energy_active_fraction': psf_energy_active_fraction,
+            'psf_spectral_separation_loss': psf_spectral_separation_loss,
+            'psf_spectral_separation_weight': torch.tensor(
+                effective_psf_spectral_weight, device=depth_loss.device),
+            'psf_spectral_separation_weighted': weighted_psf_spectral_loss,
+            'psf_spectral_adjacent_cosine_mean': (
+                psf_spectral_adjacent_cosine_mean),
+            'psf_spectral_adjacent_cosine_p90': (
+                psf_spectral_adjacent_cosine_p90),
+            'psf_spectral_adjacent_cosine_max': (
+                psf_spectral_adjacent_cosine_max),
+            'psf_spectral_active_fraction': psf_spectral_active_fraction,
             'background_hs_loss': bg_hs_loss,
         }
     
@@ -1537,6 +1747,15 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='PSF convolution boundary model; linear_zero avoids circular FFT wrap-around')
         parser.add_argument('--dodo_doe_type', type=str, default='Zeros',
                             help='DoDo DOE 类型（Zeros=frozen, New=trainable Zernike）')
+        parser.add_argument('--dodo_zernike_mode', type=str, default='legacy12',
+                            choices=['legacy12', 'free'],
+                            help='Zernike basis: legacy12 loads the original 12-term MAT; '
+                                 'free loads an N-term NPY basis')
+        parser.add_argument('--dodo_zernike_terms', type=int, default=150,
+                            help='Number of Zernike terms when --dodo_zernike_mode free is used')
+        parser.add_argument('--dodo_zernike_basis_path', type=str, default=None,
+                            help='Optional explicit NPY basis path for free mode; by default loads '
+                                 'torch_optics/assets/zernike_volume1_128_Nterms_<N>.npy')
         parser.add_argument('--dodo_use_second_doe', dest='dodo_use_second_doe', action='store_true',
                             help='启用 DoDo 第二 DOE')
         parser.add_argument('--no-dodo_use_second_doe', dest='dodo_use_second_doe', action='store_false')
@@ -1674,6 +1893,25 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument(
             '--dodo_psf_energy_warmup_epochs', type=int, default=2,
             help='Epochs used for PSF energy weight warm-up: epoch 0=0, epoch N=full.',
+        )
+        parser.add_argument(
+            '--dodo_optical_halo', type=int, default=0,
+            help=(
+                'Real scene context on each side of a 128 target patch. '
+                '32 gives a 192x192 optical input and a center 128x128 target.'
+            ),
+        )
+        parser.add_argument(
+            '--dodo_psf_spectral_separation_weight', type=float, default=0.01,
+            help='Target weight for RGB-visible adjacent-wavelength PSF separation.',
+        )
+        parser.add_argument(
+            '--dodo_psf_spectral_separation_margin', type=float, default=0.95,
+            help='Maximum desired adjacent-wavelength cosine similarity.',
+        )
+        parser.add_argument(
+            '--dodo_psf_spectral_separation_warmup_epochs', type=int, default=2,
+            help='Epochs used to linearly warm up the spectral PSF loss weight.',
         )
         parser.add_argument('--depth_smooth_weight', type=float, default=0.01,
                     help='深度平滑正则权重（抑制颜色纹理串扰）')

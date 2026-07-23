@@ -251,6 +251,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         train_c: bool = True,
         free: bool = False,
         n_terms: int = 150,
+        zernike_basis_path: Optional[str] = None,
         input_format: str = "nhwc",
         output_format: str = "nhwc",
         assets_dir: str = "torch_optics/assets",
@@ -363,7 +364,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
             self.doe1 = DOEFreeLayer(
                 Mdoe=mss, Mesce=minput, n_terms=n_terms,
                 doe_type=doe_type_a, trainable=train_c,
-                assets_dir=assets_dir, phase_scale_mode="legacy_free",
+                assets_dir=assets_dir, basis_path=zernike_basis_path,
+                phase_scale_mode="legacy_free",
             )
         else:
             self.doe1 = DOELayer(
@@ -732,7 +734,12 @@ class DepthAwareDoDoForwardModel(nn.Module):
         return_psf: bool = False,
     ):
         batch, _, height, width = spectral.shape
-        psf_bank = self._generate_psf_bank(height, width, spectral.device, use_cache=True)
+        # The optical PSF sampling grid stays fixed at the calibrated 128x128
+        # sensor grid.  Scene tiles may be larger (for example, a 192x192 tile
+        # with a 32-pixel halo) and are convolved with this fixed kernel.
+        kernel_size = int(self.prop1_layers[0].Mp)
+        psf_bank = self._generate_psf_bank(
+            kernel_size, kernel_size, spectral.device, use_cache=True)
         response = self._sensor_response_matrix(spectral.device, spectral.dtype)
         y_sum = torch.zeros(
             (batch, response.shape[0], height, width),

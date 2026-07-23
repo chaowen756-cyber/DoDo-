@@ -164,7 +164,8 @@ class HyperspectralDepthDataset(Dataset):
                  baek_exposure_min: float = 0.90,
                  baek_exposure_max: float = 1.10,
                  baek_max_clip_ratio: float = 0.001,
-                 baek_illuminant_retries: int = 8):
+                 baek_illuminant_retries: int = 8,
+                 optical_halo: int = 0):
         
         super().__init__()
         self.is_training = is_training
@@ -212,6 +213,9 @@ class HyperspectralDepthDataset(Dataset):
         self.baek_exposure_max = float(baek_exposure_max)
         self.baek_max_clip_ratio = float(baek_max_clip_ratio)
         self.baek_illuminant_retries = max(1, int(baek_illuminant_retries))
+        self.optical_halo = int(optical_halo)
+        if self.optical_halo < 0:
+            raise ValueError(f'optical_halo must be >= 0, got {self.optical_halo}')
         for name, probability in (
             ('baek_scale_half_probability', self.baek_scale_half_probability),
             ('baek_depth_shift_probability', self.baek_depth_shift_probability),
@@ -289,6 +293,18 @@ class HyperspectralDepthDataset(Dataset):
             or (self.baek_augment and self.patch_index_path)
         ) and self.patch_index_path:
             self._load_patch_index(self.patch_index_path)
+        if (self.is_training and self.optical_halo > 0
+                and self.patch_index_by_id):
+            indexed_halo = self.patch_index_meta.get('optical_halo')
+            if indexed_halo is None or int(indexed_halo) != self.optical_halo:
+                raise ValueError(
+                    'Training with optical_halo requires a halo-safe patch index '
+                    f'generated for the same halo. Requested halo={self.optical_halo}, '
+                    f'index meta optical_halo={indexed_halo!r}.')
+            if self.patch_index_jitter != 0:
+                raise ValueError(
+                    'patch_index_jitter must be 0 with a halo-safe index; jitter '
+                    'would invalidate the verified train/validation exclusion.')
         if self.is_training and self.patch_category_mix:
             self._build_stratified_category_schedule()
 
@@ -682,50 +698,54 @@ class HyperspectralDepthDataset(Dataset):
         hs_cache_key: str,
         spatial_scale: float = 1.0,
     ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         Dict[str, torch.Tensor],
     ]:
         crop_h, crop_w = self.image_size
         if spatial_scale not in (0.5, 1.0):
             raise ValueError(f'Unsupported Baek spatial scale: {spatial_scale}')
-        source_h = int(round(crop_h / spatial_scale))
-        source_w = int(round(crop_w / spatial_scale))
-        source_top = top - (source_h - crop_h) // 2
-        source_left = left - (source_w - crop_w) // 2
-        if (
-            source_top < 0
-            or source_left < 0
-            or source_top + source_h > hs_image.shape[0]
-            or source_left + source_w > hs_image.shape[1]
-        ):
-            raise ValueError(
-                f'Invalid source window for scale={spatial_scale}: '
-                f'top={source_top}, left={source_left}, size={source_h}x{source_w}'
-            )
+        context_h = crop_h + 2 * self.optical_halo
+        context_w = crop_w + 2 * self.optical_halo
+        source_h = int(round(context_h / spatial_scale))
+        source_w = int(round(context_w / spatial_scale))
+        target_center_y = top + crop_h // 2
+        target_center_x = left + crop_w // 2
+        source_top = target_center_y - source_h // 2
+        source_left = target_center_x - source_w // 2
 
-        hs_patch = np.asarray(
-            hs_image[
-                source_top:source_top + source_h,
-                source_left:source_left + source_w,
-                :self.hs_channels,
-            ],
-            dtype=np.float32,
+        def extract_with_zero_padding(array, window_top, window_left, height, width):
+            array_h, array_w = array.shape[:2]
+            src_top = max(0, window_top)
+            src_left = max(0, window_left)
+            src_bottom = min(array_h, window_top + height)
+            src_right = min(array_w, window_left + width)
+            out_shape = (height, width) + tuple(array.shape[2:])
+            output = np.zeros(out_shape, dtype=np.float32)
+            if src_bottom > src_top and src_right > src_left:
+                dst_top = src_top - window_top
+                dst_left = src_left - window_left
+                output[
+                    dst_top:dst_top + (src_bottom - src_top),
+                    dst_left:dst_left + (src_right - src_left),
+                    ...,
+                ] = np.asarray(
+                    array[src_top:src_bottom, src_left:src_right, ...],
+                    dtype=np.float32,
+                )
+            return output
+
+        hs_patch = extract_with_zero_padding(
+            hs_image[:, :, :self.hs_channels],
+            source_top,
+            source_left,
+            source_h,
+            source_w,
         )
 
-        if depth_map.ndim == 3:
-            depth_patch = depth_map[
-                source_top:source_top + source_h,
-                source_left:source_left + source_w,
-                0,
-            ]
-        else:
-            depth_patch = depth_map[
-                source_top:source_top + source_h,
-                source_left:source_left + source_w,
-            ]
+        depth_source = depth_map[:, :, 0] if depth_map.ndim == 3 else depth_map
+        depth_patch = extract_with_zero_padding(
+            depth_source, source_top, source_left, source_h, source_w)
         depth_patch = np.asarray(depth_patch, dtype=np.float32).copy() / 1000.0
         valid_mask = (depth_patch > self.min_depth - 1e-3).astype(np.float32)
 
@@ -752,15 +772,15 @@ class HyperspectralDepthDataset(Dataset):
         if spatial_scale != 1.0:
             hs_tensor = F.interpolate(
                 hs_tensor.float(),
-                size=self.image_size,
+                size=(context_h, context_w),
                 mode='bilinear',
                 align_corners=False,
             )
             depth_raw_tensor = F.interpolate(
-                depth_raw_tensor.float(), size=self.image_size, mode='nearest'
+                depth_raw_tensor.float(), size=(context_h, context_w), mode='nearest'
             )
             mask_tensor = F.interpolate(
-                mask_tensor.float(), size=self.image_size, mode='nearest'
+                mask_tensor.float(), size=(context_h, context_w), mode='nearest'
             )
 
         illuminant_index = -1
@@ -833,6 +853,17 @@ class HyperspectralDepthDataset(Dataset):
         )
 
         depth_tensor = torch.clamp(ips_depth, 0.0, 1.0).float()
+        center_y = self.optical_halo
+        center_x = self.optical_halo
+        center_slice = (
+            slice(None), slice(None),
+            slice(center_y, center_y + crop_h),
+            slice(center_x, center_x + crop_w),
+        )
+        hs_target = hs_tensor[center_slice]
+        depth_target = depth_tensor[center_slice]
+        depth_metric_target = depth_metric_tensor[center_slice]
+        mask_target = mask_tensor[center_slice]
         augmentation = {
             'aug_scale_factor': torch.tensor(float(spatial_scale)),
             'aug_depth_shift_requested_m': torch.tensor(float(requested_shift)),
@@ -850,6 +881,10 @@ class HyperspectralDepthDataset(Dataset):
             'aug_clip_ratio': torch.tensor(float(clip_ratio)),
         }
         return (
+            hs_target.float(),
+            depth_target,
+            depth_metric_target.float(),
+            mask_target.float(),
             hs_tensor.float(),
             depth_tensor,
             depth_metric_tensor.float(),
@@ -1200,6 +1235,10 @@ class HyperspectralDepthDataset(Dataset):
             depth_tensor,
             depth_metric_tensor,
             mask_tensor,
+            hs_optical_tensor,
+            depth_optical_tensor,
+            depth_metric_optical_tensor,
+            mask_optical_tensor,
             augmentation,
         ) = self._patch_tensors_from_arrays(
             hs_image,
@@ -1217,6 +1256,14 @@ class HyperspectralDepthDataset(Dataset):
             depth_tensor = self._apply_random_flips(depth_tensor, do_vflip, do_hflip)
             depth_metric_tensor = self._apply_random_flips(depth_metric_tensor, do_vflip, do_hflip)
             mask_tensor = self._apply_random_flips(mask_tensor, do_vflip, do_hflip)
+            hs_optical_tensor = self._apply_random_flips(
+                hs_optical_tensor, do_vflip, do_hflip)
+            depth_optical_tensor = self._apply_random_flips(
+                depth_optical_tensor, do_vflip, do_hflip)
+            depth_metric_optical_tensor = self._apply_random_flips(
+                depth_metric_optical_tensor, do_vflip, do_hflip)
+            mask_optical_tensor = self._apply_random_flips(
+                mask_optical_tensor, do_vflip, do_hflip)
 
         item = {
             'id': sample_id,
@@ -1227,6 +1274,14 @@ class HyperspectralDepthDataset(Dataset):
         }
         if self.baek_augment:
             item.update(augmentation)
+        if self.optical_halo > 0:
+            item.update({
+                'hs_optical': hs_optical_tensor.squeeze(0),
+                'depth_map_optical': depth_optical_tensor.squeeze(0).squeeze(0),
+                'depth_metric_optical': (
+                    depth_metric_optical_tensor.squeeze(0).squeeze(0)),
+                'mask_optical': mask_optical_tensor.squeeze(0).squeeze(0),
+            })
         return item
 
     def __getitem__(self, idx):
@@ -1249,6 +1304,10 @@ class HyperspectralDepthDataset(Dataset):
         fast_item = self._getitem_patch_first(idx, sample, eval_window)
         if fast_item is not None:
             return fast_item
+        if self.optical_halo > 0:
+            raise RuntimeError(
+                'optical_halo requires the patch-first dataset path; use fixed_scale or '
+                'scene_max normalization with a patch index/cache-compatible configuration')
         
         try:
             hs_image = self._read_exr_with_cache(hs_path)

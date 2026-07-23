@@ -55,6 +55,7 @@ def test_half_scale_resizes_all_modalities_and_recomputes_ips():
     dataset.baek_depth_shift_m = 0.2
     dataset.baek_max_clip_ratio = 0.001
     dataset.baek_illuminant_retries = 8
+    dataset.optical_halo = 0
 
     base = np.arange(16, dtype=np.float32).reshape(4, 4) / 100.0
     hs_image = np.repeat(base[:, :, None], 25, axis=2)
@@ -68,7 +69,8 @@ def test_half_scale_resizes_all_modalities_and_recomputes_ips():
         dtype=np.float32,
     )
     depth_mm = depth_m * 1000.0
-    hs, ips, metric, mask, metadata = dataset._patch_tensors_from_arrays(
+    (hs, ips, metric, mask, hs_optical, ips_optical, metric_optical,
+     mask_optical, metadata) = dataset._patch_tensors_from_arrays(
         hs_image,
         depth_mm,
         top=1,
@@ -78,12 +80,39 @@ def test_half_scale_resizes_all_modalities_and_recomputes_ips():
     )
 
     assert hs.shape == (1, 25, 2, 2)
+    assert hs_optical.shape == hs.shape
+    assert ips_optical.shape == metric_optical.shape == mask_optical.shape == ips.shape
     assert metric.shape == mask.shape == ips.shape == (1, 1, 2, 2)
     assert metadata['aug_scale_factor'].item() == 0.5
     assert set(mask.unique().tolist()) <= {0.0, 1.0}
     expected_ips = metric_to_ips(metric, 0.4, 2.0).clamp(0.0, 1.0)
     assert torch.allclose(ips, expected_ips)
     assert torch.all(metric[mask == 0] == 0.4)
+
+
+def test_optical_halo_returns_larger_context_with_unchanged_center_target():
+    dataset = HyperspectralDepthDataset.__new__(HyperspectralDepthDataset)
+    dataset.image_size = (2, 2)
+    dataset.optical_halo = 1
+    dataset.hs_channels = 25
+    dataset.min_depth = 0.4
+    dataset.max_depth = 2.0
+    dataset.hs_norm_mode = 'fixed_scale'
+    dataset.hs_norm_scale = 1.0
+    dataset.hs_sanity_threshold = 10000.0
+    dataset.baek_augment = False
+
+    base = np.arange(36, dtype=np.float32).reshape(6, 6) / 100.0
+    hs_image = np.repeat(base[:, :, None], 25, axis=2)
+    depth_mm = np.full((6, 6), 1000.0, dtype=np.float32)
+    (hs, _, _, _, hs_optical, _, _, _, _) = (
+        dataset._patch_tensors_from_arrays(
+            hs_image, depth_mm, top=2, left=2,
+            hs_cache_key='unused', spatial_scale=1.0))
+
+    assert hs.shape == (1, 25, 2, 2)
+    assert hs_optical.shape == (1, 25, 4, 4)
+    torch.testing.assert_close(hs, hs_optical[..., 1:3, 1:3])
 
 
 def test_validation_dataset_never_enables_baek_augmentation(tmp_path):

@@ -14,11 +14,19 @@ DODO_PSF_ENERGY_RADIUS="${DODO_PSF_ENERGY_RADIUS:-16.0}"
 DODO_PSF_ENERGY_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTSIDE_BUDGET:-0.5}"
 DODO_PSF_ENERGY_SOFTNESS="${DODO_PSF_ENERGY_SOFTNESS:-1.5}"
 DODO_PSF_ENERGY_WARMUP_EPOCHS="${DODO_PSF_ENERGY_WARMUP_EPOCHS:-2}"
+DODO_OPTICAL_HALO="${DODO_OPTICAL_HALO:-32}"
+DODO_PSF_SPECTRAL_SEPARATION_WEIGHT="${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT:-0.01}"
+DODO_PSF_SPECTRAL_SEPARATION_MARGIN="${DODO_PSF_SPECTRAL_SEPARATION_MARGIN:-0.95}"
+DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS="${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS:-2}"
+DODO_ZERNIKE_MODE="${DODO_ZERNIKE_MODE:-free}"
+DODO_ZERNIKE_TERMS="${DODO_ZERNIKE_TERMS:-150}"
+DODO_ZERNIKE_BASIS_PATH="${DODO_ZERNIKE_BASIS_PATH:-${ROOT_DIR}/torch_optics/assets/zernike_volume1_128_Nterms_150.npy}"
 
 SOURCE_TRAIN_INDEX="${SOURCE_TRAIN_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_nooverlap_v1.npz}"
 VAL_INDEX="${VAL_INDEX:-${DATA_ROOT}/.patch_index/val_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_v1.npz}"
-BALANCED_INDEX="${BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
-BALANCE_REPORT="${BALANCE_REPORT:-${BALANCED_INDEX%.npz}.json}"
+BASE_BALANCED_INDEX="${BASE_BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
+BALANCED_INDEX="${BALANCED_INDEX:-${DATA_ROOT}/.patch_index/train_patch128_halo32_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz}"
+BALANCE_REPORT="${BALANCE_REPORT:-${BASE_BALANCED_INDEX%.npz}.json}"
 
 build_index() {
   cd "${ROOT_DIR}"
@@ -27,7 +35,7 @@ build_index() {
     --val_index "${VAL_INDEX}" \
     --data_root "${DATA_ROOT}" \
     --exr_cache_dir "${DATA_ROOT}/.exr_cache_npy_v1" \
-    --output "${BALANCED_INDEX}" \
+    --output "${BASE_BALANCED_INDEX}" \
     --report "${BALANCE_REPORT}" \
     --patch_size 128 \
     --bins 16 \
@@ -37,6 +45,11 @@ build_index() {
     --weight_min 0.25 \
     --weight_max 4.0 \
     --min_ess_ratio 0.5
+  "${PYTHON_BIN}" scripts/build_halo_safe_patch_index.py \
+    --train-index "${BASE_BALANCED_INDEX}" \
+    --val-index "${VAL_INDEX}" \
+    --output "${BALANCED_INDEX}" \
+    --halo "${DODO_OPTICAL_HALO}"
 }
 
 variant_args() {
@@ -104,6 +117,10 @@ run_training() {
     echo "Run: $0 build-index" >&2
     exit 1
   fi
+  if [[ "${DODO_ZERNIKE_MODE}" == "free" && ! -f "${DODO_ZERNIKE_BASIS_PATH}" ]]; then
+    echo "Zernike basis not found: ${DODO_ZERNIKE_BASIS_PATH}" >&2
+    exit 1
+  fi
   if [[ -e "${experiment_dir}/artifacts/command.txt" && "${ALLOW_EXISTING:-0}" != "1" ]]; then
     echo "Experiment already exists: ${experiment_dir}" >&2
     echo "Set ALLOW_EXISTING=1 only if reuse is intentional." >&2
@@ -167,7 +184,14 @@ run_training() {
     --dodo_psf_energy_outside_budget "${DODO_PSF_ENERGY_OUTSIDE_BUDGET}" \
     --dodo_psf_energy_softness "${DODO_PSF_ENERGY_SOFTNESS}" \
     --dodo_psf_energy_warmup_epochs "${DODO_PSF_ENERGY_WARMUP_EPOCHS}" \
+    --dodo_optical_halo "${DODO_OPTICAL_HALO}" \
+    --dodo_psf_spectral_separation_weight "${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT}" \
+    --dodo_psf_spectral_separation_margin "${DODO_PSF_SPECTRAL_SEPARATION_MARGIN}" \
+    --dodo_psf_spectral_separation_warmup_epochs "${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS}" \
     --dodo_doe_type New \
+    --dodo_zernike_mode "${DODO_ZERNIKE_MODE}" \
+    --dodo_zernike_terms "${DODO_ZERNIKE_TERMS}" \
+    --dodo_zernike_basis_path "${DODO_ZERNIKE_BASIS_PATH}" \
     --no-dodo_use_second_doe \
     --dodo_skip_prop2 \
     --dodo_sensing_mode rgb \
@@ -220,7 +244,7 @@ case "${1:-}" in
       exit 2
     fi
     VARIANT="${VARIANT:-combined}"
-    run_training "psfconv_number_18d_${VARIANT}_stageB_30ep" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
+    run_training "${STAGE_B_NAME:-psfconv_number_18d_${VARIANT}_stageB_30ep}" "${MAX_EPOCHS:-30}" "${VARIANT}" stage_b "${INIT_CKPT}"
     ;;
   *)
     echo "Usage: $0 {build-index|stage-a-balanced|stage-a-augment|stage-a-combined|stage-b}" >&2

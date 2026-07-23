@@ -152,6 +152,7 @@ class DOEFreeLayer(_BaseDOE):
         trainable: bool = True,
         wave_lengths: Optional[torch.Tensor] = None,
         assets_dir: str = "torch_optics/assets",
+        basis_path: Optional[str] = None,
         phase_scale_mode: str = "legacy_free",
         use_pupil_mask: bool = False,
     ):
@@ -176,8 +177,16 @@ class DOEFreeLayer(_BaseDOE):
         self.register_buffer("zernike_basis", torch.empty(0), persistent=False)
         self.zernike_coeffs = None
         if doe_type in ("New", "Zeros"):
-            basis_file = assets / f"zernike_volume1_{self.Mdoe}_Nterms_{self.n_terms}.npy"
+            if basis_path is None:
+                basis_file = assets / f"zernike_volume1_{self.Mdoe}_Nterms_{self.n_terms}.npy"
+            else:
+                basis_file = Path(basis_path).expanduser()
+                if not basis_file.is_absolute():
+                    basis_file = (Path.cwd() / basis_file).resolve()
             if not basis_file.exists():
+                if basis_path is not None:
+                    raise FileNotFoundError(
+                        f"Explicit DOE_Free basis file does not exist: '{basis_file}'")
                 try:
                     import poppy
                 except ImportError:

@@ -658,6 +658,19 @@ def process_single_scene(
             input_patch_size = 128
             valid_size = 128
             print(f"  [dodo] Override patch_size=128")
+    optical_halo = int(getattr(model.hparams, 'dodo_optical_halo', 0)) if is_dodo else 0
+    if optical_halo < 0:
+        raise ValueError(f'dodo_optical_halo must be >= 0, got {optical_halo}')
+    if (is_dodo and optical_halo > 0
+            and getattr(model.camera, 'image_formation_mode', None) != 'psf_convolution'):
+        raise ValueError(
+            'Optical halo inference requires DoDo psf_convolution image formation')
+    if is_dodo:
+        print(
+            f"  [dodo] Optical context: {input_patch_size + 2 * optical_halo}x"
+            f"{input_patch_size + 2 * optical_halo}; center output: "
+            f"{input_patch_size}x{input_patch_size} (halo={optical_halo}px)"
+        )
 
     # Build DoDo-specific tensors
     if is_dodo:
@@ -689,6 +702,10 @@ def process_single_scene(
     def pad_tensor_4d(t, pad):
         return torch.nn.functional.pad(t.unsqueeze(0), pad, mode='reflect')
 
+    def pad_tensor_4d_constant(t, pad, value):
+        return torch.nn.functional.pad(
+            t.unsqueeze(0), pad, mode='constant', value=float(value))
+
     hs_padded = pad_tensor_4d(hs_tensor,
         (pad_base + pad_buffer, pad_base + pad_buffer, pad_base + pad_buffer, pad_base + pad_buffer))
     depth_padded = pad_tensor_4d(depth_tensor.unsqueeze(0),
@@ -698,6 +715,18 @@ def process_single_scene(
             (pad_base + pad_buffer, pad_base + pad_buffer, pad_base + pad_buffer, pad_base + pad_buffer))
         vm_padded = pad_tensor_4d(valid_mask_tensor.unsqueeze(0),
             (pad_base + pad_buffer, pad_base + pad_buffer, pad_base + pad_buffer, pad_base + pad_buffer))
+        # Optical context uses a physical zero-outside-scene convention,
+        # matching the training dataset and linear_zero convolution boundary.
+        optical_pad = (
+            pad_base + pad_buffer, pad_base + pad_buffer,
+            pad_base + pad_buffer, pad_base + pad_buffer,
+        )
+        hs_optical_padded = pad_tensor_4d_constant(
+            hs_tensor, optical_pad, 0.0)
+        dm_optical_padded = pad_tensor_4d_constant(
+            depth_metric_tensor.unsqueeze(0), optical_pad, min_depth)
+        vm_optical_padded = pad_tensor_4d_constant(
+            valid_mask_tensor.unsqueeze(0), optical_pad, 0.0)
 
     # Per-tile measurement stats collection
     tile_meas_stats = []
@@ -740,8 +769,29 @@ def process_single_scene(
                 vm_patch = vm_padded[:, :, py:py + input_patch_size, px:px + input_patch_size].squeeze(1).to(device)
                 tile_valid_ratio = vm_patch.mean().item()
                 hs_sum = hs_patch.sum().item()
+                context_start_y = py - optical_halo
+                context_start_x = px - optical_halo
+                context_size = input_patch_size + 2 * optical_halo
+                hs_optical_patch = hs_optical_padded[
+                    :, :,
+                    context_start_y:context_start_y + context_size,
+                    context_start_x:context_start_x + context_size,
+                ].to(device)
+                dm_optical_patch = dm_optical_padded[
+                    :, :,
+                    context_start_y:context_start_y + context_size,
+                    context_start_x:context_start_x + context_size,
+                ].squeeze(1).to(device)
+                vm_optical_patch = vm_optical_padded[
+                    :, :,
+                    context_start_y:context_start_y + context_size,
+                    context_start_x:context_start_x + context_size,
+                ].squeeze(1).to(device)
                 outputs = model(hs_patch, depth_patch, is_testing=torch.tensor(True, device=device),
-                                depth_metric=dm_patch, valid_mask=vm_patch)
+                                depth_metric=dm_patch, valid_mask=vm_patch,
+                                optical_images=hs_optical_patch,
+                                optical_depth_metric=dm_optical_patch,
+                                optical_valid_mask=vm_optical_patch)
                 # Per-tile measurement stats (after norm, from outputs.captimgs)
                 capt = outputs.captimgs
                 tile_meas_stats.append({
