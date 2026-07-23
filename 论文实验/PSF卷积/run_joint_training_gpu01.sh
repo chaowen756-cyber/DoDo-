@@ -10,8 +10,8 @@ RESULT_ROOT="${REPO_ROOT}/论文实验/PSF卷积"
 TRAIN_ENTRY="${REPO_ROOT}/scripts/run_number18_baek_balanced.sh"
 INFER_ENTRY="${REPO_ROOT}/infer_contect.py"
 
-STAGE_A_NAME="${STAGE_A_NAME:-psfconv_number3_zernike150_halo64_multiphysics_stageA_20ep}"
-STAGE_B_NAME="${STAGE_B_NAME:-psfconv_number3_zernike150_halo64_multiphysics_stageB_30ep}"
+STAGE_A_NAME="${STAGE_A_NAME:-psfconv_number4_zernike150_halo64_multiphysics_lr1e-4_step10_stageA_20ep}"
+STAGE_B_NAME="${STAGE_B_NAME:-psfconv_number4_zernike150_halo64_multiphysics_lr1e-4_step10_stageB_30ep}"
 STAGE_A_MAX_EPOCHS="${STAGE_A_MAX_EPOCHS:-20}"
 STAGE_B_MAX_EPOCHS="${STAGE_B_MAX_EPOCHS:-30}"
 INFERENCE_STRIDE="${INFERENCE_STRIDE:-64}"
@@ -25,7 +25,15 @@ export EXPERIMENT_ROOT="${RESULT_ROOT}"
 
 # Optical changes specific to this experiment.  All remaining training
 # parameters continue to come from the Number18 combined-variant launcher.
-export STAGE_A_OPTICS_LR="${STAGE_A_OPTICS_LR:-1e-5}"
+export STAGE_A_OPTICS_LR="${STAGE_A_OPTICS_LR:-1e-4}"
+export STAGE_A_CNN_LR="${STAGE_A_CNN_LR:-1e-4}"
+export STAGE_A_LR_DECAY_STRATEGY="${STAGE_A_LR_DECAY_STRATEGY:-baek}"
+export STAGE_A_OPTICS_LR_DECAY_EPOCHS="${STAGE_A_OPTICS_LR_DECAY_EPOCHS:-10}"
+export STAGE_A_CNN_LR_DECAY_EPOCHS="${STAGE_A_CNN_LR_DECAY_EPOCHS:-10}"
+export STAGE_B_CNN_LR="${STAGE_B_CNN_LR:-1e-4}"
+export STAGE_B_LR_DECAY_STRATEGY="${STAGE_B_LR_DECAY_STRATEGY:-baek}"
+export STAGE_B_OPTICS_LR_DECAY_EPOCHS="${STAGE_B_OPTICS_LR_DECAY_EPOCHS:-10}"
+export STAGE_B_CNN_LR_DECAY_EPOCHS="${STAGE_B_CNN_LR_DECAY_EPOCHS:-10}"
 export DODO_OPTICAL_HALO="${DODO_OPTICAL_HALO:-64}"
 export DODO_PSF_ENERGY_WEIGHT="${DODO_PSF_ENERGY_WEIGHT:-0.03}"
 export DODO_PSF_ENERGY_RADIUS="${DODO_PSF_ENERGY_RADIUS:-16.0}"
@@ -251,7 +259,7 @@ if [[ -z "${STAGE_A_CKPT}" ]]; then
 fi
 if [[ -z "${STAGE_A_CKPT}" ]]; then
   run_logged \
-    "Stage A training on GPUs 0,1" \
+    "Stage A training on physical GPUs 2,3" \
     "${PIPELINE_LOG_ROOT}/stageA_train.log" \
     env STAGE_A_COMBINED_NAME="${STAGE_A_NAME}" MAX_EPOCHS="${STAGE_A_MAX_EPOCHS}" \
     bash "${TRAIN_ENTRY}" stage-a-combined
@@ -277,7 +285,7 @@ run_inference_14_18 "stageA" "${STAGE_A_CKPT}" "${STAGE_A_ROOT}"
 STAGE_B_CKPT="$(find_joint_checkpoint "${STAGE_B_ROOT}/artifacts/checkpoints" || true)"
 if [[ -z "${STAGE_B_CKPT}" ]]; then
   run_logged \
-    "Stage B training on GPUs 0,1" \
+    "Stage B training on physical GPUs 2,3" \
     "${PIPELINE_LOG_ROOT}/stageB_train.log" \
     env STAGE_B_NAME="${STAGE_B_NAME}" MAX_EPOCHS="${STAGE_B_MAX_EPOCHS}" \
       INIT_CKPT="${STAGE_A_CKPT}" VARIANT="combined" \

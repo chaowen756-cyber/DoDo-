@@ -9,6 +9,14 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export CUDA_VISIBLE_DEVICES
 STAGE_A_OPTICS_LR="${STAGE_A_OPTICS_LR:-1e-5}"
+STAGE_A_CNN_LR="${STAGE_A_CNN_LR:-1e-4}"
+STAGE_A_LR_DECAY_STRATEGY="${STAGE_A_LR_DECAY_STRATEGY:-none}"
+STAGE_A_OPTICS_LR_DECAY_EPOCHS="${STAGE_A_OPTICS_LR_DECAY_EPOCHS:-10}"
+STAGE_A_CNN_LR_DECAY_EPOCHS="${STAGE_A_CNN_LR_DECAY_EPOCHS:-20}"
+STAGE_B_CNN_LR="${STAGE_B_CNN_LR:-5e-5}"
+STAGE_B_LR_DECAY_STRATEGY="${STAGE_B_LR_DECAY_STRATEGY:-baek}"
+STAGE_B_OPTICS_LR_DECAY_EPOCHS="${STAGE_B_OPTICS_LR_DECAY_EPOCHS:-10}"
+STAGE_B_CNN_LR_DECAY_EPOCHS="${STAGE_B_CNN_LR_DECAY_EPOCHS:-20}"
 DODO_PSF_ENERGY_WEIGHT="${DODO_PSF_ENERGY_WEIGHT:-0.03}"
 DODO_PSF_ENERGY_RADIUS="${DODO_PSF_ENERGY_RADIUS:-16.0}"
 DODO_PSF_ENERGY_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTSIDE_BUDGET:-0.20}"
@@ -107,9 +115,11 @@ run_training() {
     stage_a)
       stage_args=(
         --optimize_optics
-        --cnn_lr 1e-4
+        --cnn_lr "${STAGE_A_CNN_LR}"
         --optics_lr "${STAGE_A_OPTICS_LR}"
-        --lr_decay_strategy none
+        --lr_decay_strategy "${STAGE_A_LR_DECAY_STRATEGY}"
+        --cnn_lr_decay_epochs "${STAGE_A_CNN_LR_DECAY_EPOCHS}"
+        --optics_lr_decay_epochs "${STAGE_A_OPTICS_LR_DECAY_EPOCHS}"
       )
       ;;
     stage_b)
@@ -121,11 +131,11 @@ run_training() {
         --init_ckpt_path "${init_ckpt}"
         --no-isolate_hs_decoder_gradients
         --no-optimize_optics
-        --cnn_lr 5e-5
+        --cnn_lr "${STAGE_B_CNN_LR}"
         --optics_lr 0.0
-        --lr_decay_strategy baek
-        --cnn_lr_decay_epochs 20
-        --optics_lr_decay_epochs 10
+        --lr_decay_strategy "${STAGE_B_LR_DECAY_STRATEGY}"
+        --cnn_lr_decay_epochs "${STAGE_B_CNN_LR_DECAY_EPOCHS}"
+        --optics_lr_decay_epochs "${STAGE_B_OPTICS_LR_DECAY_EPOCHS}"
       )
       ;;
     *)
