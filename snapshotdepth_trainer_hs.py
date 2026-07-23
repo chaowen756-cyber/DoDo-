@@ -105,15 +105,18 @@ class BestMetricTracker(Callback):
 
 
 class LossCurvePlotter(Callback):
-    """Write a lightweight train/validation loss curve during training."""
+    """Write lightweight loss and DOE convergence curves during training."""
 
     def __init__(self, output_dir, every_n_steps=50):
         self.output_dir = output_dir
         self.every_n_steps = max(1, int(every_n_steps))
         self.train_points = []
         self.val_points = []
+        self.doe_points = []
         self.png_path = os.path.join(output_dir, 'train_loss.png')
         self.json_path = os.path.join(output_dir, 'loss_history.json')
+        self.doe_png_path = os.path.join(output_dir, 'doe_convergence.png')
+        self.doe_json_path = os.path.join(output_dir, 'doe_history.json')
 
     @staticmethod
     def _to_float(value):
@@ -161,6 +164,24 @@ class LossCurvePlotter(Callback):
         else:
             self.val_points.append({'step': step, 'epoch': epoch, 'loss': value})
 
+    def _append_doe_metrics(self, pl_module):
+        stored = getattr(pl_module, '_last_doe_metrics', None) or {}
+        if 'step' not in stored:
+            return
+
+        point = {'step': int(stored['step'])}
+        for key in ('update_rel', 'grad_norm', 'coeff_norm'):
+            value = self._to_float(stored.get(key))
+            if value is not None:
+                point[key] = value
+        if len(point) == 1:
+            return
+
+        if self.doe_points and self.doe_points[-1]['step'] == point['step']:
+            self.doe_points[-1].update(point)
+        else:
+            self.doe_points.append(point)
+
     def _write_history(self):
         os.makedirs(self.output_dir, exist_ok=True)
         history = {
@@ -171,6 +192,23 @@ class LossCurvePlotter(Callback):
         with open(tmp_path, 'w') as f:
             json.dump(history, f, indent=2)
         os.replace(tmp_path, self.json_path)
+
+    def _write_doe_history(self):
+        if not self.doe_points:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        history = {
+            f'doe/{key}': [
+                {'step': point['step'], 'value': point[key]}
+                for point in self.doe_points
+                if key in point
+            ]
+            for key in ('update_rel', 'grad_norm', 'coeff_norm')
+        }
+        tmp_path = self.doe_json_path + '.tmp'
+        with open(tmp_path, 'w') as f:
+            json.dump(history, f, indent=2)
+        os.replace(tmp_path, self.doe_json_path)
 
     def _write_plot(self, trainer):
         if not self.train_points and not self.val_points:
@@ -204,14 +242,76 @@ class LossCurvePlotter(Callback):
         plt.close(fig)
         os.replace(tmp_path, self.png_path)
 
+    def _write_doe_plot(self, trainer):
+        if not self.doe_points:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            print(f'[doe-plot] matplotlib unavailable, skip doe_convergence.png: {exc}')
+            return
+
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            2, 1, figsize=(8, 6.5), dpi=140, sharex=True
+        )
+        series = (
+            ('update_rel', 'DOE relative update', '#1f77b4'),
+            ('grad_norm', 'DOE gradient norm', '#d62728'),
+        )
+        for key, label, color in series:
+            points = [point for point in self.doe_points if key in point]
+            if points:
+                ax_top.plot(
+                    [point['step'] for point in points],
+                    [point[key] for point in points],
+                    label=label,
+                    color=color,
+                    linewidth=1.3,
+                )
+        ax_top.set_yscale('symlog', linthresh=1e-12)
+        ax_top.set_ylabel('update / gradient')
+        ax_top.grid(True, alpha=0.25)
+        ax_top.legend()
+
+        coeff_points = [point for point in self.doe_points if 'coeff_norm' in point]
+        if coeff_points:
+            ax_bottom.plot(
+                [point['step'] for point in coeff_points],
+                [point['coeff_norm'] for point in coeff_points],
+                label='DOE coefficient norm',
+                color='#2ca02c',
+                linewidth=1.3,
+            )
+        ax_bottom.axhline(1.0, color='#7f7f7f', linestyle='--', linewidth=1.0,
+                          label='clamp boundary')
+        ax_bottom.set_xlabel('global step')
+        ax_bottom.set_ylabel('coefficient norm')
+        ax_bottom.grid(True, alpha=0.25)
+        ax_bottom.legend()
+
+        fig.suptitle(
+            f'DOE Convergence (epoch {int(getattr(trainer, "current_epoch", 0) or 0)})'
+        )
+        fig.tight_layout()
+        tmp_path = self.doe_png_path + '.tmp.png'
+        fig.savefig(tmp_path)
+        plt.close(fig)
+        os.replace(tmp_path, self.doe_png_path)
+
     def _flush(self, trainer):
         self._write_history()
         self._write_plot(trainer)
+        self._write_doe_history()
+        self._write_doe_plot(trainer)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs):
         if not self._is_global_zero(trainer):
             return
         self._append_train_loss(trainer, pl_module)
+        self._append_doe_metrics(pl_module)
         step = int(getattr(trainer, 'global_step', 0) or 0)
         if step == 0 or step % self.every_n_steps == 0:
             self._flush(trainer)
@@ -684,7 +784,7 @@ if __name__ == '__main__':
     parser.add_argument('--no-save_aux_best_ckpts', dest='save_aux_best_ckpts', action='store_false')
     parser.set_defaults(save_aux_best_ckpts=False)
     parser.add_argument('--loss_plot_every_n_steps', type=int, default=50,
-                        help='每隔多少个 global step 刷新 artifact_root/train_loss.png')
+                        help='每隔多少个 global step 刷新 loss 与 DOE 收敛曲线')
 
     # --- 核心修改点：动态计算默认的数据集路径 ---
     script_dir = os.path.dirname(os.path.abspath(__file__))

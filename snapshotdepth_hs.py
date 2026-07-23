@@ -71,7 +71,7 @@ class SnapshotDepthHS(pl.LightningModule):
         self._doe_diag_done = False
         self._nonfinite_count = 0
         self._clamp_hook_count = 0
-        self._doe_grad_norms = []
+        self._last_doe_metrics = {}
         self._last_train_loss_logs = {}
         self._last_train_misc_logs = {}
 
@@ -139,6 +139,21 @@ class SnapshotDepthHS(pl.LightningModule):
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, **kwargs):
         lr_decay_strategy = str(getattr(self.hparams, 'lr_decay_strategy', 'none'))
         current_epoch = int(getattr(self.trainer, 'current_epoch', epoch))
+        completed_step = int(self.trainer.global_step) + 1
+        monitor_every = max(1, int(getattr(self.hparams, 'loss_plot_every_n_steps', 50)))
+        monitor_doe = (
+            self.hparams.optimize_optics
+            and self.optical_model_type == 'dodo_depth'
+            and (completed_step == 1 or completed_step % monitor_every == 0)
+        )
+        doe_coeffs = None
+        coeffs_before = None
+        if monitor_doe and hasattr(self.camera, 'doe1'):
+            candidate = getattr(self.camera.doe1, 'zernike_coeffs', None)
+            if isinstance(candidate, nn.Parameter) and candidate.requires_grad:
+                doe_coeffs = candidate
+                coeffs_before = candidate.detach().clone()
+
         warmup_steps = int(getattr(self.hparams, 'lr_warmup_steps', 54))
         warmup_scale = 1.0
         if warmup_steps > 0 and self.trainer.global_step < warmup_steps:
@@ -163,6 +178,32 @@ class SnapshotDepthHS(pl.LightningModule):
             self._clamp_hook_count += 1
             if self._clamp_hook_count == 1:
                 print('[doe_diag] clamp_parameters_() executed (first call)')
+
+        if doe_coeffs is not None and coeffs_before is not None:
+            with torch.no_grad():
+                coeffs_after = doe_coeffs.detach()
+                update_norm = torch.linalg.vector_norm(coeffs_after - coeffs_before)
+                before_norm = torch.linalg.vector_norm(coeffs_before)
+                coeff_norm = torch.linalg.vector_norm(coeffs_after)
+                update_rel = update_norm / (before_norm + 1e-12)
+                grad_norm = (
+                    torch.linalg.vector_norm(doe_coeffs.grad.detach()).item()
+                    if doe_coeffs.grad is not None
+                    else None
+                )
+
+            self._last_doe_metrics = {
+                'step': completed_step,
+                'update_rel': update_rel.item(),
+                'grad_norm': grad_norm,
+                'coeff_norm': coeff_norm.item(),
+            }
+            self.log('doe/update_rel', update_rel.item(), on_step=True, on_epoch=False)
+            self.log('doe/coeff_norm', coeff_norm.item(), on_step=True, on_epoch=False)
+            if grad_norm is not None:
+                self.log('doe/grad_norm', grad_norm, on_step=True, on_epoch=False)
+            elif completed_step == 1:
+                print('[doe_diag] WARNING: doe1.zernike_coeffs.grad is None after optimizer step')
 
     def configure_optimizers(self):
         param_groups = []
@@ -257,19 +298,6 @@ class SnapshotDepthHS(pl.LightningModule):
             if hasattr(self.camera, 'doe1') and hasattr(self.camera.doe1, 'zernike_coeffs'):
                 zc = self.camera.doe1.zernike_coeffs
                 print(f'[doe_diag] doe1.zernike_coeffs.requires_grad={zc.requires_grad}')
-                # Register backward hook to capture grad stats
-                def _make_doe_grad_hook():
-                    def hook(grad):
-                        if grad is not None:
-                            gnorm = grad.norm().item()
-                            gfinite = torch.isfinite(grad).all().item()
-                            print(f'[doe_diag] doe1.zernike_coeffs.grad norm={gnorm:.6f}, finite={gfinite}')
-                            self._doe_grad_norms.append(gnorm)
-                        else:
-                            print('[doe_diag] WARNING: doe1.zernike_coeffs.grad is None after backward')
-                    return hook
-                zc.register_hook(_make_doe_grad_hook())
-                print(f'[doe_diag] registered backward hook on doe1.zernike_coeffs')
             # Verify optimizer param group membership by identity
             if hasattr(self.trainer, 'optimizers') and self.trainer.optimizers:
                 opt = self.trainer.optimizers[0]
@@ -354,7 +382,9 @@ class SnapshotDepthHS(pl.LightningModule):
 
     def on_after_backward(self):
         """Collect gradient norms after backward pass (reliable, not pre-backward)."""
-        if self.global_step % 50 != 0:
+        completed_step = int(self.global_step) + 1
+        monitor_every = max(1, int(getattr(self.hparams, 'loss_plot_every_n_steps', 50)))
+        if completed_step != 1 and completed_step % monitor_every != 0:
             return
         grad_norms = {}
         # Decoder components
@@ -587,6 +617,12 @@ class SnapshotDepthHS(pl.LightningModule):
         if last_grads:
             for k, v in last_grads.items():
                 extra[f'diag/grad_{k}'] = v if isinstance(v, float) else float(v)
+        last_doe_metrics = getattr(self, '_last_doe_metrics', None)
+        if last_doe_metrics:
+            for key in ('update_rel', 'grad_norm', 'coeff_norm'):
+                value = last_doe_metrics.get(key)
+                if value is not None:
+                    extra[f'doe/{key}'] = float(value)
         # Save artifacts (prefer artifact_root over log_dir)
         out_dir = self.artifact_root or self.log_dir
         if out_dir:
