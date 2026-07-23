@@ -17,6 +17,7 @@ STAGE_B_CNN_LR="${STAGE_B_CNN_LR:-5e-5}"
 STAGE_B_LR_DECAY_STRATEGY="${STAGE_B_LR_DECAY_STRATEGY:-baek}"
 STAGE_B_OPTICS_LR_DECAY_EPOCHS="${STAGE_B_OPTICS_LR_DECAY_EPOCHS:-10}"
 STAGE_B_CNN_LR_DECAY_EPOCHS="${STAGE_B_CNN_LR_DECAY_EPOCHS:-20}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-54}"
 DODO_PSF_ENERGY_WEIGHT="${DODO_PSF_ENERGY_WEIGHT:-0.03}"
 DODO_PSF_ENERGY_RADIUS="${DODO_PSF_ENERGY_RADIUS:-16.0}"
 DODO_PSF_ENERGY_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_OUTSIDE_BUDGET:-0.20}"
@@ -273,7 +274,7 @@ run_training() {
     --sam_loss_weight "${SAM_LOSS_WEIGHT}" \
     --mse_loss_weight "${MSE_LOSS_WEIGHT}" \
     --spatial_gradient_loss_weight "${SPATIAL_GRADIENT_LOSS_WEIGHT}" \
-    --lr_warmup_steps 54 \
+    --lr_warmup_steps "${LR_WARMUP_STEPS}" \
     --batch_sz "${TRAIN_BATCH_SIZE}" \
     --accumulate_grad_batches "${ACCUMULATE_GRAD_BATCHES}" \
     --num_workers 16 \

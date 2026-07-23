@@ -18,6 +18,7 @@ bash 论文实验/PSF卷积/run_joint_training_gpu01.sh
 - Stage B DOE 按阶段定义保持冻结，学习率为 `0`；CNN 初始学习率改为
   `1e-4`，每 10 epoch 乘 `0.1`：epoch 0–9 为 `1e-4`，
   epoch 10–19 为 `1e-5`，epoch 20–29 为 `1e-6`。
-- Stage A、Stage B 均保留前 54 个优化 step 的线性 warmup。
+- Stage A、Stage B 均关闭 warmup（`lr_warmup_steps=0`），从设定的
+  初始学习率直接开始训练。
 - 除学习率和衰减配置外，number3 的 Zernike-150、halo=64、PSF
   多物理正则、损失组成、数据索引和训练/推理流程保持不变。
