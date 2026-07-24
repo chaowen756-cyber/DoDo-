@@ -5,6 +5,8 @@ import torch
 
 from snapshotdepth_hs import SnapshotDepthHS
 from util.psf_regularization import (
+    delayed_epoch_tightening_value,
+    delayed_epoch_warmup_weight,
     epoch_tightening_value,
     epoch_warmup_weight,
     multiscale_psf_energy_concentration_loss,
@@ -12,6 +14,7 @@ from util.psf_regularization import (
     psf_energy_concentration_loss,
     sensor_weighted_depth_psf_separation_loss,
     sensor_weighted_spectral_psf_separation_loss,
+    task_relative_regularizer_scale,
 )
 
 
@@ -29,6 +32,38 @@ def test_epoch_constraint_budget_tightens_without_zero_weight_window():
     assert epoch_tightening_value(0.35, 0.20, 20, 3) == pytest.approx(0.20)
 
 
+def test_delayed_regularizer_schedule_stabilizes_task_before_ramp():
+    weights = [
+        delayed_epoch_warmup_weight(0.02, epoch, start_epoch=5, warmup_epochs=5)
+        for epoch in (0, 4, 5, 7, 9, 19)
+    ]
+    assert weights == pytest.approx([0.0, 0.0, 0.0, 0.008, 0.016, 0.02])
+
+    budgets = [
+        delayed_epoch_tightening_value(
+            0.70, 0.60, epoch, start_epoch=5, tightening_epochs=14)
+        for epoch in (0, 5, 12, 19)
+    ]
+    assert budgets == pytest.approx([0.70, 0.70, 0.65, 0.60])
+
+
+def test_task_relative_regularizer_cap_is_detached_and_respected():
+    regularizer = torch.tensor(0.05, requires_grad=True)
+    task = torch.tensor(0.02, requires_grad=True)
+    scale = task_relative_regularizer_scale(
+        regularizer, task, max_ratio=0.15)
+    capped = scale * regularizer
+
+    assert scale.item() == pytest.approx(0.06)
+    assert capped.item() == pytest.approx(0.003)
+    assert capped.item() / task.item() == pytest.approx(0.15)
+    assert not scale.requires_grad
+
+    capped.backward()
+    assert regularizer.grad.item() == pytest.approx(0.06)
+    assert task.grad is None
+
+
 @pytest.mark.parametrize(
     ("current_epoch", "expected_weight"),
     [(0, 0.0), (1, 0.01), (2, 0.02), (20, 0.02)],
@@ -40,6 +75,7 @@ def test_snapshot_model_reads_public_lightning_epoch_for_psf_warmup(
     model = SimpleNamespace(
         hparams=SimpleNamespace(
             dodo_psf_energy_weight=0.02,
+            dodo_psf_energy_start_epoch=0,
             dodo_psf_energy_warmup_epochs=2,
             optimize_optics=True,
         ),
@@ -137,6 +173,34 @@ def test_multiscale_energy_penalizes_core_and_tail_and_reports_radii():
     assert stats['r8_inside_mean'].item() == pytest.approx(0.5)
     assert stats['r90_max'].item() >= 28.0
     assert psf.grad is not None
+
+
+def test_linear_energy_hinge_keeps_stronger_gradient_near_budget():
+    logits_linear = torch.zeros((1, 1, 16 * 16), requires_grad=True)
+    logits_squared = logits_linear.detach().clone().requires_grad_(True)
+    with torch.no_grad():
+        logits_linear[..., 0] = 0.2
+        logits_squared[..., 0] = 0.2
+
+    def compute(logits, penalty_power):
+        psf = torch.softmax(logits, dim=-1).reshape(1, 1, 16, 16)
+        loss, _ = multiscale_psf_energy_concentration_loss(
+            psf,
+            radii=(3.0,),
+            outside_budgets=(0.80,),
+            scale_weights=(1.0,),
+            softness=0.0,
+            cvar_weight=0.0,
+            penalty_power=penalty_power,
+        )
+        loss.backward()
+        return loss, logits.grad.norm()
+
+    linear_loss, linear_grad = compute(logits_linear, 1.0)
+    squared_loss, squared_grad = compute(logits_squared, 2.0)
+    assert linear_loss.item() > 0
+    assert squared_loss.item() > 0
+    assert linear_grad.item() > squared_grad.item()
 
 
 def test_mtf_floor_distinguishes_delta_from_broad_psf_and_backpropagates():

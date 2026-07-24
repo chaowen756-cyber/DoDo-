@@ -28,20 +28,32 @@ DODO_PSF_ENERGY_INITIAL_OUTER_OUTSIDE_BUDGET="${DODO_PSF_ENERGY_INITIAL_OUTER_OU
 DODO_PSF_ENERGY_TIGHTENING_EPOCHS="${DODO_PSF_ENERGY_TIGHTENING_EPOCHS:-3}"
 DODO_PSF_ENERGY_CVAR_FRACTION="${DODO_PSF_ENERGY_CVAR_FRACTION:-0.10}"
 DODO_PSF_ENERGY_CVAR_WEIGHT="${DODO_PSF_ENERGY_CVAR_WEIGHT:-0.5}"
+DODO_PSF_ENERGY_PENALTY_POWER="${DODO_PSF_ENERGY_PENALTY_POWER:-2.0}"
 DODO_PSF_ENERGY_SOFTNESS="${DODO_PSF_ENERGY_SOFTNESS:-1.5}"
 DODO_PSF_ENERGY_WARMUP_EPOCHS="${DODO_PSF_ENERGY_WARMUP_EPOCHS:-0}"
+DODO_PSF_ENERGY_START_EPOCH="${DODO_PSF_ENERGY_START_EPOCH:-0}"
+DODO_PSF_ENERGY_TIGHTENING_START_EPOCH="${DODO_PSF_ENERGY_TIGHTENING_START_EPOCH:-0}"
 DODO_OPTICAL_HALO="${DODO_OPTICAL_HALO:-64}"
 DODO_PSF_MTF_WEIGHT="${DODO_PSF_MTF_WEIGHT:-0.25}"
+DODO_PSF_MTF_START_EPOCH="${DODO_PSF_MTF_START_EPOCH:-0}"
+DODO_PSF_MTF_WARMUP_EPOCHS="${DODO_PSF_MTF_WARMUP_EPOCHS:-0}"
 DODO_PSF_SPECTRAL_SEPARATION_WEIGHT="${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT:-0.02}"
 DODO_PSF_SPECTRAL_SEPARATION_MARGIN="${DODO_PSF_SPECTRAL_SEPARATION_MARGIN:-0.90}"
 DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS="${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS:-0}"
+DODO_PSF_SPECTRAL_SEPARATION_START_EPOCH="${DODO_PSF_SPECTRAL_SEPARATION_START_EPOCH:-0}"
 DODO_PSF_DEPTH_SEPARATION_WEIGHT="${DODO_PSF_DEPTH_SEPARATION_WEIGHT:-0.005}"
 DODO_PSF_DEPTH_SEPARATION_MARGIN="${DODO_PSF_DEPTH_SEPARATION_MARGIN:-0.90}"
+DODO_PSF_DEPTH_SEPARATION_START_EPOCH="${DODO_PSF_DEPTH_SEPARATION_START_EPOCH:-0}"
+DODO_PSF_DEPTH_SEPARATION_WARMUP_EPOCHS="${DODO_PSF_DEPTH_SEPARATION_WARMUP_EPOCHS:-0}"
+DODO_OPTICAL_REGULARIZER_MAX_RATIO="${DODO_OPTICAL_REGULARIZER_MAX_RATIO:-0.0}"
 DODO_ZERNIKE_MODE="${DODO_ZERNIKE_MODE:-free}"
 DODO_ZERNIKE_TERMS="${DODO_ZERNIKE_TERMS:-150}"
 DODO_ZERNIKE_BASIS_PATH="${DODO_ZERNIKE_BASIS_PATH:-${ROOT_DIR}/torch_optics/assets/zernike_volume1_128_Nterms_150.npy}"
 DODO_ZERNIKE_INIT_CHECKPOINT="${DODO_ZERNIKE_INIT_CHECKPOINT:-${ROOT_DIR}/experiments/number_18e_optics_lr1e-5_stageA_12ep/artifacts/checkpoints/joint-best-epoch=011.ckpt}"
 DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH="${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH:-${ROOT_DIR}/torch_optics/assets/Base_zernike_128x128_nopadd.mat}"
+if [[ "${DODO_ZERNIKE_INIT_CHECKPOINT}" == "none" ]]; then
+  DODO_ZERNIKE_INIT_CHECKPOINT=""
+fi
 DODO_ZERNIKE_LOW_ORDER_TERMS="${DODO_ZERNIKE_LOW_ORDER_TERMS:-15}"
 DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH="${DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH:-5}"
 DODO_ZERNIKE_HIGH_ORDER_LR_RATIO="${DODO_ZERNIKE_HIGH_ORDER_LR_RATIO:-0.2}"
@@ -155,14 +167,17 @@ run_training() {
     exit 1
   fi
   if [[ "${stage}" == "stage_a" ]]; then
-    for required_zernike_file in \
-      "${DODO_ZERNIKE_INIT_CHECKPOINT}" \
-      "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}"; do
-      if [[ ! -f "${required_zernike_file}" ]]; then
-        echo "Zernike initialization file not found: ${required_zernike_file}" >&2
+    if [[ -n "${DODO_ZERNIKE_INIT_CHECKPOINT}" ]]; then
+      if [[ ! -f "${DODO_ZERNIKE_INIT_CHECKPOINT}" ]]; then
+        echo "Zernike initialization file not found: ${DODO_ZERNIKE_INIT_CHECKPOINT}" >&2
         exit 1
       fi
-    done
+      if [[ -z "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}" \
+          || ! -f "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}" ]]; then
+        echo "Legacy Zernike basis not found: ${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}" >&2
+        exit 1
+      fi
+    fi
   fi
   if [[ -e "${experiment_dir}/artifacts/command.txt" && "${ALLOW_EXISTING:-0}" != "1" ]]; then
     echo "Experiment already exists: ${experiment_dir}" >&2
@@ -232,15 +247,24 @@ run_training() {
     --dodo_psf_energy_tightening_epochs "${DODO_PSF_ENERGY_TIGHTENING_EPOCHS}" \
     --dodo_psf_energy_cvar_fraction "${DODO_PSF_ENERGY_CVAR_FRACTION}" \
     --dodo_psf_energy_cvar_weight "${DODO_PSF_ENERGY_CVAR_WEIGHT}" \
+    --dodo_psf_energy_penalty_power "${DODO_PSF_ENERGY_PENALTY_POWER}" \
     --dodo_psf_energy_softness "${DODO_PSF_ENERGY_SOFTNESS}" \
     --dodo_psf_energy_warmup_epochs "${DODO_PSF_ENERGY_WARMUP_EPOCHS}" \
+    --dodo_psf_energy_start_epoch "${DODO_PSF_ENERGY_START_EPOCH}" \
+    --dodo_psf_energy_tightening_start_epoch "${DODO_PSF_ENERGY_TIGHTENING_START_EPOCH}" \
     --dodo_optical_halo "${DODO_OPTICAL_HALO}" \
     --dodo_psf_spectral_separation_weight "${DODO_PSF_SPECTRAL_SEPARATION_WEIGHT}" \
     --dodo_psf_spectral_separation_margin "${DODO_PSF_SPECTRAL_SEPARATION_MARGIN}" \
     --dodo_psf_spectral_separation_warmup_epochs "${DODO_PSF_SPECTRAL_SEPARATION_WARMUP_EPOCHS}" \
+    --dodo_psf_spectral_separation_start_epoch "${DODO_PSF_SPECTRAL_SEPARATION_START_EPOCH}" \
     --dodo_psf_mtf_weight "${DODO_PSF_MTF_WEIGHT}" \
+    --dodo_psf_mtf_start_epoch "${DODO_PSF_MTF_START_EPOCH}" \
+    --dodo_psf_mtf_warmup_epochs "${DODO_PSF_MTF_WARMUP_EPOCHS}" \
     --dodo_psf_depth_separation_weight "${DODO_PSF_DEPTH_SEPARATION_WEIGHT}" \
     --dodo_psf_depth_separation_margin "${DODO_PSF_DEPTH_SEPARATION_MARGIN}" \
+    --dodo_psf_depth_separation_start_epoch "${DODO_PSF_DEPTH_SEPARATION_START_EPOCH}" \
+    --dodo_psf_depth_separation_warmup_epochs "${DODO_PSF_DEPTH_SEPARATION_WARMUP_EPOCHS}" \
+    --dodo_optical_regularizer_max_ratio "${DODO_OPTICAL_REGULARIZER_MAX_RATIO}" \
     --dodo_doe_type New \
     --dodo_zernike_mode "${DODO_ZERNIKE_MODE}" \
     --dodo_zernike_terms "${DODO_ZERNIKE_TERMS}" \

@@ -27,6 +27,37 @@ def epoch_warmup_weight(
     return target_weight * scale
 
 
+def delayed_epoch_warmup_weight(
+    target_weight: float,
+    current_epoch: int,
+    start_epoch: int,
+    warmup_epochs: int,
+) -> float:
+    """Delay a regularizer, then linearly ramp it to its target weight.
+
+    ``start_epoch`` is the zero-weight anchor of the ramp.  A positive
+    ``warmup_epochs`` reaches the target that many epochs later.  This
+    makes it possible to stabilize the task network before changing the DOE
+    objective, while preserving ``epoch_warmup_weight`` for old checkpoints.
+    """
+    target_weight = float(target_weight)
+    current_epoch = int(current_epoch)
+    start_epoch = int(start_epoch)
+    warmup_epochs = int(warmup_epochs)
+    if target_weight < 0:
+        raise ValueError(f"target_weight must be >= 0, got {target_weight}")
+    if current_epoch < 0 or start_epoch < 0 or warmup_epochs < 0:
+        raise ValueError(
+            "current_epoch, start_epoch and warmup_epochs must be >= 0")
+    if current_epoch < start_epoch or target_weight == 0.0:
+        return 0.0
+    if warmup_epochs == 0:
+        return target_weight
+    active_epoch = current_epoch - start_epoch
+    scale = min(float(active_epoch) / float(warmup_epochs), 1.0)
+    return target_weight * scale
+
+
 def epoch_tightening_value(
     initial_value: float,
     target_value: float,
@@ -43,6 +74,59 @@ def epoch_tightening_value(
     fraction = min(float(current_epoch) / float(tightening_epochs), 1.0)
     return float(initial_value) + fraction * (
         float(target_value) - float(initial_value))
+
+
+def delayed_epoch_tightening_value(
+    initial_value: float,
+    target_value: float,
+    current_epoch: int,
+    start_epoch: int,
+    tightening_epochs: int,
+) -> float:
+    """Hold a constraint fixed, then tighten it over a chosen epoch window."""
+    current_epoch = int(current_epoch)
+    start_epoch = int(start_epoch)
+    tightening_epochs = int(tightening_epochs)
+    if current_epoch < 0 or start_epoch < 0 or tightening_epochs < 0:
+        raise ValueError(
+            "current_epoch, start_epoch and tightening_epochs must be >= 0")
+    if current_epoch <= start_epoch:
+        return float(initial_value)
+    if tightening_epochs == 0:
+        return float(target_value)
+    active_epoch = current_epoch - start_epoch
+    fraction = min(float(active_epoch) / float(tightening_epochs), 1.0)
+    return float(initial_value) + fraction * (
+        float(target_value) - float(initial_value))
+
+
+def task_relative_regularizer_scale(
+    regularizer_loss: torch.Tensor,
+    task_loss: torch.Tensor,
+    max_ratio: float,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Return a detached scale that caps a regularizer relative to task loss.
+
+    The returned value is one when ``max_ratio`` is zero, which keeps historical
+    runs bit-for-bit compatible.  Detaching the scale is intentional: it limits
+    the regularizer's contribution without creating an incentive to increase
+    the task loss merely to relax the cap.
+    """
+    if regularizer_loss.ndim != 0 or task_loss.ndim != 0:
+        raise ValueError("regularizer_loss and task_loss must be scalar tensors")
+    max_ratio = float(max_ratio)
+    if max_ratio < 0:
+        raise ValueError(f"max_ratio must be >= 0, got {max_ratio}")
+    if max_ratio == 0.0:
+        return regularizer_loss.detach().new_tensor(1.0)
+    regularizer_magnitude = regularizer_loss.detach().abs()
+    task_magnitude = task_loss.detach().abs()
+    allowed = max_ratio * task_magnitude
+    return torch.clamp(
+        allowed / regularizer_magnitude.clamp_min(float(eps)),
+        max=1.0,
+    )
 
 
 def _validate_and_normalize_psf(psf_bank: torch.Tensor) -> torch.Tensor:
@@ -161,6 +245,7 @@ def multiscale_psf_energy_concentration_loss(
     softness: float = 1.5,
     cvar_fraction: float = 0.10,
     cvar_weight: float = 0.5,
+    penalty_power: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Constrain the PSF core and tail, including the worst PSF subset."""
     if not (len(radii) == len(outside_budgets) == len(scale_weights)):
@@ -171,6 +256,9 @@ def multiscale_psf_energy_concentration_loss(
         raise ValueError("softness must be >= 0")
     if cvar_weight < 0:
         raise ValueError("cvar_weight must be >= 0")
+    penalty_power = float(penalty_power)
+    if not 1.0 <= penalty_power <= 2.0:
+        raise ValueError("penalty_power must be in [1,2]")
 
     psf = _validate_and_normalize_psf(psf_bank)
     radial_distance = _radial_distance(psf)
@@ -189,7 +277,7 @@ def multiscale_psf_energy_concentration_loss(
                 f"weight={weight}")
         outside = _outside_energy(psf, radial_distance, radius, softness)
         violation = F.relu(outside - budget)
-        loss = loss + weight * violation.square().mean()
+        loss = loss + weight * violation.pow(penalty_power).mean()
         key = f"r{int(round(radius))}"
         with torch.no_grad():
             stats[f"{key}_outside_mean"] = outside.mean().detach()
@@ -205,7 +293,7 @@ def multiscale_psf_energy_concentration_loss(
 
     if cvar_weight > 0:
         cvar_loss = _top_fraction_mean(
-            primary_violation.square(), cvar_fraction)
+            primary_violation.pow(penalty_power), cvar_fraction)
         loss = loss + float(cvar_weight) * cvar_loss
     else:
         cvar_loss = loss.detach() * 0.0
