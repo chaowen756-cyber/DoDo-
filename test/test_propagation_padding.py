@@ -298,6 +298,42 @@ def test_padding_cache_is_not_checkpointed_and_strict_load_stays_compatible():
     )
 
 
+def test_fixed_distance_fresnel_kernel_is_reused():
+    layer = PropagationLayer(
+        Mp=8,
+        L=0.01,
+        zi=0.7,
+        wave_lengths=torch.tensor([540e-9]),
+        trainable_z=False,
+        padding_factor=2,
+    )
+
+    first = layer._kernel(torch.device("cpu"))
+    second = layer._kernel(torch.device("cpu"))
+
+    assert first.data_ptr() == second.data_ptr()
+    assert layer._fixed_kernel_cache is first
+
+
+def test_trainable_distance_fresnel_kernel_is_never_cached():
+    layer = PropagationLayer(
+        Mp=8,
+        L=0.01,
+        zi=0.7,
+        wave_lengths=torch.tensor([540e-9]),
+        trainable_z=True,
+        padding_factor=2,
+    )
+
+    first = layer._kernel(torch.device("cpu"))
+    second = layer._kernel(torch.device("cpu"))
+
+    assert first.data_ptr() != second.data_ptr()
+    assert first.grad_fn is not None
+    assert second.grad_fn is not None
+    assert layer._fixed_kernel_cache is None
+
+
 def test_depth_aware_model_applies_padding_only_to_prop1():
     model = DepthAwareDoDoForwardModel(
         depth_min=0.4,

@@ -8,6 +8,9 @@ import torch.nn as nn
 from scipy.io import loadmat
 
 
+_DOE_BASIS_MODES = ("legacy_raw12", "orthogonal_rms")
+
+
 def _resolve_assets_dir(assets_dir: Optional[str]) -> Path:
     if assets_dir is not None:
         candidate = Path(assets_dir)
@@ -41,6 +44,76 @@ def _idlens_from_lambda(lambda_m: torch.Tensor) -> torch.Tensor:
     lambda_um = lambda_m * 1e6
     refr_index = 1.5375 + 0.00829045 * (lambda_um ** -2) - 0.000211046 * (lambda_um ** -4)
     return refr_index - 1.0
+
+
+def _build_orthogonal_rms_basis(
+    raw_basis: np.ndarray,
+    pupil: np.ndarray,
+    rank: int,
+    rank_rtol: float,
+    target_rms_m: float,
+):
+    """Build a deterministic, pupil-orthogonal basis in the legacy physical span."""
+    if raw_basis.ndim != 3:
+        raise ValueError(f"raw_basis must be [terms,H,W], got {raw_basis.shape}")
+    if pupil.shape != raw_basis.shape[-2:]:
+        raise ValueError(
+            f"pupil shape {pupil.shape} does not match basis shape {raw_basis.shape[-2:]}"
+        )
+    if rank < 1 or rank > raw_basis.shape[0]:
+        raise ValueError(f"basis rank must be in [1,{raw_basis.shape[0]}], got {rank}")
+    if rank_rtol <= 0.0:
+        raise ValueError(f"basis rank_rtol must be > 0, got {rank_rtol}")
+    if target_rms_m <= 0.0:
+        raise ValueError(f"basis target_rms_m must be > 0, got {target_rms_m}")
+
+    pupil_mask = np.asarray(pupil > 0.5)
+    pupil_count = int(np.count_nonzero(pupil_mask))
+    if pupil_count < 1:
+        raise ValueError("DOE pupil is empty")
+
+    orthonormal_vectors = []
+    source_indices = []
+    residual_ratios = []
+    for source_idx in range(raw_basis.shape[0]):
+        raw_vector = np.asarray(raw_basis[source_idx][pupil_mask], dtype=np.float64)
+        raw_norm = float(np.linalg.norm(raw_vector))
+        if raw_norm <= 0.0:
+            continue
+
+        residual = raw_vector.copy()
+        # Re-orthogonalize once to make the rank decision stable for nearly
+        # collinear legacy modes.
+        for _ in range(2):
+            for unit_vector in orthonormal_vectors:
+                residual -= np.dot(residual, unit_vector) * unit_vector
+
+        residual_norm = float(np.linalg.norm(residual))
+        residual_ratio = residual_norm / raw_norm
+        if residual_ratio <= rank_rtol:
+            continue
+
+        orthonormal_vectors.append(residual / residual_norm)
+        source_indices.append(source_idx)
+        residual_ratios.append(residual_ratio)
+        if len(orthonormal_vectors) == rank:
+            break
+
+    if len(orthonormal_vectors) != rank:
+        raise ValueError(
+            f"Only {len(orthonormal_vectors)} independent DOE modes remain at "
+            f"rank_rtol={rank_rtol:g}; requested rank={rank}"
+        )
+
+    rms_scale = float(target_rms_m) * np.sqrt(float(pupil_count))
+    basis = np.zeros((rank, *pupil_mask.shape), dtype=np.float32)
+    for mode_idx, unit_vector in enumerate(orthonormal_vectors):
+        basis[mode_idx][pupil_mask] = (unit_vector * rms_scale).astype(np.float32)
+    return (
+        basis,
+        np.asarray(source_indices, dtype=np.int64),
+        np.asarray(residual_ratios, dtype=np.float32),
+    )
 
 
 class _BaseDOE(nn.Module):
@@ -90,6 +163,13 @@ class DOELayer(_BaseDOE):
         assets_dir: str = "torch_optics/assets",
         phase_scale_mode: str = "legacy_doe",
         use_pupil_mask: bool = False,
+        *,
+        basis_mode: str = "legacy_raw12",
+        basis_rank: int = 9,
+        basis_rank_rtol: float = 1e-4,
+        basis_rms_m: float = 3e-6,
+        coeff_norm_limit: float = 1.0,
+        init_coeff_norm: float = 1.0,
     ):
         super().__init__()
         self.Mdoe = int(Mdoe)
@@ -98,6 +178,23 @@ class DOELayer(_BaseDOE):
         self.trainable = bool(trainable)
         self.phase_scale_mode = phase_scale_mode
         self.use_pupil_mask = bool(use_pupil_mask)
+        self.basis_mode = str(basis_mode)
+        self.basis_rank = int(basis_rank)
+        self.basis_rank_rtol = float(basis_rank_rtol)
+        self.basis_rms_m = float(basis_rms_m)
+        self.coeff_norm_limit = float(coeff_norm_limit)
+        self.init_coeff_norm = float(init_coeff_norm)
+        if self.basis_mode not in _DOE_BASIS_MODES:
+            raise ValueError(
+                f"basis_mode must be one of {_DOE_BASIS_MODES}, got '{self.basis_mode}'"
+            )
+        if self.coeff_norm_limit <= 0.0:
+            raise ValueError(f"coeff_norm_limit must be > 0, got {self.coeff_norm_limit}")
+        if self.init_coeff_norm < 0.0 or self.init_coeff_norm > self.coeff_norm_limit:
+            raise ValueError(
+                f"init_coeff_norm must be in [0,{self.coeff_norm_limit}], "
+                f"got {self.init_coeff_norm}"
+            )
 
         self.register_buffer("wave_lengths", _build_wave_lengths(wave_lengths))
         assets = _resolve_assets_dir(assets_dir)
@@ -109,17 +206,43 @@ class DOELayer(_BaseDOE):
         self.register_buffer("spiral_p", torch.from_numpy(spiral_p))
 
         self.register_buffer("zernike_basis", torch.empty(0), persistent=False)
+        self.register_buffer(
+            "zernike_source_indices", torch.empty(0, dtype=torch.int64), persistent=False
+        )
+        self.register_buffer("zernike_residual_ratios", torch.empty(0), persistent=False)
         self.zernike_coeffs = None
         if doe_type in ("New", "Zeros"):
             base_mat = loadmat(assets / "Base_zernike_128x128_nopadd.mat")
-            basis = np.asarray(base_mat["HmBase"], dtype=np.float32)
-            basis = np.transpose(basis, (2, 0, 1))
+            raw_basis = np.asarray(base_mat["HmBase"], dtype=np.float32)
+            raw_basis = np.transpose(raw_basis, (2, 0, 1))
+            if self.basis_mode == "orthogonal_rms":
+                basis, source_indices, residual_ratios = _build_orthogonal_rms_basis(
+                    raw_basis=raw_basis,
+                    pupil=spiral_p,
+                    rank=self.basis_rank,
+                    rank_rtol=self.basis_rank_rtol,
+                    target_rms_m=self.basis_rms_m,
+                )
+                self.zernike_source_indices = torch.from_numpy(source_indices)
+                self.zernike_residual_ratios = torch.from_numpy(residual_ratios)
+            else:
+                basis = raw_basis
+                self.zernike_source_indices = torch.arange(
+                    basis.shape[0], dtype=torch.int64
+                )
+                self.zernike_residual_ratios = torch.ones(
+                    basis.shape[0], dtype=torch.float32
+                )
             self.zernike_basis = torch.from_numpy(basis)
 
             coeffs = torch.zeros((basis.shape[0],), dtype=torch.float32)
             if doe_type == "New":
-                n_rand = min(12, coeffs.numel())
+                n_rand = coeffs.numel()
                 coeffs[:n_rand].uniform_(-1.0, 1.0)
+                if self.basis_mode == "orthogonal_rms":
+                    coeff_norm = torch.linalg.vector_norm(coeffs)
+                    if coeff_norm > 0.0:
+                        coeffs.mul_(self.init_coeff_norm / coeff_norm)
                 self.zernike_coeffs = nn.Parameter(coeffs, requires_grad=self.trainable)
             else:
                 # Match TensorFlow behavior: Zeros branch is frozen.
@@ -136,8 +259,36 @@ class DOELayer(_BaseDOE):
         if hasattr(self, "zernike_coeffs") and isinstance(self.zernike_coeffs, nn.Parameter) and self.zernike_coeffs.requires_grad:
             with torch.no_grad():
                 coeff_norm = self.zernike_coeffs.norm(p=2)
-                if coeff_norm > 1.0:
-                    self.zernike_coeffs.div_(coeff_norm)
+                if coeff_norm > self.coeff_norm_limit:
+                    self.zernike_coeffs.mul_(self.coeff_norm_limit / coeff_norm)
+
+    def heightmap(self) -> torch.Tensor:
+        if isinstance(self.zernike_coeffs, nn.Parameter):
+            device = self.zernike_coeffs.device
+        else:
+            device = self.spiral_hm.device
+        return self._compute_hm(device=device)
+
+    def pupil_rms(self, value: torch.Tensor) -> torch.Tensor:
+        pupil = self.spiral_p.to(device=value.device) > 0.5
+        selected = value[pupil]
+        if selected.numel() == 0:
+            return torch.zeros((), device=value.device, dtype=value.dtype)
+        return torch.sqrt(torch.mean(selected.to(torch.float32) ** 2))
+
+    def phase_rms_from_height_rms(
+        self,
+        height_rms_m: torch.Tensor,
+        wavelength_m: float = 540e-9,
+    ) -> torch.Tensor:
+        wavelength = torch.as_tensor(
+            wavelength_m,
+            device=height_rms_m.device,
+            dtype=torch.float32,
+        )
+        idlens = _idlens_from_lambda(wavelength)
+        phase_gain = abs(_phase_scale(self.phase_scale_mode)) * torch.abs(idlens) / wavelength
+        return height_rms_m.to(torch.float32) * phase_gain
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:

@@ -91,6 +91,8 @@ class SnapshotDepthHS(pl.LightningModule):
         """Freeze then gently release high-order free-Zernike coefficients."""
         if not bool(getattr(self.hparams, 'optimize_optics', False)):
             return
+        if getattr(self.hparams, 'dodo_zernike_mode', 'legacy12') != 'free':
+            return
         doe1 = getattr(getattr(self, 'camera', None), 'doe1', None)
         coefficients = getattr(doe1, 'zernike_coeffs', None)
         if not isinstance(coefficients, nn.Parameter) or not coefficients.requires_grad:
@@ -450,8 +452,12 @@ class SnapshotDepthHS(pl.LightningModule):
                 gfinite = torch.isfinite(zc.grad).all().item()
                 grad_norms['doe_zernike'] = gnorm
                 grad_norms['doe_zernike_finite'] = float(gfinite)
-                low_terms = int(getattr(
-                    self.hparams, 'dodo_zernike_low_order_terms', 15))
+                if getattr(
+                        self.hparams, 'dodo_zernike_mode', 'legacy12') == 'free':
+                    low_terms = int(getattr(
+                        self.hparams, 'dodo_zernike_low_order_terms', 15))
+                else:
+                    low_terms = zc.numel()
                 grad_norms['doe_zernike_low_order'] = (
                     zc.grad[:low_terms].norm().item())
                 grad_norms['doe_zernike_high_order'] = (
@@ -905,10 +911,31 @@ class SnapshotDepthHS(pl.LightningModule):
             dodo_zernike_terms = int(getattr(hparams, 'dodo_zernike_terms', 150))
             dodo_zernike_basis_path = getattr(
                 hparams, 'dodo_zernike_basis_path', None)
+            dodo_doe_basis_mode = getattr(
+                hparams, 'dodo_doe_basis_mode', 'legacy_raw12')
+            dodo_doe_basis_rank = int(
+                getattr(hparams, 'dodo_doe_basis_rank', 9))
+            dodo_doe_basis_rank_rtol = float(
+                getattr(hparams, 'dodo_doe_basis_rank_rtol', 1e-4))
+            dodo_doe_basis_rms_m = float(
+                getattr(hparams, 'dodo_doe_basis_rms_m', 3e-6))
+            dodo_doe_coeff_norm_limit = float(
+                getattr(hparams, 'dodo_doe_coeff_norm_limit', 1.0))
+            dodo_doe_init_coeff_norm = float(
+                getattr(hparams, 'dodo_doe_init_coeff_norm', 1.0))
             if dodo_zernike_mode not in ('legacy12', 'free'):
                 raise ValueError(
                     'dodo_zernike_mode must be legacy12 or free, got '
                     f'{dodo_zernike_mode!r}')
+            if dodo_doe_basis_mode not in ('legacy_raw12', 'orthogonal_rms'):
+                raise ValueError(
+                    'dodo_doe_basis_mode must be legacy_raw12 or '
+                    f'orthogonal_rms, got {dodo_doe_basis_mode!r}')
+            if (dodo_zernike_mode == 'free'
+                    and dodo_doe_basis_mode != 'legacy_raw12'):
+                raise ValueError(
+                    'orthogonal_rms applies only to '
+                    '--dodo_zernike_mode legacy12')
             if dodo_zernike_terms < 1:
                 raise ValueError(
                     f'dodo_zernike_terms must be >= 1, got {dodo_zernike_terms}')
@@ -1125,6 +1152,12 @@ class SnapshotDepthHS(pl.LightningModule):
                 psf_layer_mask_mode=dodo_psf_layer_mask,
                 psf_mask_blur_sigma=dodo_psf_mask_blur_sigma,
                 psf_boundary_mode=dodo_psf_boundary,
+                doe_basis_mode=dodo_doe_basis_mode,
+                doe_basis_rank=dodo_doe_basis_rank,
+                doe_basis_rank_rtol=dodo_doe_basis_rank_rtol,
+                doe_basis_rms_m=dodo_doe_basis_rms_m,
+                doe_coeff_norm_limit=dodo_doe_coeff_norm_limit,
+                doe_init_coeff_norm=dodo_doe_init_coeff_norm,
             )
             if hasattr(self.camera.doe1, 'coefficient_limit'):
                 self.camera.doe1.coefficient_limit = (
@@ -1133,10 +1166,21 @@ class SnapshotDepthHS(pl.LightningModule):
                 setattr(
                     self.camera.doe1, 'coefficient_limit',
                     dodo_zernike_coefficient_limit)
+            if dodo_use_free_zernike:
+                dodo_basis_summary = 'doe_basis_mode=n/a(free), '
+            else:
+                dodo_basis_summary = (
+                    f'doe_basis_mode={dodo_doe_basis_mode}, '
+                    f'doe_basis_rank={self.camera.doe1.zernike_basis.shape[0]}, '
+                    f'doe_basis_rms={dodo_doe_basis_rms_m:.3g}m, '
+                    f'doe_coeff_norm_limit={dodo_doe_coeff_norm_limit:g}, '
+                    f'doe_init_coeff_norm={dodo_doe_init_coeff_norm:g}, '
+                )
             print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
                   f'zernike_mode={dodo_zernike_mode}, '
-                  f'zernike_terms={12 if not dodo_use_free_zernike else dodo_zernike_terms}, '
+                  f'zernike_terms={self.camera.doe1.zernike_basis.shape[0]}, '
                   f'zernike_basis={dodo_zernike_basis_path or "auto"}, '
+                  f'{dodo_basis_summary}'
                   f'forward_norm={dodo_forward_norm}, '
                   f'forward_scale={dodo_forward_scale:g}, '
                   f'skip_prop2={dodo_skip_prop2}, '
@@ -1977,7 +2021,9 @@ class SnapshotDepthHS(pl.LightningModule):
                     'dodo_psf_depth_separation_warmup_epochs')
 
             coefficients = getattr(self.camera.doe1, 'zernike_coeffs', None)
-            if isinstance(coefficients, torch.Tensor):
+            if (isinstance(coefficients, torch.Tensor)
+                    and getattr(
+                        self.hparams, 'dodo_zernike_mode', 'legacy12') == 'free'):
                 low_terms = int(getattr(
                     self.hparams, 'dodo_zernike_low_order_terms', 15))
                 zernike_high_order_loss = zernike_order_weighted_l2(
@@ -2273,6 +2319,46 @@ class SnapshotDepthHS(pl.LightningModule):
                             choices=['legacy12', 'free'],
                             help='Zernike basis: legacy12 loads the original 12-term MAT; '
                                  'free loads an N-term NPY basis')
+        parser.add_argument(
+            '--dodo_doe_basis_mode',
+            type=str,
+            default='legacy_raw12',
+            choices=['legacy_raw12', 'orthogonal_rms'],
+            help=(
+                'legacy12 内部基底：legacy_raw12 保持旧 checkpoint；'
+                'orthogonal_rms 去除近共线方向并统一 pupil 内物理 RMS'
+            ),
+        )
+        parser.add_argument(
+            '--dodo_doe_basis_rank',
+            type=int,
+            default=9,
+            help='orthogonal_rms 从原始 12 项中保留的有效独立模式数',
+        )
+        parser.add_argument(
+            '--dodo_doe_basis_rank_rtol',
+            type=float,
+            default=1e-4,
+            help='orthogonal_rms 丢弃近共线模式的相对残差阈值',
+        )
+        parser.add_argument(
+            '--dodo_doe_basis_rms_m',
+            type=float,
+            default=3e-6,
+            help='orthogonal_rms 每个正交模式在 pupil 内的高度 RMS（米）',
+        )
+        parser.add_argument(
+            '--dodo_doe_coeff_norm_limit',
+            type=float,
+            default=1.0,
+            help='正交 DOE 系数向量的 L2 上限',
+        )
+        parser.add_argument(
+            '--dodo_doe_init_coeff_norm',
+            type=float,
+            default=1.0,
+            help='orthogonal_rms 模式的初始系数 L2 范数',
+        )
         parser.add_argument('--dodo_zernike_terms', type=int, default=150,
                             help='Number of Zernike terms when --dodo_zernike_mode free is used')
         parser.add_argument('--dodo_zernike_basis_path', type=str, default=None,

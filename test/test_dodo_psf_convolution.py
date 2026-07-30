@@ -28,6 +28,12 @@ def _make_model(
     n_terms=150,
     zernike_basis_path=None,
     prop1_padding_factor=1,
+    doe_basis_mode="legacy_raw12",
+    doe_basis_rank=9,
+    doe_basis_rank_rtol=1e-4,
+    doe_basis_rms_m=3e-6,
+    doe_coeff_norm_limit=1.0,
+    doe_init_coeff_norm=1.0,
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=0.4,
@@ -53,6 +59,12 @@ def _make_model(
         psf_layer_mask_mode=psf_layer_mask_mode,
         psf_mask_blur_sigma=psf_mask_blur_sigma,
         psf_boundary_mode=psf_boundary_mode,
+        doe_basis_mode=doe_basis_mode,
+        doe_basis_rank=doe_basis_rank,
+        doe_basis_rank_rtol=doe_basis_rank_rtol,
+        doe_basis_rms_m=doe_basis_rms_m,
+        doe_coeff_norm_limit=doe_coeff_norm_limit,
+        doe_init_coeff_norm=doe_init_coeff_norm,
     )
 
 
@@ -88,6 +100,39 @@ def test_free_zernike_mode_loads_150_term_npy_basis():
     assert torch.count_nonzero(grad).item() == 150
 
 
+def test_orthogonal_rms_mode_is_used_by_psf_model():
+    torch.manual_seed(123)
+    model = _make_model(
+        train_c=True,
+        doe_type_a="New",
+        doe_basis_mode="orthogonal_rms",
+    )
+
+    assert isinstance(model.doe1, DOELayer)
+    assert model.doe1.zernike_basis.shape == (9, 128, 128)
+    assert model.doe1.zernike_coeffs.shape == (9,)
+    psf = model.psf_bank(use_cache=False)
+    assert torch.isfinite(psf).all()
+    torch.testing.assert_close(
+        psf.sum(dim=(-2, -1)),
+        torch.ones((1, 25)),
+        atol=2e-6,
+        rtol=0,
+    )
+    loss, _ = psf_energy_concentration_loss(
+        psf, radius=16.0, outside_budget=0.5, softness=1.5)
+    loss.backward()
+    gradient = model.doe1.zernike_coeffs.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient).item() == 9
+
+
+def test_free_zernike_rejects_legacy12_orthogonal_mode():
+    with pytest.raises(ValueError, match="legacy 12-term DOE"):
+        _make_model(free=True, doe_basis_mode="orthogonal_rms")
+
+
 @pytest.fixture(scope="module")
 def frozen_psf_model():
     return _make_model().eval()
@@ -112,12 +157,33 @@ def test_image_formation_mode_does_not_change_state_dict_keys():
 
 
 def test_prop1_padding_parameter_preserves_existing_positional_api():
+    orthogonal_parameters = (
+        "doe_basis_mode",
+        "doe_basis_rank",
+        "doe_basis_rank_rtol",
+        "doe_basis_rms_m",
+        "doe_coeff_norm_limit",
+        "doe_init_coeff_norm",
+    )
     for model_factory in (
         DepthAwareDoDoForwardModel,
         Forward_DM_Spiral_Depth,
     ):
-        parameters = list(inspect.signature(model_factory).parameters)
-        assert parameters[-1] == "prop1_padding_factor"
+        parameters = inspect.signature(model_factory).parameters
+        positional = [
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        assert positional[-1] == "prop1_padding_factor"
+        assert all(
+            parameters[name].kind == inspect.Parameter.KEYWORD_ONLY
+            for name in orthogonal_parameters
+        )
 
 
 def test_psf_bank_is_finite_nonnegative_normalized_and_cached(frozen_psf_model):

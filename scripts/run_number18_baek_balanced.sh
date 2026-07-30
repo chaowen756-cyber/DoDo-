@@ -50,6 +50,12 @@ DODO_PSF_DEPTH_SEPARATION_START_EPOCH="${DODO_PSF_DEPTH_SEPARATION_START_EPOCH:-
 DODO_PSF_DEPTH_SEPARATION_WARMUP_EPOCHS="${DODO_PSF_DEPTH_SEPARATION_WARMUP_EPOCHS:-0}"
 DODO_OPTICAL_REGULARIZER_MAX_RATIO="${DODO_OPTICAL_REGULARIZER_MAX_RATIO:-0.0}"
 DODO_ZERNIKE_MODE="${DODO_ZERNIKE_MODE:-free}"
+DODO_DOE_BASIS_MODE="${DODO_DOE_BASIS_MODE:-legacy_raw12}"
+DODO_DOE_BASIS_RANK="${DODO_DOE_BASIS_RANK:-9}"
+DODO_DOE_BASIS_RANK_RTOL="${DODO_DOE_BASIS_RANK_RTOL:-1e-4}"
+DODO_DOE_BASIS_RMS_M="${DODO_DOE_BASIS_RMS_M:-3e-6}"
+DODO_DOE_COEFF_NORM_LIMIT="${DODO_DOE_COEFF_NORM_LIMIT:-1.0}"
+DODO_DOE_INIT_COEFF_NORM="${DODO_DOE_INIT_COEFF_NORM:-1.0}"
 DODO_ZERNIKE_TERMS="${DODO_ZERNIKE_TERMS:-150}"
 DODO_ZERNIKE_BASIS_PATH="${DODO_ZERNIKE_BASIS_PATH:-${ROOT_DIR}/torch_optics/assets/zernike_volume1_128_Nterms_150.npy}"
 DODO_ZERNIKE_INIT_CHECKPOINT="${DODO_ZERNIKE_INIT_CHECKPOINT:-${ROOT_DIR}/experiments/number_18e_optics_lr1e-5_stageA_12ep/artifacts/checkpoints/joint-best-epoch=011.ckpt}"
@@ -125,6 +131,7 @@ run_training() {
   local experiment_dir="${EXPERIMENT_ROOT}/${experiment_name}"
   local -a extra_args
   local -a stage_args
+  local -a zernike_args
   mapfile -t extra_args < <(variant_args "${variant}")
 
   case "${stage}" in
@@ -169,7 +176,7 @@ run_training() {
     echo "Zernike basis not found: ${DODO_ZERNIKE_BASIS_PATH}" >&2
     exit 1
   fi
-  if [[ "${stage}" == "stage_a" ]]; then
+  if [[ "${DODO_ZERNIKE_MODE}" == "free" && "${stage}" == "stage_a" ]]; then
     if [[ -n "${DODO_ZERNIKE_INIT_CHECKPOINT}" ]]; then
       if [[ ! -f "${DODO_ZERNIKE_INIT_CHECKPOINT}" ]]; then
         echo "Zernike initialization file not found: ${DODO_ZERNIKE_INIT_CHECKPOINT}" >&2
@@ -182,6 +189,43 @@ run_training() {
       fi
     fi
   fi
+  case "${DODO_ZERNIKE_MODE}" in
+    free)
+      if [[ "${DODO_DOE_BASIS_MODE}" != "legacy_raw12" ]]; then
+        echo "DODO_DOE_BASIS_MODE only applies when DODO_ZERNIKE_MODE=legacy12" >&2
+        exit 2
+      fi
+      zernike_args=(
+        --dodo_zernike_terms "${DODO_ZERNIKE_TERMS}"
+        --dodo_zernike_basis_path "${DODO_ZERNIKE_BASIS_PATH}"
+        --dodo_zernike_low_order_terms "${DODO_ZERNIKE_LOW_ORDER_TERMS}"
+        --dodo_zernike_high_order_unlock_epoch "${DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH}"
+        --dodo_zernike_high_order_lr_ratio "${DODO_ZERNIKE_HIGH_ORDER_LR_RATIO}"
+        --dodo_zernike_high_order_weight "${DODO_ZERNIKE_HIGH_ORDER_WEIGHT}"
+        --dodo_zernike_coefficient_limit "${DODO_ZERNIKE_COEFFICIENT_LIMIT}"
+      )
+      if [[ "${stage}" == "stage_a" && -n "${DODO_ZERNIKE_INIT_CHECKPOINT}" ]]; then
+        zernike_args+=(
+          --dodo_zernike_init_checkpoint "${DODO_ZERNIKE_INIT_CHECKPOINT}"
+          --dodo_zernike_init_legacy_basis_path "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}"
+        )
+      fi
+      ;;
+    legacy12)
+      zernike_args=(
+        --dodo_doe_basis_mode "${DODO_DOE_BASIS_MODE}"
+        --dodo_doe_basis_rank "${DODO_DOE_BASIS_RANK}"
+        --dodo_doe_basis_rank_rtol "${DODO_DOE_BASIS_RANK_RTOL}"
+        --dodo_doe_basis_rms_m "${DODO_DOE_BASIS_RMS_M}"
+        --dodo_doe_coeff_norm_limit "${DODO_DOE_COEFF_NORM_LIMIT}"
+        --dodo_doe_init_coeff_norm "${DODO_DOE_INIT_COEFF_NORM}"
+      )
+      ;;
+    *)
+      echo "DODO_ZERNIKE_MODE must be free or legacy12, got: ${DODO_ZERNIKE_MODE}" >&2
+      exit 2
+      ;;
+  esac
   if [[ -e "${experiment_dir}/artifacts/command.txt" && "${ALLOW_EXISTING:-0}" != "1" ]]; then
     echo "Experiment already exists: ${experiment_dir}" >&2
     echo "Set ALLOW_EXISTING=1 only if reuse is intentional." >&2
@@ -271,15 +315,6 @@ run_training() {
     --dodo_optical_regularizer_max_ratio "${DODO_OPTICAL_REGULARIZER_MAX_RATIO}" \
     --dodo_doe_type New \
     --dodo_zernike_mode "${DODO_ZERNIKE_MODE}" \
-    --dodo_zernike_terms "${DODO_ZERNIKE_TERMS}" \
-    --dodo_zernike_basis_path "${DODO_ZERNIKE_BASIS_PATH}" \
-    --dodo_zernike_init_checkpoint "${DODO_ZERNIKE_INIT_CHECKPOINT}" \
-    --dodo_zernike_init_legacy_basis_path "${DODO_ZERNIKE_INIT_LEGACY_BASIS_PATH}" \
-    --dodo_zernike_low_order_terms "${DODO_ZERNIKE_LOW_ORDER_TERMS}" \
-    --dodo_zernike_high_order_unlock_epoch "${DODO_ZERNIKE_HIGH_ORDER_UNLOCK_EPOCH}" \
-    --dodo_zernike_high_order_lr_ratio "${DODO_ZERNIKE_HIGH_ORDER_LR_RATIO}" \
-    --dodo_zernike_high_order_weight "${DODO_ZERNIKE_HIGH_ORDER_WEIGHT}" \
-    --dodo_zernike_coefficient_limit "${DODO_ZERNIKE_COEFFICIENT_LIMIT}" \
     --no-dodo_use_second_doe \
     --dodo_skip_prop2 \
     --dodo_sensing_mode rgb \
@@ -314,6 +349,7 @@ run_training() {
     --val_check_interval 0.25 \
     --max_epochs "${max_epochs}" \
     "${stage_args[@]}" \
+    "${zernike_args[@]}" \
     "${extra_args[@]}"
 }
 

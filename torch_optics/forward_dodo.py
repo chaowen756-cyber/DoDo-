@@ -274,6 +274,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
         psf_mask_blur_sigma: float = 1.0,
         psf_boundary_mode: str = "linear_zero",
         prop1_padding_factor: int = 1,
+        *,
+        doe_basis_mode: str = "legacy_raw12",
+        doe_basis_rank: int = 9,
+        doe_basis_rank_rtol: float = 1e-4,
+        doe_basis_rms_m: float = 3e-6,
+        doe_coeff_norm_limit: float = 1.0,
+        doe_init_coeff_norm: float = 1.0,
     ):
         super().__init__()
         self.skip_prop2 = bool(skip_prop2)
@@ -329,6 +336,12 @@ class DepthAwareDoDoForwardModel(nn.Module):
             raise ValueError(
                 "psf_convolution forms an incoherent intensity image and therefore requires "
                 "sensor_measurement='intensity'")
+        if free and doe_basis_mode != "legacy_raw12":
+            raise ValueError(
+                "doe_basis_mode applies only to the legacy 12-term DOE; "
+                "set free=False (or --dodo_zernike_mode legacy12) to use "
+                f"'{doe_basis_mode}'"
+            )
         self.image_formation_mode = image_formation_mode
         self.psf_layer_mask_mode = psf_layer_mask_mode
         self.psf_mask_blur_sigma = psf_mask_blur_sigma
@@ -396,6 +409,12 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 Mdoe=mss, Mesce=minput, doe_type=doe_type_a,
                 trainable=train_c, assets_dir=assets_dir,
                 phase_scale_mode="legacy_doe",
+                basis_mode=doe_basis_mode,
+                basis_rank=doe_basis_rank,
+                basis_rank_rtol=doe_basis_rank_rtol,
+                basis_rms_m=doe_basis_rms_m,
+                coeff_norm_limit=doe_coeff_norm_limit,
+                init_coeff_norm=doe_init_coeff_norm,
             )
 
         self.prop2 = PropagationLayer(Mp=mss, L=0.006, zi=0.05, trainable_z=False)
@@ -897,6 +916,13 @@ def Forward_DM_Spiral_Depth(
     psf_mask_blur_sigma=1.0,
     psf_boundary_mode="linear_zero",
     prop1_padding_factor=1,
+    *,
+    doe_basis_mode="legacy_raw12",
+    doe_basis_rank=9,
+    doe_basis_rank_rtol=1e-4,
+    doe_basis_rms_m=3e-6,
+    doe_coeff_norm_limit=1.0,
+    doe_init_coeff_norm=1.0,
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=depth_min,
@@ -923,6 +949,12 @@ def Forward_DM_Spiral_Depth(
         psf_layer_mask_mode=psf_layer_mask_mode,
         psf_mask_blur_sigma=psf_mask_blur_sigma,
         psf_boundary_mode=psf_boundary_mode,
+        doe_basis_mode=doe_basis_mode,
+        doe_basis_rank=doe_basis_rank,
+        doe_basis_rank_rtol=doe_basis_rank_rtol,
+        doe_basis_rms_m=doe_basis_rms_m,
+        doe_coeff_norm_limit=doe_coeff_norm_limit,
+        doe_init_coeff_norm=doe_init_coeff_norm,
     )
 
 

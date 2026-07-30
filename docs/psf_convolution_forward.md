@@ -79,6 +79,31 @@ PSF 的中心点源传播可通过：
 原光学前向。新 padding 实验必须显式设置 factor=2，并确保 Stage A 与
 Stage B 使用同一值。
 
+### 4.1 原始 12 项 DOE 的 orthogonal RMS 模式
+
+`legacy12` DOE 可选用：
+
+```text
+--dodo_zernike_mode legacy12
+--dodo_doe_basis_mode orthogonal_rms
+--dodo_doe_basis_rank 9
+--dodo_doe_basis_rank_rtol 1e-4
+--dodo_doe_basis_rms_m 3e-6
+--dodo_doe_coeff_norm_limit 1.0
+--dodo_doe_init_coeff_norm 1.0
+```
+
+该模式在 pupil 内对原始 12 项做两遍 Gram-Schmidt，并按相对残差
+阈值去除近共线方向。默认保留原始索引
+`[0,1,2,3,4,5,6,10,11]` 的 9 个有效模式。每个模式的 pupil
+高度 RMS 都是 3 微米，因此总高度 RMS 为
+`3 微米 * ||coeff||2`，系数向量用 L2 球约束，而不是逐项裁剪。
+
+默认仍为 `legacy_raw12`，所以旧 12 维 checkpoint 和现有 free150
+实验不变。orthogonal 9 维 checkpoint 不能直接与 raw12 checkpoint
+互载，Stage A/B 必须使用相同的 mode 和 rank。free150 的高阶解锁、
+高阶正则与诊断也只在 `--dodo_zernike_mode free` 下启用。
+
 ## 5. 卷积边界
 
 默认 `--dodo_psf_boundary linear_zero`：
@@ -119,6 +144,15 @@ DODO_PROP1_PADDING_FACTOR=2 \
   bash scripts/run_number18_baek_balanced.sh stage-a-combined
 ```
 
+若要运行 12 项来源的 orthogonal RMS + padding PSF 实验：
+
+```bash
+DODO_ZERNIKE_MODE=legacy12 \
+DODO_DOE_BASIS_MODE=orthogonal_rms \
+DODO_PROP1_PADDING_FACTOR=2 \
+  bash scripts/run_number18_baek_balanced.sh stage-a-combined
+```
+
 新实验目录统一带 `psfconv_` 前缀，避免覆盖原 Number18 结果。
 
 ## 8. 归一化注意事项
@@ -135,12 +169,16 @@ DODO_PROP1_PADDING_FACTOR=2 \
 ## 9. 验证
 
 自动化测试位于 `test/test_dodo_psf_convolution.py`、
+`test/test_doe_orthogonal_rms.py`、
 `test/test_dodo_radiance_field.py` 和
 `test/test_propagation_padding.py`，覆盖：
 
+- 原始 12 项正交化后的有效 rank、等 RMS Gram 矩阵和 L2 约束；
+- legacy raw12 checkpoint 严格加载兼容；
 - PSF 非负、有限和单位能量；
 - factor=1 与旧传播公式完全一致；
 - factor=2 保持采样间距并抑制远场周期环绕；
+- 固定距离 Fresnel 核复用与可训练距离禁用缓存；
 - padded Prop1 生成的 PSF 仍非负、有限、单位能量；
 - 冻结光学缓存；
 - Gaussian depth occupancy 归一化；
