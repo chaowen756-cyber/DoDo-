@@ -25,6 +25,7 @@ def _make_model(
     psf_layer_mask_mode="baek_hard",
     psf_mask_blur_sigma=1.0,
     psf_boundary_mode="linear_zero",
+    psf_depth_chunk_size=1,
     free=False,
     n_terms=150,
     zernike_basis_path=None,
@@ -60,6 +61,7 @@ def _make_model(
         psf_layer_mask_mode=psf_layer_mask_mode,
         psf_mask_blur_sigma=psf_mask_blur_sigma,
         psf_boundary_mode=psf_boundary_mode,
+        psf_depth_chunk_size=psf_depth_chunk_size,
         doe_basis_mode=doe_basis_mode,
         doe_basis_rank=doe_basis_rank,
         doe_basis_rank_rtol=doe_basis_rank_rtol,
@@ -83,6 +85,38 @@ def _legacy_loop_psf_bank(model):
             (psf / psf.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8))[0]
         )
     return torch.stack(psfs, dim=0)
+
+
+def _legacy_depth_loop_convolution(model, spectral, weights, psf_bank):
+    batch, _, height, width = spectral.shape
+    response = model._sensor_response_matrix(
+        spectral.device, spectral.dtype)
+    kernel_height, kernel_width = psf_bank.shape[-2:]
+    fft_size = (
+        _next_fast_fft_length(height + kernel_height - 1),
+        _next_fast_fft_length(width + kernel_width - 1),
+    )
+    spectral_fft = torch.fft.rfft2(spectral, s=fft_size, dim=(-2, -1))
+    response = response.to(dtype=spectral_fft.dtype)
+    output = torch.zeros(
+        (batch, response.shape[0], height, width),
+        device=spectral.device,
+        dtype=spectral.dtype,
+    )
+    for depth_index in range(model.num_depth_layers):
+        psf_fft = torch.fft.rfft2(
+            psf_bank[depth_index], s=fft_size, dim=(-2, -1))
+        mixed_fft = torch.einsum(
+            "bcxy,cxy,oc->boxy", spectral_fft, psf_fft, response)
+        full = torch.fft.irfft2(
+            mixed_fft, s=fft_size, dim=(-2, -1))
+        blurred = full[
+            ...,
+            kernel_height // 2:kernel_height // 2 + height,
+            kernel_width // 2:kernel_width // 2 + width,
+        ]
+        output = output + blurred * weights[:, depth_index:depth_index + 1]
+    return output
 
 
 def test_default_zernike_mode_remains_legacy_12_term_mat_basis():
@@ -228,6 +262,98 @@ def test_next_fast_fft_length_avoids_prime_linear_convolution_grids():
         _next_fast_fft_length(0)
 
 
+def test_depth_chunk_convolution_matches_legacy_output_and_gradients(monkeypatch):
+    torch.manual_seed(100)
+    model = _make_model(
+        num_depth_layers=3,
+        sensing_mode="rgb",
+        measurement_channels=3,
+        psf_depth_chunk_size=2,
+    )
+    optimized_spectral = torch.rand(
+        (2, 25, 16, 16), requires_grad=True)
+    reference_spectral = optimized_spectral.detach().clone().requires_grad_()
+    optimized_psf = torch.rand(
+        (3, 25, 8, 8), requires_grad=True)
+    reference_psf = optimized_psf.detach().clone().requires_grad_()
+    weights = torch.softmax(torch.rand((2, 3, 16, 16)), dim=1)
+
+    def fake_psf_bank(self, height, width, device, use_cache=True):
+        return optimized_psf
+
+    monkeypatch.setattr(
+        model,
+        "_generate_psf_bank",
+        types.MethodType(fake_psf_bank, model),
+    )
+    optimized = model._forward_psf_convolution(
+        optimized_spectral,
+        weights,
+        binner_debug=None,
+        debug_stages=False,
+        output_size=(8, 8),
+    )
+    reference_full = _legacy_depth_loop_convolution(
+        model, reference_spectral, weights, reference_psf)
+    reference = reference_full[..., 4:12, 4:12]
+    torch.testing.assert_close(
+        optimized, reference, atol=2e-5, rtol=2e-5)
+
+    probe = torch.linspace(
+        0.5, 1.5, optimized.numel(), dtype=optimized.dtype
+    ).reshape_as(optimized)
+    (optimized * probe).mean().backward()
+    (reference * probe).mean().backward()
+    torch.testing.assert_close(
+        optimized_spectral.grad,
+        reference_spectral.grad,
+        atol=2e-7,
+        rtol=2e-5,
+    )
+    torch.testing.assert_close(
+        optimized_psf.grad,
+        reference_psf.grad,
+        atol=2e-7,
+        rtol=2e-5,
+    )
+
+
+def test_detached_psf_frequency_bank_is_reused_and_cleared():
+    model = _make_model(num_depth_layers=2)
+    psf = torch.rand((2, 25, 8, 8))
+    first = model._psf_frequency_bank(psf, (24, 24))
+    second = model._psf_frequency_bank(psf, (24, 24))
+
+    assert first.data_ptr() == second.data_ptr()
+    model.clear_psf_cache()
+    assert model._cached_psf_fft_bank is None
+    third = model._psf_frequency_bank(psf, (24, 24))
+    assert third.data_ptr() != first.data_ptr()
+
+
+def test_overlap_save_halo_center_matches_full_linear_convolution():
+    torch.manual_seed(102)
+    model = _make_model(
+        num_depth_layers=1,
+        sensing_mode="rgb",
+        measurement_channels=3,
+    ).eval()
+    spectral = torch.rand((1, 25, 256, 256))
+    depth = torch.ones((1, 1, 256, 256))
+
+    with torch.no_grad():
+        full = model(spectral, depth)
+        center = model(
+            spectral, depth, output_size=(128, 128))
+
+    torch.testing.assert_close(
+        center,
+        full[..., 64:192, 64:192],
+        atol=3e-6,
+        rtol=3e-5,
+    )
+
+
 def test_batched_psf_generation_matches_legacy_loop_and_doe_gradient():
     torch.manual_seed(101)
     optimized = _make_model(
@@ -307,8 +433,11 @@ def test_optics_caches_are_not_checkpointed_and_load_clears_them():
     model = _make_model(num_depth_layers=2).eval()
     with torch.no_grad():
         model.psf_bank(use_cache=True)
+        model._psf_frequency_bank(
+            model._cached_psf_bank, (256, 256))
 
     assert model._cached_psf_bank is not None
+    assert model._cached_psf_fft_bank is not None
     assert model._cached_prop1_field_bank is not None
     state = model.state_dict()
     assert all("cached_psf" not in key for key in state)
@@ -318,15 +447,20 @@ def test_optics_caches_are_not_checkpointed_and_load_clears_them():
     assert not result.missing_keys
     assert not result.unexpected_keys
     assert model._cached_psf_bank is None
+    assert model._cached_psf_fft_bank is None
     assert model._cached_prop1_field_bank is None
 
     with torch.no_grad():
         model.psf_bank(use_cache=True)
+        model._psf_frequency_bank(
+            model._cached_psf_bank, (256, 256))
     assert model._cached_psf_bank is not None
+    assert model._cached_psf_fft_bank is not None
     assert model._cached_prop1_field_bank is not None
 
     model._apply(lambda tensor: tensor)
     assert model._cached_psf_bank is None
+    assert model._cached_psf_fft_bank is None
     assert model._cached_prop1_field_bank is None
 
 

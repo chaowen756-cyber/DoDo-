@@ -120,6 +120,7 @@ Stage B 使用同一值。
 - DOE 可训练时，PSF 每个 forward 重新生成，梯度从 loss 经卷积、PSF 强度和传播链回到 `doe1.zernike_coeffs`。
 - DOE 冻结时，PSF bank 自动缓存，用于 Stage B 和推理。
 - Stage A 验证处于无梯度模式，DOE 在整段 validation loop 中不更新，因此同一轮验证只生成一次 detached PSF bank；恢复训练后仍重新生成 live autograd PSF。
+- detached PSF 的频域 bank 也按 FFT 尺寸缓存，验证 batch 不再重复执行 16 组 PSF FFT；可训练 PSF 仍保留实时梯度图。
 - 固定中心点源经过各深度 Prop1 的复场独立缓存。Prop1 距离、波长和网格均冻结，这部分不需要梯度；缓存之后仍批量执行可训练 DOE、Prop3 和 PSF 归一化，DOE 梯度保持不变。
 - 缓存不是 persistent buffer，不写入 checkpoint；`clamp_parameters_()` 会主动清空缓存。
 - 固定传播距离的 padded Fresnel kernel 也按进程惰性缓存，但不注册为 buffer、不写入 checkpoint，并在设备迁移或载入 state dict 时失效重建。
@@ -129,6 +130,14 @@ Stage B 使用同一值。
 `384 x 384` FFT；halo0 的 `255 x 255` 会使用 `256 x 256` FFT。
 只要 FFT 尺寸不小于完整线性卷积支撑，中心裁剪结果在数学上等价，
 差异仅来自浮点 FFT 的舍入顺序。
+
+halo64 训练只把卷积结果中心 `128 x 128` 送入解码网络。此时使用
+overlap-save 直接计算该中心块：所需输入支撑为
+`128 + 128 - 1 = 255`，因此使用 `256 x 256` FFT，而不再先计算
+完整 `256 x 256` 输出所需的 `384 x 384` FFT 再裁剪。输出中心块与
+原完整线性卷积后裁剪在数学上等价。频域混合和逆 FFT 还支持按
+`--dodo_psf_depth_chunk_size` 对深度层分块；默认值 1 保持最低峰值显存，
+可在有显存余量时实测 2 或 4。
 
 ## 7. 启动参数
 
@@ -188,8 +197,10 @@ DODO_PROP1_PADDING_FACTOR=2 \
 - factor=2 保持采样间距并抑制远场周期环绕；
 - 固定距离 Fresnel 核复用与可训练距离禁用缓存；
 - 383→384 next-fast FFT 与最小长度线性卷积的输出等价；
+- halo64 overlap-save 256 FFT 与完整 384 FFT 后中心裁剪的输出、输入梯度和 PSF 梯度等价；
 - 批量 PSF 生成与旧逐深度实现的输出、DOE 梯度等价；
 - Stage A 验证 PSF 复用、DOE 更新失效与训练 live graph 隔离；
+- detached PSF 频域 bank 复用并随 PSF/device/checkpoint 正确失效；
 - Prop1 点源场缓存不进入 checkpoint，并在设备迁移或加载后失效；
 - padded Prop1 生成的 PSF 仍非负、有限、单位能量；
 - 冻结光学缓存；

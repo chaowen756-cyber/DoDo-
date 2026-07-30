@@ -967,6 +967,12 @@ class SnapshotDepthHS(pl.LightningModule):
             dodo_psf_mask_blur_sigma = float(
                 getattr(hparams, 'dodo_psf_mask_blur_sigma', 1.0))
             dodo_psf_boundary = getattr(hparams, 'dodo_psf_boundary', 'linear_zero')
+            dodo_psf_depth_chunk_size = int(
+                getattr(hparams, 'dodo_psf_depth_chunk_size', 1))
+            if dodo_psf_depth_chunk_size < 1:
+                raise ValueError(
+                    'dodo_psf_depth_chunk_size must be >= 1, '
+                    f'got {dodo_psf_depth_chunk_size}')
             dodo_psf_energy_weight = float(
                 getattr(hparams, 'dodo_psf_energy_weight', 0.02))
             dodo_psf_energy_radius = float(
@@ -1152,6 +1158,7 @@ class SnapshotDepthHS(pl.LightningModule):
                 psf_layer_mask_mode=dodo_psf_layer_mask,
                 psf_mask_blur_sigma=dodo_psf_mask_blur_sigma,
                 psf_boundary_mode=dodo_psf_boundary,
+                psf_depth_chunk_size=dodo_psf_depth_chunk_size,
                 doe_basis_mode=dodo_doe_basis_mode,
                 doe_basis_rank=dodo_doe_basis_rank,
                 doe_basis_rank_rtol=dodo_doe_basis_rank_rtol,
@@ -1192,6 +1199,7 @@ class SnapshotDepthHS(pl.LightningModule):
                   f'psf_layer_mask={dodo_psf_layer_mask}, '
                   f'psf_mask_sigma={dodo_psf_mask_blur_sigma:g}, '
                   f'psf_boundary={dodo_psf_boundary}, '
+                  f'psf_depth_chunk_size={dodo_psf_depth_chunk_size}, '
                   f'optical_halo={dodo_optical_halo}px '
                   f'(context={hparams.image_sz + 2 * dodo_optical_halo}px), '
                   f'psf_energy=(weight={dodo_psf_energy_weight:g}, '
@@ -1396,6 +1404,7 @@ class SnapshotDepthHS(pl.LightningModule):
                     'dodo_depth requires metric depth input. '
                     'Dataset must provide depth_metric (metric meters).'
                 )
+            target_height, target_width = images.shape[-2:]
 
             # DepthAwareDoDoForwardModel: input_format='nchw', output_format='nchw'
             # output: (B, 3, H, W)
@@ -1405,6 +1414,7 @@ class SnapshotDepthHS(pl.LightningModule):
                     optical_depth,
                     valid_mask=optical_mask,
                     return_psf=True,
+                    output_size=(target_height, target_width),
                 )
             else:
                 if optical_images is not None:
@@ -1413,7 +1423,6 @@ class SnapshotDepthHS(pl.LightningModule):
                 captimgs = self.camera(images_linear, depth_metric, valid_mask=valid_mask)
                 psf = None
 
-            target_height, target_width = images.shape[-2:]
             captimgs = self._center_crop_to_size(
                 captimgs, target_height, target_width)
 
@@ -2313,6 +2322,15 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--dodo_psf_boundary', type=str, default='linear_zero',
                             choices=['linear_zero', 'circular'],
                             help='PSF convolution boundary model; linear_zero avoids circular FFT wrap-around')
+        parser.add_argument(
+            '--dodo_psf_depth_chunk_size',
+            type=int,
+            default=1,
+            help=(
+                'Number of depth layers processed by each batched inverse FFT; '
+                'larger values reduce launch overhead but use more peak memory'
+            ),
+        )
         parser.add_argument('--dodo_doe_type', type=str, default='Zeros',
                             help='DoDo DOE 类型（Zeros=frozen, New=trainable Zernike）')
         parser.add_argument('--dodo_zernike_mode', type=str, default='legacy12',

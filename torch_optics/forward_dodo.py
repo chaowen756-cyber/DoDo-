@@ -289,6 +289,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         psf_layer_mask_mode: str = "baek_hard",
         psf_mask_blur_sigma: float = 1.0,
         psf_boundary_mode: str = "linear_zero",
+        psf_depth_chunk_size: int = 1,
         prop1_padding_factor: int = 1,
         *,
         doe_basis_mode: str = "legacy_raw12",
@@ -348,6 +349,17 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if psf_mask_blur_sigma < 0:
             raise ValueError(
                 f"psf_mask_blur_sigma must be >= 0, got {psf_mask_blur_sigma}")
+        if isinstance(psf_depth_chunk_size, bool) or not isinstance(
+            psf_depth_chunk_size, int
+        ):
+            raise TypeError(
+                "psf_depth_chunk_size must be an integer >= 1, "
+                f"got {psf_depth_chunk_size!r}"
+            )
+        if psf_depth_chunk_size < 1:
+            raise ValueError(
+                "psf_depth_chunk_size must be >= 1, "
+                f"got {psf_depth_chunk_size}")
         if image_formation_mode == "psf_convolution" and sensor_measurement.lower() != "intensity":
             raise ValueError(
                 "psf_convolution forms an incoherent intensity image and therefore requires "
@@ -362,6 +374,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         self.psf_layer_mask_mode = psf_layer_mask_mode
         self.psf_mask_blur_sigma = psf_mask_blur_sigma
         self.psf_boundary_mode = psf_boundary_mode
+        self.psf_depth_chunk_size = psf_depth_chunk_size
         depth_layering_mode = depth_layering_mode.lower()
         if depth_layering_mode not in _DEPTH_LAYERING_MODES:
             raise ValueError(
@@ -448,6 +461,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # image-formation mode does not change checkpoint state-dict keys.
         self._cached_psf_bank = None
         self._cached_psf_key = None
+        self._cached_psf_fft_bank = None
+        self._cached_psf_fft_key = None
         # The center impulse and Prop1 layers are fixed. Cache their output
         # independently from the trainable DOE-dependent PSF bank.
         self._cached_prop1_field_bank = None
@@ -463,6 +478,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
     def clear_psf_cache(self):
         self._cached_psf_bank = None
         self._cached_psf_key = None
+        self._cached_psf_fft_bank = None
+        self._cached_psf_fft_key = None
 
     def clear_static_optics_cache(self):
         self.clear_psf_cache()
@@ -782,6 +799,39 @@ class DepthAwareDoDoForwardModel(nn.Module):
         return self._generate_psf_bank(
             int(spatial_size[0]), int(spatial_size[1]), torch.device(device), use_cache=use_cache)
 
+    def _psf_frequency_bank(
+        self,
+        psf_bank: torch.Tensor,
+        fft_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        cache_key = (
+            psf_bank.data_ptr(),
+            int(psf_bank._version),
+            psf_bank.device.type,
+            psf_bank.device.index,
+            psf_bank.dtype,
+            tuple(fft_size),
+            self.psf_boundary_mode,
+        )
+        can_cache = not psf_bank.requires_grad
+        if (
+            can_cache
+            and self._cached_psf_fft_key == cache_key
+            and self._cached_psf_fft_bank is not None
+        ):
+            return self._cached_psf_fft_bank
+
+        kernels = psf_bank
+        if self.psf_boundary_mode == "circular":
+            kernels = torch.fft.ifftshift(kernels, dim=(-2, -1))
+        frequency_bank = torch.fft.rfft2(
+            kernels, s=fft_size, dim=(-2, -1))
+        if can_cache:
+            self._cached_psf_fft_bank = frequency_bank.detach()
+            self._cached_psf_fft_key = cache_key
+            return self._cached_psf_fft_bank
+        return frequency_bank
+
     def _sensor_response_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         sensing = self.sensing_unnorm
         if sensing.sensing_mode == "rgb":
@@ -867,8 +917,30 @@ class DepthAwareDoDoForwardModel(nn.Module):
         binner_debug: Optional[dict],
         debug_stages: bool,
         return_psf: bool = False,
+        output_size: Optional[Tuple[int, int]] = None,
     ):
         batch, _, height, width = spectral.shape
+        if output_size is None:
+            output_height, output_width = height, width
+        else:
+            output_height, output_width = map(int, output_size)
+            if (
+                output_height < 1
+                or output_width < 1
+                or output_height > height
+                or output_width > width
+            ):
+                raise ValueError(
+                    "PSF convolution output_size must be positive and no "
+                    f"larger than the {height}x{width} input, got "
+                    f"{output_height}x{output_width}")
+        output_top = (height - output_height) // 2
+        output_left = (width - output_width) // 2
+        output_weights = weights[
+            ...,
+            output_top:output_top + output_height,
+            output_left:output_left + output_width,
+        ]
         # Unlike the coherent whole-field path, this path is already an
         # incoherent intensity model: spectral radiance is convolved directly
         # with normalized intensity PSFs. Do not apply the field-amplitude
@@ -881,26 +953,78 @@ class DepthAwareDoDoForwardModel(nn.Module):
             kernel_size, kernel_size, spectral.device, use_cache=True)
         response = self._sensor_response_matrix(spectral.device, spectral.dtype)
         y_sum = torch.zeros(
-            (batch, response.shape[0], height, width),
+            (batch, response.shape[0], output_height, output_width),
             device=spectral.device,
             dtype=spectral.dtype,
         )
 
         if self.psf_boundary_mode == "linear_zero":
             kernel_height, kernel_width = psf_bank.shape[-2:]
-            full_height = height + kernel_height - 1
-            full_width = width + kernel_width - 1
-            # Any FFT grid at least as large as the full linear-convolution
-            # support is mathematically equivalent. Avoid prime sizes such as
-            # 383x383 (256 scene + 128 PSF - 1) by using a fast 5-smooth grid.
-            fft_size = (
-                _next_fast_fft_length(full_height),
-                _next_fast_fft_length(full_width),
-            )
-            spectral_fft = torch.fft.rfft2(spectral, s=fft_size, dim=(-2, -1))
+            use_overlap_save = (
+                output_height < height or output_width < width)
+            if use_overlap_save:
+                # Only the center output tile enters the decoder. Overlap-save
+                # needs output+kernel-1 samples, reducing halo64 FFTs from
+                # 384x384 to 256x256 without changing that center tile.
+                fft_size = (
+                    _next_fast_fft_length(
+                        output_height + kernel_height - 1),
+                    _next_fast_fft_length(
+                        output_width + kernel_width - 1),
+                )
+                block_top = (
+                    output_top + kernel_height // 2
+                    - (kernel_height - 1)
+                )
+                block_left = (
+                    output_left + kernel_width // 2
+                    - (kernel_width - 1)
+                )
+                source_top = max(block_top, 0)
+                source_left = max(block_left, 0)
+                source_bottom = min(block_top + fft_size[0], height)
+                source_right = min(block_left + fft_size[1], width)
+                spectral_block = spectral[
+                    ...,
+                    source_top:source_bottom,
+                    source_left:source_right,
+                ]
+                pad_top = source_top - block_top
+                pad_left = source_left - block_left
+                pad_bottom = (
+                    fft_size[0] - pad_top - spectral_block.shape[-2])
+                pad_right = (
+                    fft_size[1] - pad_left - spectral_block.shape[-1])
+                spectral_block = F.pad(
+                    spectral_block,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                )
+                spectral_fft = torch.fft.rfft2(
+                    spectral_block, dim=(-2, -1))
+                convolution_crop_top = kernel_height - 1
+                convolution_crop_left = kernel_width - 1
+            else:
+                full_height = height + kernel_height - 1
+                full_width = width + kernel_width - 1
+                # Any FFT grid at least as large as the full linear-convolution
+                # support is mathematically equivalent. Avoid prime sizes such
+                # as 383x383 by using a fast 5-smooth grid.
+                fft_size = (
+                    _next_fast_fft_length(full_height),
+                    _next_fast_fft_length(full_width),
+                )
+                spectral_fft = torch.fft.rfft2(
+                    spectral, s=fft_size, dim=(-2, -1))
+                convolution_crop_top = kernel_height // 2
+                convolution_crop_left = kernel_width // 2
         else:
             fft_size = (height, width)
             spectral_fft = torch.fft.rfft2(spectral, dim=(-2, -1))
+        cached_psf_fft_bank = (
+            self._psf_frequency_bank(psf_bank, fft_size)
+            if not psf_bank.requires_grad
+            else None
+        )
         response_complex = response.to(dtype=spectral_fft.dtype)
 
         stage_diag = [] if debug_stages else None
@@ -917,40 +1041,58 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 _tensor_stats(psf_bank.detach().sum(dim=(-2, -1))),
             ))
 
-        for k in range(self.num_depth_layers):
-            psf_k = psf_bank[k]
-            if self.psf_boundary_mode == "linear_zero":
-                psf_fft = torch.fft.rfft2(psf_k, s=fft_size, dim=(-2, -1))
-                mixed_fft = torch.einsum(
-                    "bcxy,cxy,oc->boxy",
-                    spectral_fft,
-                    psf_fft,
-                    response_complex,
-                )
-                full = torch.fft.irfft2(
-                    mixed_fft, s=fft_size, dim=(-2, -1))
-                start_y = psf_k.shape[-2] // 2
-                start_x = psf_k.shape[-1] // 2
-                blurred_sensor = full[..., start_y:start_y + height, start_x:start_x + width]
+        chunk_size = min(self.psf_depth_chunk_size, self.num_depth_layers)
+        for chunk_start in range(0, self.num_depth_layers, chunk_size):
+            chunk_end = min(
+                chunk_start + chunk_size, self.num_depth_layers)
+            if cached_psf_fft_bank is not None:
+                psf_fft_chunk = cached_psf_fft_bank[
+                    chunk_start:chunk_end]
             else:
-                psf_origin = torch.fft.ifftshift(psf_k, dim=(-2, -1))
-                psf_fft = torch.fft.rfft2(psf_origin, dim=(-2, -1))
-                mixed_fft = torch.einsum(
-                    "bcxy,cxy,oc->boxy",
-                    spectral_fft,
-                    psf_fft,
-                    response_complex,
-                )
-                blurred_sensor = torch.fft.irfft2(
-                    mixed_fft, s=fft_size, dim=(-2, -1))
+                kernels = psf_bank[chunk_start:chunk_end]
+                if self.psf_boundary_mode == "circular":
+                    kernels = torch.fft.ifftshift(
+                        kernels, dim=(-2, -1))
+                psf_fft_chunk = torch.fft.rfft2(
+                    kernels, s=fft_size, dim=(-2, -1))
+            mixed_fft = torch.einsum(
+                "bcxy,kcxy,oc->bkoxy",
+                spectral_fft,
+                psf_fft_chunk,
+                response_complex,
+            )
+            full = torch.fft.irfft2(
+                mixed_fft, s=fft_size, dim=(-2, -1))
+            if self.psf_boundary_mode == "linear_zero":
+                blurred_chunk = full[
+                    ...,
+                    convolution_crop_top:
+                    convolution_crop_top + output_height,
+                    convolution_crop_left:
+                    convolution_crop_left + output_width,
+                ]
+            else:
+                blurred_chunk = full[
+                    ...,
+                    output_top:output_top + output_height,
+                    output_left:output_left + output_width,
+                ]
 
-            # Baek et al. Eq. (3): depth occupancy is applied after each
-            # wavelength-dependent PSF convolution.
-            layered_sensor = blurred_sensor * weights[:, k:k + 1].to(dtype=blurred_sensor.dtype)
-            y_sum = y_sum + layered_sensor
-            if debug_stages and k == 0:
-                stage_diag.append(("blurred_sensor", _tensor_stats(blurred_sensor)))
-                stage_diag.append(("layered_sensor", _tensor_stats(layered_sensor)))
+            # Preserve the historical layer summation order while amortizing
+            # FFT launch overhead across a small depth chunk.
+            for local_index, k in enumerate(range(chunk_start, chunk_end)):
+                blurred_sensor = blurred_chunk[:, local_index]
+                # Baek et al. Eq. (3): depth occupancy is applied after each
+                # wavelength-dependent PSF convolution.
+                layered_sensor = blurred_sensor * output_weights[
+                    :, k:k + 1
+                ].to(dtype=blurred_sensor.dtype)
+                y_sum = y_sum + layered_sensor
+                if debug_stages and k == 0:
+                    stage_diag.append((
+                        "blurred_sensor", _tensor_stats(blurred_sensor)))
+                    stage_diag.append((
+                        "layered_sensor", _tensor_stats(layered_sensor)))
 
         if debug_stages:
             stage_diag.append(("y_sum_before_norm", _tensor_stats_real(y_sum)))
@@ -969,6 +1111,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
         debug_stages: bool = False,
         return_psf: bool = False,
+        output_size: Optional[Tuple[int, int]] = None,
     ):
         spectral, depth, valid_mask = self._prepare_inputs(spectral, depth, valid_mask)
         psf_bank = None
@@ -976,7 +1119,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
             weights, binner_debug = self._psf_depth_weights(
                 depth, valid_mask, return_debug=debug_stages)
             y, psf_bank = self._forward_psf_convolution(
-                spectral, weights, binner_debug, debug_stages, return_psf=True)
+                spectral,
+                weights,
+                binner_debug,
+                debug_stages,
+                return_psf=True,
+                output_size=output_size,
+            )
         else:
             weights, binner_debug = self._current_depth_weights(
                 depth, valid_mask, return_debug=debug_stages)
@@ -1009,6 +1158,7 @@ def Forward_DM_Spiral_Depth(
     psf_layer_mask_mode="baek_hard",
     psf_mask_blur_sigma=1.0,
     psf_boundary_mode="linear_zero",
+    psf_depth_chunk_size=1,
     prop1_padding_factor=1,
     *,
     doe_basis_mode="legacy_raw12",
@@ -1043,6 +1193,7 @@ def Forward_DM_Spiral_Depth(
         psf_layer_mask_mode=psf_layer_mask_mode,
         psf_mask_blur_sigma=psf_mask_blur_sigma,
         psf_boundary_mode=psf_boundary_mode,
+        psf_depth_chunk_size=psf_depth_chunk_size,
         doe_basis_mode=doe_basis_mode,
         doe_basis_rank=doe_basis_rank,
         doe_basis_rank_rtol=doe_basis_rank_rtol,
