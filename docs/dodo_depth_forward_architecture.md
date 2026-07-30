@@ -411,18 +411,31 @@ M(u,v)
 w\in\mathbb{R}^{B\times K\times128\times128}
 \]
 
-每个深度层得到一个 masked spectral field：
+每个深度层先在辐亮度/光强域加权：
 
 \[
-X_k(b,\lambda,u,v)
+I_k(b,\lambda,u,v)
 =
 X(b,\lambda,u,v)\,w_k(b,u,v)
 \]
 
+相干传播需要的是场振幅，因此再转换为初始复场：
+
+\[
+U_k^{(0)}(b,\lambda,u,v)
+=
+\sqrt{\max(I_k(b,\lambda,u,v),0)}
+\]
+
+这样 \(\left|U_k^{(0)}\right|^2=I_k=Xw_k\)。尤其在 soft
+diopter 下，必须先乘权重再开平方；否则把 \(Xw_k\) 直接当场振幅会使
+传感器光强错误地变成 \(X^2w_k^2\)。
+
 形状：
 
 \[
-X_k\in\mathbb{R}^{B\times25\times128\times128}
+I_k,\ U_k^{(0)}
+\in\mathbb{R}^{B\times25\times128\times128}
 \]
 
 ### 7.2 Fresnel 传播层
@@ -440,6 +453,21 @@ X_k\in\mathbb{R}^{B\times25\times128\times128}
 \[
 \Delta x=\frac{L}{M_p}
 \]
+
+`prop1_padding_factor=p` 时，Prop1 在传播前做中心零填充，并同时扩展
+采样数和物理计算窗：
+
+\[
+M_p^{\mathrm{work}}=pM_p,\qquad
+L^{\mathrm{work}}=pL
+\]
+
+因此 \(\Delta x=L/M_p=L^{\mathrm{work}}/M_p^{\mathrm{work}}\) 保持不变。
+传播后再中心裁回 \(M_p\times M_p\)。这种等采样 padding 用更大的物理
+计算窗抑制 FFT 周期边界的远场环绕混叠；只作用于 Prop1，Prop2 和
+Prop3 保持 `padding_factor=1`。核心、旧 checkpoint 和通用 PSF
+训练入口的默认值均为 1；新 padding 实验应显式设置 2
+（128/0.01 m 扩为 256/0.02 m），并在 Stage A/Stage B 使用同一值。
 
 频率网格：
 
@@ -538,7 +566,7 @@ U_{k,\lambda}^{(1)}
 =
 \mathcal{P}_{\lambda,z_k}
 \left(
-X_{k,\lambda}
+U_{k,\lambda}^{(0)}
 \right)
 \]
 
@@ -604,11 +632,11 @@ U_{k,\lambda}^{(4)}
 
 代码中的固定传播参数：
 
-| stage | `L` | `z` |
-|---|---:|---:|
-| `prop1_layers[k]` | `0.01` | \(z_k\) |
-| `prop2` | `0.006` | `0.05` |
-| `prop3` | `0.0048` | `0.01` |
+| stage | 原始 `M/L` | 计算窗 | `z` |
+|---|---:|---:|---:|
+| `prop1_layers[k]` | `128 / 0.01 m` | factor=2 时 `256 / 0.02 m`，再中心裁回 128 | \(z_k\) |
+| `prop2` | `128 / 0.006 m` | 不填充 | `0.05` |
+| `prop3` | `128 / 0.0048 m` | 不填充 | `0.01` |
 
 ### 7.5 Sensor 测量
 
@@ -1343,6 +1371,7 @@ M_{buv}
 | `--dodo_use_second_doe` | 走 DOE2，DOE2 是固定 Spiral |
 | `--dodo_sensor_measurement intensity` | sensor 使用 \(|U|^2\) |
 | `--dodo_sensor_measurement amplitude` | sensor 使用 \(|U|\) |
+| `--dodo_prop1_padding_factor 2` | Prop1 保持采样间距，将计算窗扩大 2 倍后中心裁剪 |
 | `--dodo_forward_norm fixed_scale` | 用固定 \(s_Y\) 缩放光学输出 |
 | `--dodo_forward_norm none` | 直接把 \(y_{\mathrm{sum}}\) 输入 decoder |
 | `--dodo_measurement_norm none` | decoder 前不再做额外归一化 |
@@ -1363,7 +1392,8 @@ M_{buv}
 | DataLoader | \(Z,D,M\) | \([B,128,128]\) |
 | mask HS input | \(X\odot M\) | \([B,25,128,128]\) |
 | soft diopter weights | \(w\) | \([B,16,128,128]\) |
-| per-layer spectral | \(X_k\) | \([B,25,128,128]\) |
+| per-layer radiance | \(I_k=Xw_k\) | \([B,25,128,128]\) |
+| per-layer field amplitude | \(U_k^{(0)}=\sqrt{\max(I_k,0)}\) | \([B,25,128,128]\) |
 | prop/DOE chain | \(U_k\) | \([B,25,128,128]\) complex |
 | sensor per layer | \(y_k\) | \([B,3,128,128]\) |
 | depth sum | \(y_{\mathrm{sum}}\) | \([B,3,128,128]\) |
@@ -1382,7 +1412,9 @@ M_{buv}
 \[
 X_{\mathrm{norm}}
 \xrightarrow{\text{metric depth + soft diopter}}
-\{X_k\}_{k=1}^{K}
+\{I_k=Xw_k\}_{k=1}^{K}
+\xrightarrow{\text{radiance to field amplitude}}
+\{U_k^{(0)}=\sqrt{\max(I_k,0)}\}_{k=1}^{K}
 \xrightarrow{\text{Fresnel + DOE + sensor}}
 \{y_k\}_{k=1}^{K}
 \xrightarrow{\sum_k}

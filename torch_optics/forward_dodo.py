@@ -46,6 +46,11 @@ def _normalize_once(y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return y / (y_max + eps)
 
 
+def _radiance_to_field_amplitude(radiance: torch.Tensor) -> torch.Tensor:
+    """Convert non-negative spectral radiance/intensity to field amplitude."""
+    return torch.sqrt(torch.clamp(radiance, min=0.0))
+
+
 _VALID_FORMATS = {"nchw", "nhwc"}
 _DEPTH_LAYERING_MODES = {"hard_depth", "hard_meter", "soft_diopter"}
 _IMAGE_FORMATION_MODES = {"whole_field", "psf_convolution"}
@@ -268,9 +273,22 @@ class DepthAwareDoDoForwardModel(nn.Module):
         psf_layer_mask_mode: str = "baek_hard",
         psf_mask_blur_sigma: float = 1.0,
         psf_boundary_mode: str = "linear_zero",
+        prop1_padding_factor: int = 1,
     ):
         super().__init__()
         self.skip_prop2 = bool(skip_prop2)
+        if isinstance(prop1_padding_factor, bool) or not isinstance(
+            prop1_padding_factor, int
+        ):
+            raise TypeError(
+                "prop1_padding_factor must be an integer >= 1, "
+                f"got {prop1_padding_factor!r}"
+            )
+        if prop1_padding_factor < 1:
+            raise ValueError(
+                f"prop1_padding_factor must be >= 1, got {prop1_padding_factor}"
+            )
+        self.prop1_padding_factor = prop1_padding_factor
         if depth_min >= depth_max:
             raise ValueError(f"depth_min ({depth_min}) must be < depth_max ({depth_max})")
         if num_depth_layers < 1:
@@ -356,7 +374,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
         # One prop1 per depth bin (fixed zi = bin center)
         self.prop1_layers = nn.ModuleList([
-            PropagationLayer(Mp=minput, L=0.01, zi=float(z_centers[k]), trainable_z=False)
+            PropagationLayer(
+                Mp=minput,
+                L=0.01,
+                zi=float(z_centers[k]),
+                trainable_z=False,
+                padding_factor=self.prop1_padding_factor,
+            )
             for k in range(num_depth_layers)
         ])
 
@@ -690,7 +714,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
         for k in range(self.num_depth_layers):
             layer_weight = weights[:, k:k + 1].to(dtype=spectral.dtype)
-            x_k = spectral * layer_weight
+            # Dataset values are spectral radiance/intensity, while coherent
+            # propagation operates on field amplitude. Apply the depth weight
+            # in the intensity domain first, then take sqrt, so
+            # |x_k|^2 = spectral * layer_weight. This is especially important
+            # for soft depth weights, which would otherwise be squared by the
+            # intensity sensor.
+            layer_radiance = spectral * layer_weight
+            x_k = _radiance_to_field_amplitude(layer_radiance)
             if debug_stages and k == 0:
                 stage_diag.append(("input_masked", _tensor_stats(x_k)))
 
@@ -734,6 +765,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
         return_psf: bool = False,
     ):
         batch, _, height, width = spectral.shape
+        # Unlike the coherent whole-field path, this path is already an
+        # incoherent intensity model: spectral radiance is convolved directly
+        # with normalized intensity PSFs. Do not apply the field-amplitude
+        # square root here.
         # The optical PSF sampling grid stays fixed at the calibrated 128x128
         # sensor grid. Scene tiles may be larger (for example, a 256x256 tile
         # with a 64-pixel halo) and are convolved with this fixed kernel.
@@ -861,6 +896,7 @@ def Forward_DM_Spiral_Depth(
     psf_layer_mask_mode="baek_hard",
     psf_mask_blur_sigma=1.0,
     psf_boundary_mode="linear_zero",
+    prop1_padding_factor=1,
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=depth_min,
@@ -882,6 +918,7 @@ def Forward_DM_Spiral_Depth(
         soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
         sensor_measurement=sensor_measurement,
         skip_prop2=skip_prop2,
+        prop1_padding_factor=prop1_padding_factor,
         image_formation_mode=image_formation_mode,
         psf_layer_mask_mode=psf_layer_mask_mode,
         psf_mask_blur_sigma=psf_mask_blur_sigma,

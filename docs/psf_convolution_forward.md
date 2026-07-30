@@ -40,6 +40,12 @@ J[c] = sum_lambda response[c, lambda]
        * sum_k M[k] * convolution(I[lambda], P[k, lambda]) + noise
 ```
 
+这里的 `I` 是输入的高光谱辐亮度/光强，`P` 是归一化强度 PSF，
+所以 PSF 路径直接做强度域线性卷积，不对场景 `I` 开平方。开平方
+`sqrt(I * depth_weight)` 只属于 `whole_field` 相干整场传播的
+“辐亮度转场振幅”步骤；若在 PSF 路径重复开平方，会破坏
+`J(aI_1+bI_2)=aJ(I_1)+bJ(I_2)` 的非相干成像线性。
+
 深度 mask 在卷积之后相乘，与 Baek et al. 主论文式 (3) 一致。实现先在频域把波长维按传感器响应压缩成 3 个 RGB 通道，再执行逆 FFT，从而避免构造 `[B,K,25,H,W]` 中间张量。
 
 ## 3. 深度 mask
@@ -56,7 +62,24 @@ J[c] = sum_lambda response[c, lambda]
 
 当前 Number18 配置仍使用 16 个逆深度均匀层，以保持 decoder 深度概率通道不变。若要复现论文的 7 个深度层，应作为单独实验设置 `dodo_depth_layers=7` 和 `n_depths=7`。
 
-## 4. 卷积边界
+## 4. Prop1 等采样 padding
+
+PSF 的中心点源传播可通过：
+
+```text
+--dodo_prop1_padding_factor 2
+```
+
+把每个 `prop1[k]` 的计算网格从 `128 / 0.01 m` 扩为
+`256 / 0.02 m`，传播后中心裁回 128。采样数 \(N\) 与物理窗 \(L\)
+同倍扩大，因此像素间距 \(\Delta x=L/N\) 不变，同时更大的计算窗会
+抑制 Prop1 远场传播的周期环绕混叠。Prop2/Prop3 不做这项 padding。
+
+核心接口、旧 checkpoint 和通用 PSF 训练脚本均默认 factor=1，以保持
+原光学前向。新 padding 实验必须显式设置 factor=2，并确保 Stage A 与
+Stage B 使用同一值。
+
+## 5. 卷积边界
 
 默认 `--dodo_psf_boundary linear_zero`：
 
@@ -67,13 +90,14 @@ J[c] = sum_lambda response[c, lambda]
 
 `circular` 仅保留作诊断和速度对照，不建议作为正式物理模型。
 
-## 5. PSF 缓存与梯度
+## 6. PSF 缓存与梯度
 
 - DOE 可训练时，PSF 每个 forward 重新生成，梯度从 loss 经卷积、PSF 强度和传播链回到 `doe1.zernike_coeffs`。
 - DOE 冻结时，PSF bank 自动缓存，用于 Stage B 和推理。
 - 缓存不是 persistent buffer，不写入 checkpoint；`clamp_parameters_()` 会主动清空缓存。
+- 固定传播距离的 padded Fresnel kernel 也按进程惰性缓存，但不注册为 buffer、不写入 checkpoint，并在设备迁移或载入 state dict 时失效重建。
 
-## 6. 启动参数
+## 7. 启动参数
 
 正式 PSF 卷积实验至少需要：
 
@@ -84,18 +108,20 @@ J[c] = sum_lambda response[c, lambda]
 --dodo_psf_layer_mask baek_hard
 --dodo_psf_mask_blur_sigma 1.0
 --dodo_psf_boundary linear_zero
+--dodo_prop1_padding_factor 2
 --dodo_sensor_measurement intensity
 ```
 
 可直接使用：
 
 ```bash
-bash scripts/run_number18_baek_balanced.sh stage-a-combined
+DODO_PROP1_PADDING_FACTOR=2 \
+  bash scripts/run_number18_baek_balanced.sh stage-a-combined
 ```
 
 新实验目录统一带 `psfconv_` 前缀，避免覆盖原 Number18 结果。
 
-## 7. 归一化注意事项
+## 8. 归一化注意事项
 
 旧 whole-field forward 的 `dodo_forward_scale` 不应复用于 PSF 卷积。建议先使用：
 
@@ -106,11 +132,16 @@ bash scripts/run_number18_baek_balanced.sh stage-a-combined
 
 统计新测量分布后再标定新的 fixed scale。旧 decoder checkpoint 虽然结构上可加载，但其训练测量分布不同，正式 PSF 卷积实验应重新训练 decoder。
 
-## 8. 验证
+## 9. 验证
 
-自动化测试位于 `test/test_dodo_psf_convolution.py`，覆盖：
+自动化测试位于 `test/test_dodo_psf_convolution.py`、
+`test/test_dodo_radiance_field.py` 和
+`test/test_propagation_padding.py`，覆盖：
 
 - PSF 非负、有限和单位能量；
+- factor=1 与旧传播公式完全一致；
+- factor=2 保持采样间距并抑制远场周期环绕；
+- padded Prop1 生成的 PSF 仍非负、有限、单位能量；
 - 冻结光学缓存；
 - Gaussian depth occupancy 归一化；
 - FFT 中心对齐；

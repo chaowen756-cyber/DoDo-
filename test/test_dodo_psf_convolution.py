@@ -1,10 +1,14 @@
+import inspect
 import types
 
 import pytest
 import torch
 
 from torch_optics.doe import DOELayer, DOEFreeLayer
-from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
+from torch_optics.forward_dodo import (
+    DepthAwareDoDoForwardModel,
+    Forward_DM_Spiral_Depth,
+)
 from util.psf_regularization import psf_energy_concentration_loss
 from util.psf_regularization import sensor_weighted_spectral_psf_separation_loss
 
@@ -23,6 +27,7 @@ def _make_model(
     free=False,
     n_terms=150,
     zernike_basis_path=None,
+    prop1_padding_factor=1,
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=0.4,
@@ -43,6 +48,7 @@ def _make_model(
         depth_layering_mode="soft_diopter",
         sensor_measurement="intensity",
         skip_prop2=True,
+        prop1_padding_factor=prop1_padding_factor,
         image_formation_mode=image_formation_mode,
         psf_layer_mask_mode=psf_layer_mask_mode,
         psf_mask_blur_sigma=psf_mask_blur_sigma,
@@ -105,6 +111,15 @@ def test_image_formation_mode_does_not_change_state_dict_keys():
     assert set(whole_field.state_dict()) == set(psf_convolution.state_dict())
 
 
+def test_prop1_padding_parameter_preserves_existing_positional_api():
+    for model_factory in (
+        DepthAwareDoDoForwardModel,
+        Forward_DM_Spiral_Depth,
+    ):
+        parameters = list(inspect.signature(model_factory).parameters)
+        assert parameters[-1] == "prop1_padding_factor"
+
+
 def test_psf_bank_is_finite_nonnegative_normalized_and_cached(frozen_psf_model):
     with torch.no_grad():
         first = frozen_psf_model.psf_bank(use_cache=True)
@@ -120,6 +135,27 @@ def test_psf_bank_is_finite_nonnegative_normalized_and_cached(frozen_psf_model):
         rtol=0,
     )
     assert first.data_ptr() == second.data_ptr()
+
+
+def test_prop1_padding_generates_finite_normalized_intensity_psf():
+    model = _make_model(prop1_padding_factor=2).eval()
+
+    with torch.no_grad():
+        psf = model.psf_bank(use_cache=False)
+
+    assert model.prop1_layers[0].padding_factor == 2
+    assert model.prop1_layers[0].work_Mp == 256
+    assert model.prop1_layers[0].work_L == 0.02
+    assert model.prop2.padding_factor == 1
+    assert model.prop3.padding_factor == 1
+    assert torch.isfinite(psf).all()
+    assert torch.all(psf >= 0)
+    torch.testing.assert_close(
+        psf.sum(dim=(-2, -1)),
+        torch.ones((1, 25)),
+        atol=2e-6,
+        rtol=0,
+    )
 
 
 def test_baek_depth_masks_sum_to_validity_after_gaussian_blur():

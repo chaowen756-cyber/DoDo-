@@ -34,6 +34,9 @@ DODO_PSF_ENERGY_WARMUP_EPOCHS="${DODO_PSF_ENERGY_WARMUP_EPOCHS:-0}"
 DODO_PSF_ENERGY_START_EPOCH="${DODO_PSF_ENERGY_START_EPOCH:-0}"
 DODO_PSF_ENERGY_TIGHTENING_START_EPOCH="${DODO_PSF_ENERGY_TIGHTENING_START_EPOCH:-0}"
 DODO_OPTICAL_HALO="${DODO_OPTICAL_HALO:-64}"
+# Keep historical runs reproducible; set 2 explicitly for new padded runs and
+# use the same value for their Stage A and Stage B.
+DODO_PROP1_PADDING_FACTOR="${DODO_PROP1_PADDING_FACTOR:-1}"
 DODO_PSF_MTF_WEIGHT="${DODO_PSF_MTF_WEIGHT:-0.25}"
 DODO_PSF_MTF_START_EPOCH="${DODO_PSF_MTF_START_EPOCH:-0}"
 DODO_PSF_MTF_WARMUP_EPOCHS="${DODO_PSF_MTF_WARMUP_EPOCHS:-0}"
@@ -230,6 +233,7 @@ run_training() {
     --max_depth 2.0 \
     --depth_layering_mode soft_diopter \
     --dodo_depth_layers 16 \
+    --dodo_prop1_padding_factor "${DODO_PROP1_PADDING_FACTOR}" \
     --n_depths 16 \
     --soft_diopter_eps 1e-8 \
     --soft_diopter_bandwidth_scale 1.0 \

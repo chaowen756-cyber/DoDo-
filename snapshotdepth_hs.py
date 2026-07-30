@@ -921,6 +921,16 @@ class SnapshotDepthHS(pl.LightningModule):
             dodo_forward_scale = float(getattr(hparams, 'dodo_forward_scale', 1.0))
             dodo_sensing_mode = getattr(hparams, 'dodo_sensing_mode', 'rgb')
             dodo_skip_prop2 = bool(getattr(hparams, 'dodo_skip_prop2', False))
+            # Historical checkpoints do not contain this field and must retain
+            # their original unpadded optical forward when loaded by new code.
+            dodo_prop1_padding_factor = int(
+                getattr(hparams, 'dodo_prop1_padding_factor', 1)
+            )
+            if dodo_prop1_padding_factor < 1:
+                raise ValueError(
+                    'dodo_prop1_padding_factor must be >= 1, '
+                    f'got {dodo_prop1_padding_factor}'
+                )
             depth_layering_mode = getattr(hparams, 'depth_layering_mode', 'hard_depth')
             soft_diopter_eps = getattr(hparams, 'soft_diopter_eps', 1e-8)
             soft_diopter_bandwidth_scale = getattr(hparams, 'soft_diopter_bandwidth_scale', 1.0)
@@ -1110,6 +1120,7 @@ class SnapshotDepthHS(pl.LightningModule):
                 soft_diopter_bandwidth_scale=soft_diopter_bandwidth_scale,
                 sensor_measurement=dodo_sensor_measurement,
                 skip_prop2=dodo_skip_prop2,
+                prop1_padding_factor=dodo_prop1_padding_factor,
                 image_formation_mode=dodo_image_formation,
                 psf_layer_mask_mode=dodo_psf_layer_mask,
                 psf_mask_blur_sigma=dodo_psf_mask_blur_sigma,
@@ -1129,6 +1140,9 @@ class SnapshotDepthHS(pl.LightningModule):
                   f'forward_norm={dodo_forward_norm}, '
                   f'forward_scale={dodo_forward_scale:g}, '
                   f'skip_prop2={dodo_skip_prop2}, '
+                  f'prop1_padding_factor={dodo_prop1_padding_factor} '
+                  f'(work_grid={self.camera.prop1_layers[0].work_Mp}, '
+                  f'work_L={self.camera.prop1_layers[0].work_L:g}m), '
                   f'image_formation={dodo_image_formation}, '
                   f'depth_layering={depth_layering_mode}, '
                   f'psf_layer_mask={dodo_psf_layer_mask}, '
@@ -2226,6 +2240,15 @@ class SnapshotDepthHS(pl.LightningModule):
                             help='光学测量输出通道数；None=自动推断')
         parser.add_argument('--dodo_depth_layers', type=int, default=None,
                             help='DoDo 深度分层数；None=使用 n_depths')
+        parser.add_argument(
+            '--dodo_prop1_padding_factor',
+            type=int,
+            default=1,
+            help=(
+                'Prop1 保持物理像素间距的计算窗倍数；'
+                '2 表示将 128/0.01m 扩为 256/0.02m 后中心裁剪'
+            ),
+        )
         parser.add_argument('--depth_layering_mode', type=str, default='soft_diopter',
                             choices=['hard_depth', 'hard_meter', 'soft_diopter'],
                             help='DoDo depth layering mode')
