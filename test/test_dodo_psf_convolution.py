@@ -8,6 +8,7 @@ from torch_optics.doe import DOELayer, DOEFreeLayer
 from torch_optics.forward_dodo import (
     DepthAwareDoDoForwardModel,
     Forward_DM_Spiral_Depth,
+    _next_fast_fft_length,
 )
 from util.psf_regularization import psf_energy_concentration_loss
 from util.psf_regularization import sensor_weighted_spectral_psf_separation_loss
@@ -66,6 +67,22 @@ def _make_model(
         doe_coeff_norm_limit=doe_coeff_norm_limit,
         doe_init_coeff_norm=doe_init_coeff_norm,
     )
+
+
+def _legacy_loop_psf_bank(model):
+    height = width = model.prop1_layers[0].Mp
+    bands = int(model.prop3.wave_lengths.numel())
+    device = model.z_centers.device
+    impulse = torch.zeros((1, bands, height, width), device=device)
+    impulse[:, :, height // 2, width // 2] = 1.0
+    psfs = []
+    for depth_index in range(model.num_depth_layers):
+        sensor_field = model._propagate_to_sensor(impulse, depth_index)
+        psf = sensor_field.abs().to(torch.float32).square()
+        psfs.append(
+            (psf / psf.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8))[0]
+        )
+    return torch.stack(psfs, dim=0)
 
 
 def test_default_zernike_mode_remains_legacy_12_term_mat_basis():
@@ -201,6 +218,116 @@ def test_psf_bank_is_finite_nonnegative_normalized_and_cached(frozen_psf_model):
         rtol=0,
     )
     assert first.data_ptr() == second.data_ptr()
+
+
+def test_next_fast_fft_length_avoids_prime_linear_convolution_grids():
+    assert _next_fast_fft_length(255) == 256
+    assert _next_fast_fft_length(383) == 384
+    assert _next_fast_fft_length(384) == 384
+    with pytest.raises(ValueError, match="must be >= 1"):
+        _next_fast_fft_length(0)
+
+
+def test_batched_psf_generation_matches_legacy_loop_and_doe_gradient():
+    torch.manual_seed(101)
+    optimized = _make_model(
+        train_c=True,
+        doe_type_a="New",
+        num_depth_layers=2,
+        doe_basis_mode="orthogonal_rms",
+    )
+    reference = _make_model(
+        train_c=True,
+        doe_type_a="New",
+        num_depth_layers=2,
+        doe_basis_mode="orthogonal_rms",
+    )
+    reference.load_state_dict(optimized.state_dict(), strict=True)
+
+    optimized_psf = optimized.psf_bank(use_cache=False)
+    reference_psf = _legacy_loop_psf_bank(reference)
+    torch.testing.assert_close(
+        optimized_psf,
+        reference_psf,
+        atol=2e-7,
+        rtol=2e-5,
+    )
+
+    probe = torch.linspace(
+        0.25,
+        1.25,
+        optimized_psf.numel(),
+        dtype=optimized_psf.dtype,
+    ).reshape_as(optimized_psf)
+    (optimized_psf * probe).mean().backward()
+    (reference_psf * probe).mean().backward()
+    torch.testing.assert_close(
+        optimized.doe1.zernike_coeffs.grad,
+        reference.doe1.zernike_coeffs.grad,
+        atol=2e-8,
+        rtol=2e-4,
+    )
+
+
+def test_trainable_doe_reuses_validation_psf_but_training_gets_live_graph():
+    torch.manual_seed(103)
+    model = _make_model(
+        train_c=True,
+        doe_type_a="New",
+        num_depth_layers=2,
+        doe_basis_mode="orthogonal_rms",
+    )
+
+    with torch.no_grad():
+        first = model.psf_bank(use_cache=True)
+        prop1_fields = model._cached_prop1_field_bank
+        second = model.psf_bank(use_cache=True)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert not first.requires_grad
+    assert prop1_fields is not None
+    assert model._cached_prop1_field_bank.data_ptr() == prop1_fields.data_ptr()
+
+    with torch.no_grad():
+        model.doe1.zernike_coeffs.add_(0.01)
+        updated = model.psf_bank(use_cache=True)
+    assert updated.data_ptr() != first.data_ptr()
+    assert not torch.equal(updated, first)
+    assert model._cached_prop1_field_bank.data_ptr() == prop1_fields.data_ptr()
+
+    live = model.psf_bank(use_cache=True)
+    assert live.requires_grad
+    assert live.data_ptr() != first.data_ptr()
+    live[..., 64, 64].sum().backward()
+    assert model.doe1.zernike_coeffs.grad is not None
+    assert torch.isfinite(model.doe1.zernike_coeffs.grad).all()
+
+
+def test_optics_caches_are_not_checkpointed_and_load_clears_them():
+    model = _make_model(num_depth_layers=2).eval()
+    with torch.no_grad():
+        model.psf_bank(use_cache=True)
+
+    assert model._cached_psf_bank is not None
+    assert model._cached_prop1_field_bank is not None
+    state = model.state_dict()
+    assert all("cached_psf" not in key for key in state)
+    assert all("cached_prop1" not in key for key in state)
+
+    result = model.load_state_dict(state, strict=True)
+    assert not result.missing_keys
+    assert not result.unexpected_keys
+    assert model._cached_psf_bank is None
+    assert model._cached_prop1_field_bank is None
+
+    with torch.no_grad():
+        model.psf_bank(use_cache=True)
+    assert model._cached_psf_bank is not None
+    assert model._cached_prop1_field_bank is not None
+
+    model._apply(lambda tensor: tensor)
+    assert model._cached_psf_bank is None
+    assert model._cached_prop1_field_bank is None
 
 
 def test_prop1_padding_generates_finite_normalized_intensity_psf():

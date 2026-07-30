@@ -119,8 +119,16 @@ Stage B 使用同一值。
 
 - DOE 可训练时，PSF 每个 forward 重新生成，梯度从 loss 经卷积、PSF 强度和传播链回到 `doe1.zernike_coeffs`。
 - DOE 冻结时，PSF bank 自动缓存，用于 Stage B 和推理。
+- Stage A 验证处于无梯度模式，DOE 在整段 validation loop 中不更新，因此同一轮验证只生成一次 detached PSF bank；恢复训练后仍重新生成 live autograd PSF。
+- 固定中心点源经过各深度 Prop1 的复场独立缓存。Prop1 距离、波长和网格均冻结，这部分不需要梯度；缓存之后仍批量执行可训练 DOE、Prop3 和 PSF 归一化，DOE 梯度保持不变。
 - 缓存不是 persistent buffer，不写入 checkpoint；`clamp_parameters_()` 会主动清空缓存。
 - 固定传播距离的 padded Fresnel kernel 也按进程惰性缓存，但不注册为 buffer、不写入 checkpoint，并在设备迁移或载入 state dict 时失效重建。
+
+线性卷积仍使用零填充 FFT，但工作尺寸会向上取最近的 5-smooth
+`next-fast` 长度。例如 halo64 的 `256 + 128 - 1 = 383` 会使用
+`384 x 384` FFT；halo0 的 `255 x 255` 会使用 `256 x 256` FFT。
+只要 FFT 尺寸不小于完整线性卷积支撑，中心裁剪结果在数学上等价，
+差异仅来自浮点 FFT 的舍入顺序。
 
 ## 7. 启动参数
 
@@ -179,6 +187,10 @@ DODO_PROP1_PADDING_FACTOR=2 \
 - factor=1 与旧传播公式完全一致；
 - factor=2 保持采样间距并抑制远场周期环绕；
 - 固定距离 Fresnel 核复用与可训练距离禁用缓存；
+- 383→384 next-fast FFT 与最小长度线性卷积的输出等价；
+- 批量 PSF 生成与旧逐深度实现的输出、DOE 梯度等价；
+- Stage A 验证 PSF 复用、DOE 更新失效与训练 live graph 隔离；
+- Prop1 点源场缓存不进入 checkpoint，并在设备迁移或加载后失效；
 - padded Prop1 生成的 PSF 仍非负、有限、单位能量；
 - 冻结光学缓存；
 - Gaussian depth occupancy 归一化；

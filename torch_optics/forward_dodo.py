@@ -58,6 +58,22 @@ _PSF_LAYER_MASK_MODES = {"current", "baek_hard"}
 _PSF_BOUNDARY_MODES = {"linear_zero", "circular"}
 
 
+def _next_fast_fft_length(target: int) -> int:
+    """Return the smallest 5-smooth FFT length greater than or equal to target."""
+    target = int(target)
+    if target < 1:
+        raise ValueError(f"FFT length must be >= 1, got {target}")
+    candidate = target
+    while True:
+        remainder = candidate
+        for factor in (2, 3, 5):
+            while remainder % factor == 0:
+                remainder //= factor
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
 class SoftDiopterBinner(nn.Module):
     def __init__(
         self,
@@ -432,6 +448,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # image-formation mode does not change checkpoint state-dict keys.
         self._cached_psf_bank = None
         self._cached_psf_key = None
+        # The center impulse and Prop1 layers are fixed. Cache their output
+        # independently from the trainable DOE-dependent PSF bank.
+        self._cached_prop1_field_bank = None
+        self._cached_prop1_field_key = None
 
     def clamp_parameters_(self):
         if hasattr(self.doe1, "clamp_parameters_"):
@@ -444,8 +464,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
         self._cached_psf_bank = None
         self._cached_psf_key = None
 
-    def _apply(self, fn):
+    def clear_static_optics_cache(self):
         self.clear_psf_cache()
+        self._cached_prop1_field_bank = None
+        self._cached_prop1_field_key = None
+
+    def _apply(self, fn):
+        self.clear_static_optics_cache()
         return super()._apply(fn)
 
     def _load_from_state_dict(
@@ -458,7 +483,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
-        self.clear_psf_cache()
+        self.clear_static_optics_cache()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -468,7 +493,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             unexpected_keys,
             error_msgs,
         )
-        self.clear_psf_cache()
+        self.clear_static_optics_cache()
 
     def _to_nchw(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_format == "nhwc":
@@ -640,6 +665,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
     def _propagate_to_sensor(self, field: torch.Tensor, depth_index: int) -> torch.Tensor:
         field = self.prop1_layers[depth_index](field)
+        return self._propagate_after_prop1(field)
+
+    def _propagate_after_prop1(self, field: torch.Tensor) -> torch.Tensor:
         field = self.doe1(field)
         if not self.skip_prop2:
             field = self.prop2(field)
@@ -649,6 +677,54 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
     def _optics_are_frozen(self) -> bool:
         return not any(parameter.requires_grad for parameter in self.parameters())
+
+    def _optics_parameter_signature(self):
+        return tuple(
+            (parameter.data_ptr(), int(parameter._version))
+            for parameter in self.parameters()
+        )
+
+    def _prop1_impulse_field_bank(
+        self,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        cache_key = (device.type, device.index, height, width)
+        prop1_is_frozen = not any(
+            parameter.requires_grad
+            for layer in self.prop1_layers
+            for parameter in layer.parameters()
+        )
+        if (
+            prop1_is_frozen
+            and self._cached_prop1_field_key == cache_key
+            and self._cached_prop1_field_bank is not None
+        ):
+            return self._cached_prop1_field_bank
+
+        bands = int(self.prop3.wave_lengths.numel())
+        impulse = torch.zeros(
+            (1, bands, height, width),
+            device=device,
+            dtype=torch.float32,
+        )
+        impulse[:, :, height // 2, width // 2] = 1.0
+
+        if prop1_is_frozen:
+            with torch.no_grad():
+                field_bank = torch.cat(
+                    [layer(impulse) for layer in self.prop1_layers],
+                    dim=0,
+                ).detach()
+            self._cached_prop1_field_bank = field_bank
+            self._cached_prop1_field_key = cache_key
+            return self._cached_prop1_field_bank
+
+        return torch.cat(
+            [layer(impulse) for layer in self.prop1_layers],
+            dim=0,
+        )
 
     def _generate_psf_bank(
         self,
@@ -663,22 +739,31 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 f"PSF convolution expects spatial size {expected_size}x{expected_size}, "
                 f"got {height}x{width}")
 
-        cache_key = (device.type, device.index, height, width)
-        can_cache = bool(use_cache and self._optics_are_frozen())
+        cache_key = (
+            device.type,
+            device.index,
+            height,
+            width,
+            self._optics_parameter_signature(),
+        )
+        # Stage-A validation runs without gradients while DOE parameters remain
+        # unchanged. Reuse one detached PSF bank across validation batches;
+        # training forwards still rebuild a live autograd graph.
+        can_cache = bool(
+            use_cache
+            and (self._optics_are_frozen() or not torch.is_grad_enabled())
+        )
         if can_cache and self._cached_psf_key == cache_key and self._cached_psf_bank is not None:
             return self._cached_psf_bank
 
-        bands = int(self.prop3.wave_lengths.numel())
-        impulse = torch.zeros((1, bands, height, width), device=device, dtype=torch.float32)
-        impulse[:, :, height // 2, width // 2] = 1.0
-
-        psfs = []
-        for depth_index in range(self.num_depth_layers):
-            sensor_field = self._propagate_to_sensor(impulse, depth_index)
-            psf = torch.abs(sensor_field).to(torch.float32) ** 2
-            psf = psf / psf.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
-            psfs.append(psf.squeeze(0))
-        psf_bank = torch.stack(psfs, dim=0)
+        # Depth is represented as the batch dimension, so DOE phase generation
+        # and all downstream propagations execute once as batched operations.
+        prop1_fields = self._prop1_impulse_field_bank(height, width, device)
+        sensor_field = self._propagate_after_prop1(prop1_fields)
+        psf_bank = torch.abs(sensor_field).to(torch.float32) ** 2
+        psf_bank = psf_bank / psf_bank.sum(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(1e-8)
 
         if can_cache:
             self._cached_psf_bank = psf_bank.detach()
@@ -803,11 +888,20 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
         if self.psf_boundary_mode == "linear_zero":
             kernel_height, kernel_width = psf_bank.shape[-2:]
-            fft_size = (height + kernel_height - 1, width + kernel_width - 1)
+            full_height = height + kernel_height - 1
+            full_width = width + kernel_width - 1
+            # Any FFT grid at least as large as the full linear-convolution
+            # support is mathematically equivalent. Avoid prime sizes such as
+            # 383x383 (256 scene + 128 PSF - 1) by using a fast 5-smooth grid.
+            fft_size = (
+                _next_fast_fft_length(full_height),
+                _next_fast_fft_length(full_width),
+            )
             spectral_fft = torch.fft.rfft2(spectral, s=fft_size, dim=(-2, -1))
         else:
             fft_size = (height, width)
             spectral_fft = torch.fft.rfft2(spectral, dim=(-2, -1))
+        response_complex = response.to(dtype=spectral_fft.dtype)
 
         stage_diag = [] if debug_stages else None
         if debug_stages:
@@ -831,7 +925,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                     "bcxy,cxy,oc->boxy",
                     spectral_fft,
                     psf_fft,
-                    response.to(dtype=psf_fft.dtype),
+                    response_complex,
                 )
                 full = torch.fft.irfft2(
                     mixed_fft, s=fft_size, dim=(-2, -1))
@@ -845,7 +939,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                     "bcxy,cxy,oc->boxy",
                     spectral_fft,
                     psf_fft,
-                    response.to(dtype=psf_fft.dtype),
+                    response_complex,
                 )
                 blurred_sensor = torch.fft.irfft2(
                     mixed_fft, s=fft_size, dim=(-2, -1))
