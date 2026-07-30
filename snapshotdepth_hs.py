@@ -2178,87 +2178,100 @@ class SnapshotDepthHS(pl.LightningModule):
                 'r90_unresolved_fraction']
             effective_psf_loss_weight = self._dodo_psf_energy_weight()
 
-            psf_mtf_loss, mtf_stats = psf_mtf_floor_loss(
-                outputs.psf,
-                min_frequency=float(getattr(
-                    self.hparams, 'dodo_psf_mtf_min_frequency', 0.02)),
-                max_frequency=float(getattr(
-                    self.hparams, 'dodo_psf_mtf_max_frequency', 0.15)),
-                mtf_at_005=float(getattr(
-                    self.hparams, 'dodo_psf_mtf_target_005', 0.12)),
-                mtf_at_010=float(getattr(
-                    self.hparams, 'dodo_psf_mtf_target_010', 0.05)),
-                mtf_at_015=float(getattr(
-                    self.hparams, 'dodo_psf_mtf_target_015', 0.025)),
-            )
-            psf_mtf_005_mean = mtf_stats['mtf_005_mean']
-            psf_mtf_005_p10 = mtf_stats['mtf_005_p10']
-            psf_mtf_010_mean = mtf_stats['mtf_010_mean']
-            psf_mtf_010_p10 = mtf_stats['mtf_010_p10']
-            psf_mtf_020_mean = mtf_stats['mtf_020_mean']
             effective_psf_mtf_weight = self._dodo_optical_weight(
                 'dodo_psf_mtf_weight', 0.0,
                 'dodo_psf_mtf_start_epoch',
                 'dodo_psf_mtf_warmup_epochs')
+            if effective_psf_mtf_weight > 0.0:
+                psf_mtf_loss, mtf_stats = psf_mtf_floor_loss(
+                    outputs.psf,
+                    min_frequency=float(getattr(
+                        self.hparams, 'dodo_psf_mtf_min_frequency', 0.02)),
+                    max_frequency=float(getattr(
+                        self.hparams, 'dodo_psf_mtf_max_frequency', 0.15)),
+                    mtf_at_005=float(getattr(
+                        self.hparams, 'dodo_psf_mtf_target_005', 0.12)),
+                    mtf_at_010=float(getattr(
+                        self.hparams, 'dodo_psf_mtf_target_010', 0.05)),
+                    mtf_at_015=float(getattr(
+                        self.hparams, 'dodo_psf_mtf_target_015', 0.025)),
+                )
+                psf_mtf_005_mean = mtf_stats['mtf_005_mean']
+                psf_mtf_005_p10 = mtf_stats['mtf_005_p10']
+                psf_mtf_010_mean = mtf_stats['mtf_010_mean']
+                psf_mtf_010_p10 = mtf_stats['mtf_010_p10']
+                psf_mtf_020_mean = mtf_stats['mtf_020_mean']
 
             if getattr(self.camera.sensing_unnorm, 'sensing_mode', None) == 'rgb':
-                sensor_response = self.camera._sensor_response_matrix(
-                    outputs.psf.device, outputs.psf.dtype)
-                (psf_spectral_separation_loss,
-                 psf_spectral_stats) = (
-                    sensor_weighted_spectral_psf_separation_loss(
-                        outputs.psf,
-                        sensor_response,
-                        margin=float(getattr(
-                            self.hparams,
-                            'dodo_psf_spectral_separation_margin',
-                            0.90)),
-                        offsets=(1, 2),
-                        hard_fraction=float(getattr(
-                            self.hparams,
-                            'dodo_psf_spectral_hard_fraction', 0.20)),
-                        hard_weight=float(getattr(
-                            self.hparams,
-                            'dodo_psf_spectral_hard_weight', 0.5)),
-                    )
-                )
-                psf_spectral_adjacent_cosine_mean = psf_spectral_stats[
-                    'adjacent_cosine_mean']
-                psf_spectral_adjacent_cosine_p90 = psf_spectral_stats[
-                    'adjacent_cosine_p90']
-                psf_spectral_adjacent_cosine_max = psf_spectral_stats[
-                    'adjacent_cosine_max']
-                psf_spectral_active_fraction = psf_spectral_stats[
-                    'active_fraction']
                 effective_psf_spectral_weight = (
                     self._dodo_psf_spectral_separation_weight())
-
-                (psf_depth_separation_loss,
-                 psf_depth_stats) = sensor_weighted_depth_psf_separation_loss(
-                    outputs.psf,
-                    sensor_response,
-                    margin=float(getattr(
-                        self.hparams,
-                        'dodo_psf_depth_separation_margin', 0.90)),
-                    hard_fraction=float(getattr(
-                        self.hparams,
-                        'dodo_psf_depth_hard_fraction', 0.20)),
-                    hard_weight=float(getattr(
-                        self.hparams,
-                        'dodo_psf_depth_hard_weight', 0.5)),
-                    energy_reference=getattr(
-                        self.camera, 'psf_energy_reference', 'crop'),
-                )
-                psf_depth_adjacent_cosine_mean = psf_depth_stats[
-                    'adjacent_cosine_mean']
-                psf_depth_adjacent_cosine_p90 = psf_depth_stats[
-                    'adjacent_cosine_p90']
-                psf_depth_adjacent_cosine_max = psf_depth_stats[
-                    'adjacent_cosine_max']
                 effective_psf_depth_weight = self._dodo_optical_weight(
                     'dodo_psf_depth_separation_weight', 0.0,
                     'dodo_psf_depth_separation_start_epoch',
                     'dodo_psf_depth_separation_warmup_epochs')
+                if (
+                    effective_psf_spectral_weight > 0.0
+                    or effective_psf_depth_weight > 0.0
+                ):
+                    sensor_response = self.camera._sensor_response_matrix(
+                        outputs.psf.device, outputs.psf.dtype)
+
+                    if effective_psf_spectral_weight > 0.0:
+                        (psf_spectral_separation_loss,
+                         psf_spectral_stats) = (
+                            sensor_weighted_spectral_psf_separation_loss(
+                                outputs.psf,
+                                sensor_response,
+                                margin=float(getattr(
+                                    self.hparams,
+                                    'dodo_psf_spectral_separation_margin',
+                                    0.90)),
+                                offsets=(1, 2),
+                                hard_fraction=float(getattr(
+                                    self.hparams,
+                                    'dodo_psf_spectral_hard_fraction', 0.20)),
+                                hard_weight=float(getattr(
+                                    self.hparams,
+                                    'dodo_psf_spectral_hard_weight', 0.5)),
+                            )
+                        )
+                        psf_spectral_adjacent_cosine_mean = (
+                            psf_spectral_stats['adjacent_cosine_mean'])
+                        psf_spectral_adjacent_cosine_p90 = (
+                            psf_spectral_stats['adjacent_cosine_p90'])
+                        psf_spectral_adjacent_cosine_max = (
+                            psf_spectral_stats['adjacent_cosine_max'])
+                        psf_spectral_active_fraction = (
+                            psf_spectral_stats['active_fraction'])
+
+                    if effective_psf_depth_weight > 0.0:
+                        (psf_depth_separation_loss,
+                         psf_depth_stats) = (
+                            sensor_weighted_depth_psf_separation_loss(
+                                outputs.psf,
+                                sensor_response,
+                                margin=float(getattr(
+                                    self.hparams,
+                                    'dodo_psf_depth_separation_margin',
+                                    0.90)),
+                                hard_fraction=float(getattr(
+                                    self.hparams,
+                                    'dodo_psf_depth_hard_fraction', 0.20)),
+                                hard_weight=float(getattr(
+                                    self.hparams,
+                                    'dodo_psf_depth_hard_weight', 0.5)),
+                                energy_reference=getattr(
+                                    self.camera,
+                                    'psf_energy_reference',
+                                    'crop'),
+                            )
+                        )
+                        psf_depth_adjacent_cosine_mean = psf_depth_stats[
+                            'adjacent_cosine_mean']
+                        psf_depth_adjacent_cosine_p90 = psf_depth_stats[
+                            'adjacent_cosine_p90']
+                        psf_depth_adjacent_cosine_max = psf_depth_stats[
+                            'adjacent_cosine_max']
 
             coefficients = getattr(self.camera.doe1, 'zernike_coeffs', None)
             if (isinstance(coefficients, torch.Tensor)

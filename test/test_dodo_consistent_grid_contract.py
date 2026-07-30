@@ -318,8 +318,26 @@ def test_consistent_grid_full_field_energy_loss_reaches_doe_parameters():
     )
 
 
-def test_snapshot_total_loss_uses_full_field_psf_energy_and_reaches_doe():
+def test_snapshot_total_loss_uses_full_field_psf_energy_and_reaches_doe(
+    monkeypatch,
+):
     from snapshotdepth_hs import SnapshotDepthHS
+
+    def disabled_regularizer_must_not_run(*args, **kwargs):
+        raise AssertionError("zero-weight PSF regularizer was evaluated")
+
+    monkeypatch.setattr(
+        "snapshotdepth_hs.psf_mtf_floor_loss",
+        disabled_regularizer_must_not_run,
+    )
+    monkeypatch.setattr(
+        "snapshotdepth_hs.sensor_weighted_spectral_psf_separation_loss",
+        disabled_regularizer_must_not_run,
+    )
+    monkeypatch.setattr(
+        "snapshotdepth_hs.sensor_weighted_depth_psf_separation_loss",
+        disabled_regularizer_must_not_run,
+    )
 
     model = _make_consistent_model(
         doe_type_a="New",
