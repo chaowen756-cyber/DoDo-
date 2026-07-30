@@ -221,6 +221,7 @@ def test_legacy_optics_version_preserves_original_grid_and_checkpoint_keys():
     assert legacy.prop3.L == 0.0048
     assert legacy.prop3.padding_factor == 1
     assert legacy.psf_kernel_size == 128
+    assert legacy.psf_energy_reference == "crop"
     assert not legacy.doe1.use_pupil_mask
     assert legacy.psf_capture_fraction is None
     assert set(legacy.state_dict()) == set(consistent.state_dict())

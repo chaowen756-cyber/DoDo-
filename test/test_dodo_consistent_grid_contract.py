@@ -1,9 +1,10 @@
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
 from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
+from util.psf_regularization import multiscale_psf_energy_concentration_loss
 
 
 def _make_consistent_model(
@@ -143,6 +144,7 @@ def test_consistent_grid_has_one_pitch_across_prop1_doe_and_prop3():
     prop3_work_dx = prop3.work_L / prop3.work_Mp
 
     assert model.psf_optics_version == "consistent_grid_v1"
+    assert model.psf_energy_reference == "full_field"
     assert prop1.Mp == model.doe1.Mesce == model.doe1.Mdoe == prop3.Mp == 128
     assert prop1_dx == prop3_dx == prop3_work_dx
     assert prop3.padding_factor == 2
@@ -205,6 +207,40 @@ def test_consistent_grid_psf_normalizes_full_grid_then_captures_center_129():
     assert torch.all(expected_capture >= 0.995)
     assert torch.all(expected_capture <= 1.0 + 2e-6)
 
+    _, energy_stats = multiscale_psf_energy_concentration_loss(
+        actual,
+        radii=(16.0, 24.0),
+        outside_budgets=(1.0, 1.0),
+        scale_weights=(1.0, 1.0),
+        softness=1.5,
+        cvar_weight=0.0,
+        energy_reference=model.psf_energy_reference,
+    )
+    full_y = torch.arange(256, dtype=full_normalized.dtype) - 128
+    full_x = torch.arange(256, dtype=full_normalized.dtype) - 128
+    full_yy, full_xx = torch.meshgrid(full_y, full_x, indexing="ij")
+    full_radius = torch.sqrt(full_xx.square() + full_yy.square())
+    direct_r16_outside = (
+        full_normalized
+        * torch.sigmoid((full_radius - 16.0) / 1.5)
+    ).sum(dim=(-2, -1))
+    direct_r24_outside = (
+        full_normalized
+        * torch.sigmoid((full_radius - 24.0) / 1.5)
+    ).sum(dim=(-2, -1))
+    torch.testing.assert_close(
+        energy_stats["r16_outside_mean"],
+        direct_r16_outside.mean(),
+        atol=2e-6,
+        rtol=2e-5,
+    )
+    torch.testing.assert_close(
+        energy_stats["r24_outside_mean"],
+        direct_r24_outside.mean(),
+        atol=2e-6,
+        rtol=2e-5,
+    )
+
 
 def test_consistent_grid_doe_gradient_matches_centered_finite_difference():
     torch.manual_seed(79)
@@ -246,6 +282,129 @@ def test_consistent_grid_doe_gradient_matches_centered_finite_difference():
     assert torch.isfinite(gradient).all()
     assert autograd_derivative.abs() > 1e-6
     assert relative_error < 0.02
+
+
+def test_consistent_grid_full_field_energy_loss_reaches_doe_parameters():
+    torch.manual_seed(83)
+    model = _make_consistent_model(
+        doe_type_a="New",
+        train_c=True,
+        doe_basis_mode="orthogonal_rms",
+        doe_init_coeff_norm=0.2,
+    )
+    psf = model.psf_bank(use_cache=False)
+    loss, stats = multiscale_psf_energy_concentration_loss(
+        psf,
+        radii=(16.0, 24.0),
+        outside_budgets=(0.0, 0.0),
+        scale_weights=(1.0, 0.5),
+        softness=1.5,
+        cvar_weight=0.0,
+        energy_reference=model.psf_energy_reference,
+    )
+    gradient = torch.autograd.grad(
+        loss,
+        model.doe1.zernike_coeffs,
+    )[0]
+
+    assert loss.item() > 0.0
+    assert torch.isfinite(gradient).all()
+    assert gradient.norm().item() > 0.0
+    torch.testing.assert_close(
+        stats["captured_mean"],
+        psf.detach().sum(dim=(-2, -1)).mean(),
+        atol=2e-7,
+        rtol=0,
+    )
+
+
+def test_snapshot_total_loss_uses_full_field_psf_energy_and_reaches_doe():
+    from snapshotdepth_hs import SnapshotDepthHS
+
+    model = _make_consistent_model(
+        doe_type_a="New",
+        train_c=True,
+        doe_basis_mode="orthogonal_rms",
+        doe_init_coeff_norm=0.2,
+    )
+    psf = model.psf_bank(use_cache=False)
+    zeros_hs = torch.zeros((1, 25, 4, 4))
+    zeros_depth = torch.zeros((1, 4, 4))
+    outputs = SimpleNamespace(
+        est_images=zeros_hs,
+        est_depthmaps=zeros_depth,
+        psf=psf,
+    )
+
+    def image_loss(est_images, target_images, mask):
+        zero = (est_images - target_images).sum() * 0.0
+        return zero, {
+            "l1": zero,
+            "mse": zero,
+            "sam": zero,
+            "gradient": zero,
+        }
+
+    dummy = SimpleNamespace(
+        training=False,
+        global_step=1,
+        current_epoch=1,
+        optical_model_type="dodo_depth",
+        camera=model,
+        image_lossfn=image_loss,
+        hparams=SimpleNamespace(
+            depth_loss_weight=0.0,
+            image_loss_weight=0.0,
+            depth_smooth_weight=0.0,
+            metric_depth_loss_weight=0.0,
+            background_hs_loss_weight=0.0,
+            psf_loss_weight=0.0,
+            optimize_optics=True,
+            dodo_psf_energy_weight=1.0,
+            dodo_psf_energy_start_epoch=0,
+            dodo_psf_energy_warmup_epochs=0,
+            dodo_psf_energy_outside_budget=0.0,
+            dodo_psf_energy_outer_outside_budget=0.0,
+            dodo_psf_energy_initial_outside_budget=0.0,
+            dodo_psf_energy_initial_outer_outside_budget=0.0,
+            dodo_psf_energy_cvar_weight=0.0,
+            dodo_psf_mtf_weight=0.0,
+            dodo_zernike_mode="legacy12",
+            dodo_optical_regularizer_max_ratio=0.0,
+        ),
+    )
+    dummy._dodo_psf_energy_weight = MethodType(
+        SnapshotDepthHS._dodo_psf_energy_weight,
+        dummy,
+    )
+    dummy._dodo_optical_weight = MethodType(
+        SnapshotDepthHS._dodo_optical_weight,
+        dummy,
+    )
+
+    total_loss, logs = (
+        SnapshotDepthHS._SnapshotDepthHS__compute_loss(
+            dummy,
+            outputs,
+            zeros_depth,
+            zeros_hs,
+            torch.ones_like(zeros_depth),
+        )
+    )
+    total_loss.backward()
+
+    assert total_loss.item() > 0.0
+    assert logs["psf_loss_weighted"].item() > 0.0
+    torch.testing.assert_close(
+        logs["psf_energy_captured_mean"],
+        psf.detach().sum(dim=(-2, -1)).mean(),
+        atol=2e-7,
+        rtol=0,
+    )
+    gradient = model.doe1.zernike_coeffs.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert gradient.norm().item() > 0.0
 
 
 def test_centered_delta_in_odd_129_psf_has_no_convolution_shift(monkeypatch):

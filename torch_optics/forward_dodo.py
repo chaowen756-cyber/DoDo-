@@ -315,9 +315,11 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if self.psf_optics_version == "consistent_grid_v1":
             self.sensor_padding_factor = 2
             self.psf_kernel_size = 129
+            self.psf_energy_reference = "full_field"
         else:
             self.sensor_padding_factor = 1
             self.psf_kernel_size = 128
+            self.psf_energy_reference = "crop"
         if self.psf_optics_version == "consistent_grid_v1":
             if not self.skip_prop2:
                 raise ValueError(

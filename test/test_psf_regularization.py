@@ -155,6 +155,89 @@ def test_loss_backpropagates_finite_nonzero_gradient():
     assert logits.grad.norm().item() > 0
 
 
+def test_full_field_energy_reference_counts_missing_crop_energy():
+    captured = torch.tensor(0.5, requires_grad=True)
+    psf = torch.zeros((1, 1, 129, 129))
+    psf[..., 64, 64] = captured
+
+    crop_loss, _ = multiscale_psf_energy_concentration_loss(
+        psf,
+        radii=(16.0,),
+        outside_budgets=(0.0,),
+        scale_weights=(1.0,),
+        softness=0.0,
+        cvar_weight=0.0,
+        energy_reference="crop",
+    )
+    full_loss, stats = multiscale_psf_energy_concentration_loss(
+        psf,
+        radii=(16.0,),
+        outside_budgets=(0.0,),
+        scale_weights=(1.0,),
+        softness=0.0,
+        cvar_weight=0.0,
+        energy_reference="full_field",
+    )
+    full_loss.backward()
+
+    torch.testing.assert_close(crop_loss, torch.tensor(0.0))
+    torch.testing.assert_close(full_loss, torch.tensor(0.25))
+    torch.testing.assert_close(stats["outside_mean"], torch.tensor(0.5))
+    torch.testing.assert_close(stats["captured_mean"], torch.tensor(0.5))
+    torch.testing.assert_close(stats["missing_mean"], torch.tensor(0.5))
+    assert captured.grad.item() == pytest.approx(-1.0)
+
+
+def test_full_field_energy_gradient_pushes_energy_outside_crop_inward():
+    logits = torch.zeros((1, 1, 17, 17), requires_grad=True)
+    full_psf = torch.softmax(logits.flatten(-2), dim=-1).reshape_as(logits)
+    cropped_psf = full_psf[..., 4:13, 4:13]
+
+    loss, _ = multiscale_psf_energy_concentration_loss(
+        cropped_psf,
+        radii=(2.0,),
+        outside_budgets=(0.0,),
+        scale_weights=(1.0,),
+        softness=0.0,
+        cvar_weight=0.0,
+        energy_reference="full_field",
+    )
+    loss.backward()
+
+    assert logits.grad[..., 8, 8].item() < 0.0
+    assert logits.grad[..., 0, 0].item() > 0.0
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_full_field_energy_uses_odd_129_center_and_checks_radius():
+    centered = torch.zeros((1, 1, 129, 129))
+    centered[..., 64, 64] = 1.0
+    boundary = torch.zeros_like(centered)
+    boundary[..., 64, 80] = 1.0
+    outside = torch.zeros_like(centered)
+    outside[..., 64, 81] = 1.0
+
+    def energy(psf):
+        _, stats = psf_energy_concentration_loss(
+            psf,
+            radius=16.0,
+            outside_budget=1.0,
+            softness=0.0,
+            energy_reference="full_field",
+        )
+        return stats["outside_mean"]
+
+    torch.testing.assert_close(energy(centered), torch.tensor(0.0))
+    torch.testing.assert_close(energy(boundary), torch.tensor(0.0))
+    torch.testing.assert_close(energy(outside), torch.tensor(1.0))
+    with pytest.raises(ValueError, match="circle must lie inside"):
+        psf_energy_concentration_loss(
+            centered,
+            radius=65.0,
+            energy_reference="full_field",
+        )
+
+
 def test_multiscale_energy_penalizes_core_and_tail_and_reports_radii():
     psf = torch.zeros((1, 2, 64, 64), requires_grad=True)
     with torch.no_grad():
@@ -232,6 +315,53 @@ def test_spectral_offsets_and_depth_hard_negatives_are_differentiable():
     assert torch.isfinite(psf.grad).all()
     assert 0.0 <= spectral_stats['active_fraction'].item() <= 1.0
     assert depth_stats['adjacent_cosine_p90'].item() <= 1.0 + 1e-6
+
+
+def test_depth_separation_full_field_preserves_relative_spectral_capture():
+    psf = torch.zeros((2, 2, 3, 3))
+    psf[0, 0, 1, 1] = 0.9
+    psf[0, 1, 1, 1] = 0.1
+    psf[1, 0, 1, 1] = 0.1
+    psf[1, 1, 1, 1] = 0.9
+    response = torch.eye(2)
+
+    crop_loss, crop_stats = sensor_weighted_depth_psf_separation_loss(
+        psf,
+        response,
+        margin=0.5,
+        hard_weight=0.0,
+        energy_reference="crop",
+    )
+    full_loss, full_stats = sensor_weighted_depth_psf_separation_loss(
+        psf,
+        response,
+        margin=0.5,
+        hard_weight=0.0,
+        energy_reference="full_field",
+    )
+
+    assert crop_stats["adjacent_cosine_mean"].item() == pytest.approx(1.0)
+    assert crop_loss.item() == pytest.approx(0.5)
+    assert full_stats["adjacent_cosine_mean"].item() == pytest.approx(
+        0.2195122, abs=1e-6)
+    assert full_loss.item() == pytest.approx(0.0)
+
+
+def test_mtf_is_invariant_to_full_field_capture_scale():
+    torch.manual_seed(41)
+    psf = torch.rand((1, 2, 129, 129))
+
+    full_loss, full_stats = psf_mtf_floor_loss(psf)
+    scaled_loss, scaled_stats = psf_mtf_floor_loss(psf * 0.25)
+
+    torch.testing.assert_close(full_loss, scaled_loss, atol=1e-7, rtol=1e-6)
+    for key in ("mtf_005_mean", "mtf_010_mean", "mtf_020_mean"):
+        torch.testing.assert_close(
+            full_stats[key],
+            scaled_stats[key],
+            atol=1e-7,
+            rtol=1e-6,
+        )
 
 
 @pytest.mark.parametrize(

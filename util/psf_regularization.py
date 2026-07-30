@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 
 
+_PSF_ENERGY_REFERENCES = ("crop", "full_field")
+
+
 def epoch_warmup_weight(
     target_weight: float,
     current_epoch: int,
@@ -129,7 +132,7 @@ def task_relative_regularizer_scale(
     )
 
 
-def _validate_and_normalize_psf(psf_bank: torch.Tensor) -> torch.Tensor:
+def _validate_psf(psf_bank: torch.Tensor) -> torch.Tensor:
     if psf_bank.ndim != 4:
         raise ValueError(
             "psf_bank must have shape [depth, wavelength, H, W], "
@@ -139,8 +142,50 @@ def _validate_and_normalize_psf(psf_bank: torch.Tensor) -> torch.Tensor:
     psf = psf_bank.to(dtype=torch.float32)
     if torch.any(psf < 0):
         raise ValueError("psf_bank must contain non-negative intensity values")
+    return psf
+
+
+def _validate_and_normalize_psf(psf_bank: torch.Tensor) -> torch.Tensor:
+    psf = _validate_psf(psf_bank)
     eps = torch.finfo(psf.dtype).eps
-    return psf / psf.sum(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    energy = psf.sum(dim=(-2, -1), keepdim=True)
+    if torch.any(energy <= eps):
+        raise ValueError("every cropped PSF must contain positive energy")
+    return psf / energy
+
+
+def _prepare_energy_psf(
+    psf_bank: torch.Tensor,
+    energy_reference: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare PSFs against either their crop or the complete sensor field.
+
+    ``consistent_grid_v1`` normalizes intensity on its complete 256x256
+    sensor work grid and only then returns the centered 129x129 convolution
+    kernel.  In that case the crop sum is the captured fraction and must not
+    be normalized away: all omitted energy is outside any target circle that
+    lies fully inside the crop.
+    """
+    energy_reference = str(energy_reference).lower()
+    if energy_reference not in _PSF_ENERGY_REFERENCES:
+        raise ValueError(
+            "energy_reference must be one of "
+            f"{_PSF_ENERGY_REFERENCES}, got {energy_reference!r}"
+        )
+    psf = _validate_psf(psf_bank)
+    captured_energy = psf.sum(dim=(-2, -1))
+    eps = torch.finfo(psf.dtype).eps
+    if energy_reference == "crop":
+        if torch.any(captured_energy <= eps):
+            raise ValueError("every cropped PSF must contain positive energy")
+        psf = psf / captured_energy[..., None, None]
+        captured_energy = torch.ones_like(captured_energy)
+    elif torch.any(captured_energy > 1.0 + 1e-5):
+        raise ValueError(
+            "full_field energy reference requires PSFs already normalized "
+            "against the complete sensor field, with crop sums <= 1"
+        )
+    return psf, captured_energy
 
 
 def _radial_distance(psf: torch.Tensor) -> torch.Tensor:
@@ -151,18 +196,42 @@ def _radial_distance(psf: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(grid_x.square() + grid_y.square())
 
 
+def _validate_energy_radius(
+    psf: torch.Tensor,
+    radius: float,
+    energy_reference: str,
+) -> None:
+    if str(energy_reference).lower() != "full_field":
+        return
+    inscribed_radius = float((min(psf.shape[-2:]) - 1) // 2)
+    if float(radius) > inscribed_radius:
+        raise ValueError(
+            "full_field energy reference treats all omitted energy as outside "
+            "the target circle, so that circle must lie inside the supplied "
+            f"crop; radius must be <= {inscribed_radius:g}, got {radius:g}"
+        )
+
+
 def _outside_energy(
     psf: torch.Tensor,
     radial_distance: torch.Tensor,
     radius: float,
     softness: float,
+    energy_reference: str,
 ) -> torch.Tensor:
     if softness == 0:
         outside_mask = (radial_distance > radius).to(dtype=psf.dtype)
     else:
         outside_mask = torch.sigmoid(
             (radial_distance - float(radius)) / float(softness))
-    return (psf * outside_mask).sum(dim=(-2, -1))
+    if str(energy_reference).lower() == "crop":
+        # Preserve the historical reduction order and numerical behavior.
+        return (psf * outside_mask).sum(dim=(-2, -1))
+
+    # Use the complete-field reference energy of one. This additionally counts
+    # every omitted sample as outside the target circle.
+    inside_energy = (psf * (1.0 - outside_mask)).sum(dim=(-2, -1))
+    return (1.0 - inside_energy).clamp(min=0.0, max=1.0)
 
 
 def _top_fraction_mean(values: torch.Tensor, fraction: float) -> torch.Tensor:
@@ -183,6 +252,7 @@ def _encircled_energy_radius_stats(
     cumulative = psf.flatten(start_dim=-2)[..., order].cumsum(dim=-1)
     stats: Dict[str, torch.Tensor] = {}
     for fraction, label in ((0.50, "r50"), (0.80, "r80"), (0.90, "r90")):
+        reached = cumulative[..., -1] >= fraction
         index = (cumulative < fraction).sum(dim=-1).clamp_max(
             sorted_radius.numel() - 1)
         radius = sorted_radius[index]
@@ -190,6 +260,9 @@ def _encircled_energy_radius_stats(
         stats[f"{label}_p90"] = torch.quantile(
             radius.detach().flatten(), 0.9)
         stats[f"{label}_max"] = radius.max().detach()
+        stats[f"{label}_unresolved_fraction"] = (
+            ~reached
+        ).to(psf.dtype).mean().detach()
     return stats
 
 
@@ -198,6 +271,7 @@ def psf_energy_concentration_loss(
     radius: float = 16.0,
     outside_budget: float = 0.5,
     softness: float = 1.5,
+    energy_reference: str = "crop",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Penalize normalized PSF energy exceeding a radial outside budget.
 
@@ -207,6 +281,10 @@ def psf_energy_concentration_loss(
         outside_budget: Allowed fraction of energy outside ``radius``.
         softness: Logistic transition width in pixels. A value of zero selects
             a hard radial mask.
+        energy_reference: ``crop`` preserves the historical behavior by
+            normalizing the supplied crop. ``full_field`` expects a crop that
+            was already normalized on the complete sensor field and counts its
+            missing energy as outside ``radius``.
 
     Returns:
         The mean squared hinge penalty and detached diagnostic statistics.
@@ -219,10 +297,12 @@ def psf_energy_concentration_loss(
         )
     if softness < 0:
         raise ValueError(f"softness must be >= 0, got {softness}")
-    psf = _validate_and_normalize_psf(psf_bank)
+    psf, captured_energy = _prepare_energy_psf(
+        psf_bank, energy_reference)
+    _validate_energy_radius(psf, radius, energy_reference)
     radial_distance = _radial_distance(psf)
     outside_energy = _outside_energy(
-        psf, radial_distance, radius, softness)
+        psf, radial_distance, radius, softness, energy_reference)
     violation = F.relu(outside_energy - outside_budget)
     loss = violation.square().mean()
 
@@ -233,6 +313,11 @@ def psf_energy_concentration_loss(
             "outside_max": outside_energy.max().detach(),
             "inside_mean": (1.0 - outside_energy.mean()).detach(),
             "active_fraction": (violation > 0).to(psf.dtype).mean().detach(),
+            "captured_mean": captured_energy.mean().detach(),
+            "captured_min": captured_energy.min().detach(),
+            "missing_mean": (
+                1.0 - captured_energy
+            ).clamp_min(0.0).mean().detach(),
         }
     return loss, stats
 
@@ -246,6 +331,7 @@ def multiscale_psf_energy_concentration_loss(
     cvar_fraction: float = 0.10,
     cvar_weight: float = 0.5,
     penalty_power: float = 2.0,
+    energy_reference: str = "crop",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Constrain the PSF core and tail, including the worst PSF subset."""
     if not (len(radii) == len(outside_budgets) == len(scale_weights)):
@@ -260,7 +346,8 @@ def multiscale_psf_energy_concentration_loss(
     if not 1.0 <= penalty_power <= 2.0:
         raise ValueError("penalty_power must be in [1,2]")
 
-    psf = _validate_and_normalize_psf(psf_bank)
+    psf, captured_energy = _prepare_energy_psf(
+        psf_bank, energy_reference)
     radial_distance = _radial_distance(psf)
     loss = psf.sum() * 0.0
     stats: Dict[str, torch.Tensor] = {}
@@ -275,7 +362,9 @@ def multiscale_psf_energy_concentration_loss(
             raise ValueError(
                 f"invalid energy scale radius={radius}, budget={budget}, "
                 f"weight={weight}")
-        outside = _outside_energy(psf, radial_distance, radius, softness)
+        _validate_energy_radius(psf, radius, energy_reference)
+        outside = _outside_energy(
+            psf, radial_distance, radius, softness, energy_reference)
         violation = F.relu(outside - budget)
         loss = loss + weight * violation.pow(penalty_power).mean()
         key = f"r{int(round(radius))}"
@@ -306,6 +395,11 @@ def multiscale_psf_energy_concentration_loss(
         stats["inside_mean"] = (1.0 - primary_outside.mean()).detach()
         stats["active_fraction"] = (
             primary_violation > 0).to(psf.dtype).mean().detach()
+        stats["captured_mean"] = captured_energy.mean().detach()
+        stats["captured_min"] = captured_energy.min().detach()
+        stats["missing_mean"] = (
+            1.0 - captured_energy
+        ).clamp_min(0.0).mean().detach()
         stats.update(_encircled_energy_radius_stats(
             psf.detach(), radial_distance.detach()))
     return loss, stats
@@ -413,10 +507,10 @@ def sensor_weighted_spectral_psf_separation_loss(
         raise ValueError("spectral PSF separation requires at least two wavelengths")
     if not -1.0 <= margin <= 1.0:
         raise ValueError(f"margin must be in [-1, 1], got {margin}")
-    if not torch.isfinite(psf_bank).all() or not torch.isfinite(sensor_response).all():
+    if not torch.isfinite(sensor_response).all():
         raise ValueError("PSF bank and sensor response must be finite")
 
-    psf = psf_bank.to(dtype=torch.float32)
+    psf = _validate_psf(psf_bank)
     response = sensor_response.to(device=psf.device, dtype=psf.dtype)
     # [D, L, S, H, W], where S is the number of sensor channels.
     signatures = psf.unsqueeze(2) * response.t()[None, :, :, None, None]
@@ -468,9 +562,16 @@ def sensor_weighted_depth_psf_separation_loss(
     margin: float = 0.90,
     hard_fraction: float = 0.20,
     hard_weight: float = 0.5,
+    energy_reference: str = "crop",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Separate adjacent-depth PSFs as they appear in the RGB measurement."""
-    psf = _validate_and_normalize_psf(psf_bank)
+    """Separate adjacent-depth PSFs as they appear in the RGB measurement.
+
+    Full-field-normalized PSF crops retain wavelength-dependent captured
+    fractions because those relative throughputs are present in the actual
+    RGB convolution. Historical crop-normalized PSFs preserve their original
+    behavior.
+    """
+    psf, _ = _prepare_energy_psf(psf_bank, energy_reference)
     response = sensor_response.to(device=psf.device, dtype=psf.dtype)
     if response.ndim != 2 or response.shape[1] != psf.shape[1]:
         raise ValueError(

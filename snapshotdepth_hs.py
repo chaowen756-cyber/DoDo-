@@ -935,6 +935,10 @@ class SnapshotDepthHS(pl.LightningModule):
             ('psf_energy_outside_p90', 'train_loss/psf_energy_outside_p90'),
             ('psf_energy_inside_mean', 'train_loss/psf_energy_inside_mean'),
             ('psf_energy_active_fraction', 'train_loss/psf_energy_active_fraction'),
+            ('psf_energy_captured_mean',
+             'train_loss/psf_energy_captured_mean'),
+            ('psf_energy_missing_mean',
+             'train_loss/psf_energy_missing_mean'),
             ('psf_energy_outer_inside_mean',
              'train_loss/psf_energy_outer_inside_mean'),
             ('psf_energy_outer_outside_p90',
@@ -944,6 +948,8 @@ class SnapshotDepthHS(pl.LightningModule):
             ('psf_energy_r90_mean', 'train_loss/psf_energy_r90_mean'),
             ('psf_energy_r90_p90', 'train_loss/psf_energy_r90_p90'),
             ('psf_energy_r90_max', 'train_loss/psf_energy_r90_max'),
+            ('psf_energy_r90_unresolved_fraction',
+             'train_loss/psf_energy_r90_unresolved_fraction'),
             ('psf_energy_core_budget', 'train_loss/psf_energy_core_budget'),
             ('psf_energy_outer_budget', 'train_loss/psf_energy_outer_budget'),
             ('psf_mtf_loss', 'train_loss/psf_mtf_loss'),
@@ -2054,6 +2060,8 @@ class SnapshotDepthHS(pl.LightningModule):
         psf_energy_outside_p90 = zero.detach()
         psf_energy_inside_mean = zero.detach()
         psf_energy_active_fraction = zero.detach()
+        psf_energy_captured_mean = zero.detach()
+        psf_energy_missing_mean = zero.detach()
         psf_energy_outer_inside_mean = zero.detach()
         psf_energy_outer_outside_p90 = zero.detach()
         psf_energy_r50_mean = zero.detach()
@@ -2061,6 +2069,7 @@ class SnapshotDepthHS(pl.LightningModule):
         psf_energy_r90_mean = zero.detach()
         psf_energy_r90_p90 = zero.detach()
         psf_energy_r90_max = zero.detach()
+        psf_energy_r90_unresolved_fraction = zero.detach()
         effective_psf_loss_weight = 0.0
 
         psf_mtf_loss = zero
@@ -2145,12 +2154,16 @@ class SnapshotDepthHS(pl.LightningModule):
                     self.hparams, 'dodo_psf_energy_cvar_weight', 0.5)),
                 penalty_power=float(getattr(
                     self.hparams, 'dodo_psf_energy_penalty_power', 2.0)),
+                energy_reference=getattr(
+                    self.camera, 'psf_energy_reference', 'crop'),
             )
             psf_energy_outside_mean = psf_stats['outside_mean']
             psf_energy_outside_p90 = psf_stats['outside_p90']
             psf_out_of_fov_max = psf_stats['outside_max']
             psf_energy_inside_mean = psf_stats['inside_mean']
             psf_energy_active_fraction = psf_stats['active_fraction']
+            psf_energy_captured_mean = psf_stats['captured_mean']
+            psf_energy_missing_mean = psf_stats['missing_mean']
             outer_key = f'r{int(round(outer_radius))}'
             psf_energy_outer_inside_mean = psf_stats[
                 f'{outer_key}_inside_mean']
@@ -2161,6 +2174,8 @@ class SnapshotDepthHS(pl.LightningModule):
             psf_energy_r90_mean = psf_stats['r90_mean']
             psf_energy_r90_p90 = psf_stats['r90_p90']
             psf_energy_r90_max = psf_stats['r90_max']
+            psf_energy_r90_unresolved_fraction = psf_stats[
+                'r90_unresolved_fraction']
             effective_psf_loss_weight = self._dodo_psf_energy_weight()
 
             psf_mtf_loss, mtf_stats = psf_mtf_floor_loss(
@@ -2231,6 +2246,8 @@ class SnapshotDepthHS(pl.LightningModule):
                     hard_weight=float(getattr(
                         self.hparams,
                         'dodo_psf_depth_hard_weight', 0.5)),
+                    energy_reference=getattr(
+                        self.camera, 'psf_energy_reference', 'crop'),
                 )
                 psf_depth_adjacent_cosine_mean = psf_depth_stats[
                     'adjacent_cosine_mean']
@@ -2343,6 +2360,8 @@ class SnapshotDepthHS(pl.LightningModule):
             'psf_energy_outside_p90': psf_energy_outside_p90,
             'psf_energy_inside_mean': psf_energy_inside_mean,
             'psf_energy_active_fraction': psf_energy_active_fraction,
+            'psf_energy_captured_mean': psf_energy_captured_mean,
+            'psf_energy_missing_mean': psf_energy_missing_mean,
             'psf_energy_outer_inside_mean': psf_energy_outer_inside_mean,
             'psf_energy_outer_outside_p90': psf_energy_outer_outside_p90,
             'psf_energy_r50_mean': psf_energy_r50_mean,
@@ -2350,6 +2369,8 @@ class SnapshotDepthHS(pl.LightningModule):
             'psf_energy_r90_mean': psf_energy_r90_mean,
             'psf_energy_r90_p90': psf_energy_r90_p90,
             'psf_energy_r90_max': psf_energy_r90_max,
+            'psf_energy_r90_unresolved_fraction': (
+                psf_energy_r90_unresolved_fraction),
             'psf_energy_core_budget': torch.tensor(
                 core_budget if self.optical_model_type == 'dodo_depth' else 0.0,
                 device=depth_loss.device),
