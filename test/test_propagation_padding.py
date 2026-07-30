@@ -152,6 +152,37 @@ def test_full_work_grid_preserves_energy_and_crop_does_not_renormalize():
     assert crop_energy < work_energy
 
 
+def test_forward_work_grid_exposes_the_same_padded_propagation_before_crop():
+    torch.manual_seed(13)
+    wavelengths = torch.tensor([500e-9, 620e-9], dtype=torch.float32)
+    value = torch.rand(1, 2, 17, 17)
+    layer = PropagationLayer(
+        Mp=17,
+        L=0.01,
+        zi=0.04,
+        wave_lengths=wavelengths,
+        trainable_z=False,
+        padding_factor=2,
+    )
+
+    work_output = layer.forward_work_grid(value)
+    cropped_output = layer(value)
+    crop_top = (layer.work_Mp - layer.Mp) // 2
+    crop_left = (layer.work_Mp - layer.Mp) // 2
+
+    assert work_output.shape == (1, 2, 34, 34)
+    torch.testing.assert_close(
+        cropped_output,
+        work_output[
+            ...,
+            crop_top:crop_top + layer.Mp,
+            crop_left:crop_left + layer.Mp,
+        ],
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_padding_reduces_opposite_edge_periodic_wraparound():
     size = 128
     wavelengths = torch.tensor([660e-9], dtype=torch.float32)

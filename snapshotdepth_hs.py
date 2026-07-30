@@ -49,6 +49,42 @@ SnapshotOutputs = namedtuple('SnapshotOutputs',
                                           'target_images', 'target_depthmaps',
                                           'psf'])
 
+_VALIDATION_TOTAL_KEYS = (
+    'depth_abs_sum',
+    'depth_sq_sum',
+    'depth_valid_count',
+    'metric_depth_abs_sum',
+    'metric_depth_batch_mae_sum',
+    'hs_abs_sum',
+    'hs_sq_sum',
+    'hs_valid_count',
+    'hs_full_sq_sum',
+    'hs_full_count',
+    'depth_tv_dx_sum',
+    'depth_tv_dx_count',
+    'depth_tv_dy_sum',
+    'depth_tv_dy_count',
+    'background_hs_abs_sum',
+    'background_hs_count',
+    'valid_batches',
+    'skipped_batches',
+)
+
+
+def _all_reduce_validation_totals(totals, device):
+    """Sum additive validation statistics across all active DDP ranks."""
+    values = torch.tensor(
+        [float(totals[key]) for key in _VALIDATION_TOTAL_KEYS],
+        dtype=torch.float64,
+        device=device,
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+    return {
+        key: float(value)
+        for key, value in zip(_VALIDATION_TOTAL_KEYS, values.detach().cpu().tolist())
+    }
+
 
 class SnapshotDepthHS(pl.LightningModule):
 
@@ -67,16 +103,9 @@ class SnapshotDepthHS(pl.LightningModule):
         })
         self.log_dir = log_dir
         self.artifact_root = artifact_root
-        self._val_psnr_hs_sum = 0.0
-        self._val_mae_depth_m_sum = 0.0
-        self._val_mae_depth_m_abs_sum = 0.0
-        self._val_mae_depth_m_valid_px = 0.0
-        self._val_mae_depth_sum = 0.0
-        self._val_hs_l1_masked_sum = 0.0
-        self._val_depth_tv_sum = 0.0
-        self._val_bg_hs_l1_sum = 0.0
-        self._val_steps = 0
-        self._val_skipped_steps = 0
+        self._val_totals = {
+            key: 0.0 for key in _VALIDATION_TOTAL_KEYS
+        }
         # Diagnostics state
         self._doe_diag_done = False
         self._nonfinite_count = 0
@@ -194,6 +223,23 @@ class SnapshotDepthHS(pl.LightningModule):
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, **kwargs):
         lr_decay_strategy = str(getattr(self.hparams, 'lr_decay_strategy', 'none'))
         current_epoch = int(getattr(self.trainer, 'current_epoch', epoch))
+        completed_step = int(self.trainer.global_step) + 1
+        monitor_every = max(
+            1, int(getattr(self.hparams, 'loss_plot_every_n_steps', 50)))
+        monitor_doe = (
+            bool(getattr(self.hparams, 'optimize_optics', False))
+            and getattr(self, 'optical_model_type', None) == 'dodo_depth'
+            and (completed_step == 1 or completed_step % monitor_every == 0)
+        )
+        doe_coeffs = None
+        coeffs_before = None
+        if monitor_doe:
+            doe_layer = getattr(getattr(self, 'camera', None), 'doe1', None)
+            candidate = getattr(doe_layer, 'zernike_coeffs', None)
+            if isinstance(candidate, nn.Parameter) and candidate.requires_grad:
+                doe_coeffs = candidate
+                coeffs_before = candidate.detach().clone()
+
         warmup_steps = int(getattr(self.hparams, 'lr_warmup_steps', 54))
         warmup_scale = 1.0
         if warmup_steps > 0 and self.trainer.global_step < warmup_steps:
@@ -212,12 +258,96 @@ class SnapshotDepthHS(pl.LightningModule):
                 decay_scale = 0.1 ** (current_epoch // decay_epochs)
             pg['lr'] = warmup_scale * decay_scale * base_lr
 
-        optimizer.step(closure=optimizer_closure)
+        # Lightning 1.0.2 has already run training_step_and_backward before
+        # entering this hook. Adam/SGD must therefore not execute the supplied
+        # closure, otherwise every optimizer update repeats forward/backward
+        # and accumulates a second gradient. LBFGS is the only optimizer used
+        # here that requires the closure.
+        if bool(kwargs.get('using_native_amp', False)):
+            self.trainer.scaler.step(optimizer)
+        elif isinstance(optimizer, torch.optim.LBFGS):
+            optimizer.step(closure=optimizer_closure)
+        else:
+            optimizer.step()
+
+        coeffs_raw = None
+        grad_norm = None
+        if doe_coeffs is not None:
+            with torch.no_grad():
+                coeffs_raw = doe_coeffs.detach().clone()
+                if doe_coeffs.grad is not None:
+                    grad_norm = float(
+                        torch.linalg.vector_norm(
+                            doe_coeffs.grad.detach()).item())
+
         if self.hparams.optimize_optics and hasattr(self.camera, 'clamp_parameters_'):
             self.camera.clamp_parameters_()
             self._clamp_hook_count += 1
             if self._clamp_hook_count == 1:
                 print('[doe_diag] clamp_parameters_() executed (first call)')
+
+        if (
+                doe_coeffs is not None
+                and coeffs_before is not None
+                and coeffs_raw is not None):
+            with torch.no_grad():
+                coeffs_after = doe_coeffs.detach()
+                raw_delta = coeffs_raw - coeffs_before
+                effective_delta = coeffs_after - coeffs_before
+                projection_delta = coeffs_after - coeffs_raw
+                raw_update_norm = torch.linalg.vector_norm(raw_delta)
+                effective_update_norm = torch.linalg.vector_norm(
+                    effective_delta)
+                projection_correction_norm = torch.linalg.vector_norm(
+                    projection_delta)
+                if raw_update_norm > 1e-20:
+                    update_retention = (
+                        effective_update_norm / raw_update_norm)
+                    projection_fraction = (
+                        projection_correction_norm / raw_update_norm)
+                else:
+                    update_retention = raw_update_norm.new_tensor(1.0)
+                    projection_fraction = raw_update_norm.new_tensor(0.0)
+                coeff_norm_before = torch.linalg.vector_norm(coeffs_before)
+                coeff_norm_raw = torch.linalg.vector_norm(coeffs_raw)
+                coeff_norm = torch.linalg.vector_norm(coeffs_after)
+                update_rel = (
+                    effective_update_norm
+                    / coeff_norm_before.clamp_min(1e-12)
+                )
+                clamp_hit = float(
+                    projection_correction_norm.item() > 1e-12)
+                optics_lr = next(
+                    (
+                        float(pg['lr']) for pg in optimizer.param_groups
+                        if pg.get('name') == 'optics'
+                    ),
+                    0.0,
+                )
+
+            self._last_doe_metrics = {
+                'step': completed_step,
+                'grad_norm': grad_norm,
+                'raw_update_norm': float(raw_update_norm.item()),
+                'effective_update_norm': float(
+                    effective_update_norm.item()),
+                'projection_correction_norm': float(
+                    projection_correction_norm.item()),
+                'update_retention': float(update_retention.item()),
+                'projection_fraction': float(projection_fraction.item()),
+                'update_rel': float(update_rel.item()),
+                'clamp_hit': clamp_hit,
+                'coeff_norm_before': float(coeff_norm_before.item()),
+                'coeff_norm_raw': float(coeff_norm_raw.item()),
+                'coeff_norm': float(coeff_norm.item()),
+                'optics_lr': optics_lr,
+            }
+            for key, value in self._last_doe_metrics.items():
+                if key == 'step' or value is None:
+                    continue
+                self.log(
+                    f'doe/{key}', float(value),
+                    on_step=True, on_epoch=False)
 
     def configure_optimizers(self):
         param_groups = []
@@ -384,6 +514,15 @@ class SnapshotDepthHS(pl.LightningModule):
             'train_misc/est_image_min': outputs.est_images.min(),
             'train_misc/nonfinite_count': float(self._nonfinite_count),
         }
+        if self.optical_model_type == 'dodo_depth':
+            capture_fraction = getattr(
+                self.camera, 'psf_capture_fraction', None)
+            if capture_fraction is not None:
+                misc_logs.update({
+                    'optics/psf_capture_min': capture_fraction.min(),
+                    'optics/psf_capture_mean': capture_fraction.mean(),
+                    'optics/psf_capture_max': capture_fraction.max(),
+                })
         if self.global_step % 50 == 0:
             misc_logs.update({
                 'diag/target_depth_std': tgt_std,
@@ -474,20 +613,21 @@ class SnapshotDepthHS(pl.LightningModule):
         self._last_grad_norms = grad_norms
 
 
+    def _trainer_is_global_zero(self):
+        trainer = getattr(self, 'trainer', None)
+        if trainer is None:
+            return True
+        if hasattr(trainer, 'is_global_zero'):
+            return bool(trainer.is_global_zero)
+        return int(getattr(trainer, 'global_rank', 0) or 0) == 0
+
     def on_validation_epoch_start(self) -> None:
         for metric in self.metrics.values():
             metric.reset()
             metric.to(self.device)
-        self._val_psnr_hs_sum = 0.0
-        self._val_mae_depth_m_sum = 0.0
-        self._val_mae_depth_m_abs_sum = 0.0
-        self._val_mae_depth_m_valid_px = 0.0
-        self._val_mae_depth_sum = 0.0
-        self._val_hs_l1_masked_sum = 0.0
-        self._val_depth_tv_sum = 0.0
-        self._val_bg_hs_l1_sum = 0.0
-        self._val_steps = 0
-        self._val_skipped_steps = 0
+        self._val_totals = {
+            key: 0.0 for key in _VALIDATION_TOTAL_KEYS
+        }
 
     def validation_step(self, samples, batch_idx):
         target_images = samples['hs_image']
@@ -524,21 +664,15 @@ class SnapshotDepthHS(pl.LightningModule):
         est = outputs.est_depthmaps
         tgt = outputs.target_depthmaps
 
-        # 计算差异
+        # Accumulate raw additive statistics. Ratios and PSNR are deliberately
+        # deferred until all DDP ranks have contributed at epoch end.
         diff = torch.abs(est - tgt) * final_mask
         diff_sq = (est - tgt)**2 * final_mask
-
-        # 计算平均值 (Sum / Count)
-        num_valid = final_mask.sum() + 1e-6
-        mae = diff.sum() / num_valid
-        mse = diff_sq.sum() / num_valid
-
-        # Log 手动计算的指标
-        self.log('validation/mse_depthmap', mse, on_step=False, on_epoch=True)
-        self.log('validation/mae_depthmap', mae, on_step=False, on_epoch=True)
+        depth_abs_sum = diff.sum()
+        depth_sq_sum = diff_sq.sum()
+        num_valid_px = final_mask.sum()
 
         # Metric-depth MAE (meters)
-        num_valid_px = final_mask.sum()
         if num_valid_px > 0:
             est_m = ips_to_metric(est.clamp(0, 1), self.hparams.min_depth, self.hparams.max_depth)
             tgt_m = ips_to_metric(tgt.clamp(0, 1), self.hparams.min_depth, self.hparams.max_depth)
@@ -547,8 +681,6 @@ class SnapshotDepthHS(pl.LightningModule):
         else:
             abs_depth_err_m = torch.tensor(0.0, device=est.device)
             mae_depth_m = torch.tensor(float('nan'), device=est.device)
-        if num_valid_px > 0:
-            self.log('validation/mae_depth_m_batch_avg', mae_depth_m, on_step=False, on_epoch=True)
 
         # Masked HS PSNR (with shape check)
         est_images = outputs.est_images
@@ -560,58 +692,59 @@ class SnapshotDepthHS(pl.LightningModule):
             )
         mask4d = final_mask.unsqueeze(1)  # (B,1,H,W)
         n_valid_hs = mask4d.sum() * est_images.shape[1]
-        if n_valid_hs > 0:
-            mse_hs = ((est_images - target_images_val) ** 2 * mask4d).sum() / n_valid_hs
-            hs_l1_masked = (torch.abs(est_images - target_images_val) * mask4d).sum() / n_valid_hs
-        else:
-            mse_hs = torch.tensor(1e-10, device=est_images.device)
-            hs_l1_masked = torch.tensor(0.0, device=est_images.device)
-        psnr_hs_masked = 10 * torch.log10(1.0 / (mse_hs + 1e-10))
-        self.log('validation/psnr_hs_masked', psnr_hs_masked, on_step=False, on_epoch=True)
-        self.log('validation/hs_l1_masked', hs_l1_masked, on_step=False, on_epoch=True)
+        hs_error = est_images - target_images_val
+        hs_abs_sum = (torch.abs(hs_error) * mask4d).sum()
+        hs_sq_sum = (hs_error.square() * mask4d).sum()
 
         # Full-image PSNR (for reference)
-        mse_hs_full = ((est_images - target_images_val) ** 2).mean()
-        psnr_hs_full = 10 * torch.log10(1.0 / (mse_hs_full + 1e-10))
-        self.log('validation/psnr_hs_full', psnr_hs_full, on_step=False, on_epoch=True)
+        hs_full_sq_sum = hs_error.square().sum()
+        hs_full_count = hs_error.numel()
 
         # Baek-style depth TV on inverse-depth/IPS predictions, masked to valid neighbors.
         dx = torch.abs(est[:, :, 1:] - est[:, :, :-1])
         dy = torch.abs(est[:, 1:, :] - est[:, :-1, :])
         mask_dx = final_mask[:, :, 1:] * final_mask[:, :, :-1]
         mask_dy = final_mask[:, 1:, :] * final_mask[:, :-1, :]
-        depth_tv = 0.5 * (
-            (dx * mask_dx).sum() / (mask_dx.sum() + 1e-6) +
-            (dy * mask_dy).sum() / (mask_dy.sum() + 1e-6)
-        )
-        self.log('validation/depth_tv', depth_tv, on_step=False, on_epoch=True)
+        depth_tv_dx_sum = (dx * mask_dx).sum()
+        depth_tv_dx_count = mask_dx.sum()
+        depth_tv_dy_sum = (dy * mask_dy).sum()
+        depth_tv_dy_count = mask_dy.sum()
 
         # Background HS L1 for full-image visual quality; opt-in via background_hs_loss_weight.
         bg_mask4d = (1.0 - final_mask).unsqueeze(1)
         n_bg_hs = bg_mask4d.sum() * est_images.shape[1]
-        if n_bg_hs > 0:
-            bg_hs_l1 = (torch.abs(est_images - target_images_val) * bg_mask4d).sum() / n_bg_hs
-        else:
-            bg_hs_l1 = torch.tensor(0.0, device=est_images.device)
-        self.log('validation/hs_l1_background', bg_hs_l1, on_step=False, on_epoch=True)
+        background_hs_abs_sum = (torch.abs(hs_error) * bg_mask4d).sum()
 
-        # Accumulate for epoch-end artifact saving — skip no-valid-pixel batches
-        if num_valid_px > 0:
-            self._val_psnr_hs_sum += psnr_hs_masked.item()
-            if not torch.isnan(mae_depth_m):
-                self._val_mae_depth_m_sum += mae_depth_m.item()
-                self._val_mae_depth_m_abs_sum += abs_depth_err_m.item()
-                self._val_mae_depth_m_valid_px += num_valid_px.item()
-            self._val_mae_depth_sum += mae.item()
-            self._val_hs_l1_masked_sum += hs_l1_masked.item()
-            self._val_depth_tv_sum += depth_tv.item()
-            self._val_bg_hs_l1_sum += bg_hs_l1.item()
-            self._val_steps += 1
-        else:
-            self._val_skipped_steps += 1
+        batch_totals = {
+            'depth_abs_sum': depth_abs_sum,
+            'depth_sq_sum': depth_sq_sum,
+            'depth_valid_count': num_valid_px,
+            'metric_depth_abs_sum': abs_depth_err_m,
+            'metric_depth_batch_mae_sum': (
+                mae_depth_m if num_valid_px > 0
+                else torch.zeros_like(abs_depth_err_m)
+            ),
+            'hs_abs_sum': hs_abs_sum,
+            'hs_sq_sum': hs_sq_sum,
+            'hs_valid_count': n_valid_hs,
+            'hs_full_sq_sum': hs_full_sq_sum,
+            'hs_full_count': hs_full_count,
+            'depth_tv_dx_sum': depth_tv_dx_sum,
+            'depth_tv_dx_count': depth_tv_dx_count,
+            'depth_tv_dy_sum': depth_tv_dy_sum,
+            'depth_tv_dy_count': depth_tv_dy_count,
+            'background_hs_abs_sum': background_hs_abs_sum,
+            'background_hs_count': n_bg_hs,
+            'valid_batches': 1.0 if num_valid_px > 0 else 0.0,
+            'skipped_batches': 0.0 if num_valid_px > 0 else 1.0,
+        }
+        for key, value in batch_totals.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().to(torch.float64).item()
+            self._val_totals[key] += float(value)
 
         # Save first valid batch outputs for artifact PNG generation
-        if batch_idx == 0:
+        if batch_idx == 0 and self._trainer_is_global_zero():
             self.__log_images(outputs, outputs.target_images, outputs.target_depthmaps, 'validation', final_mask)
             self._last_val_outputs = outputs
             self._last_val_mask = final_mask
@@ -639,51 +772,126 @@ class SnapshotDepthHS(pl.LightningModule):
 #         self.log('validation/psnr_image', psnr_image)
 
     def validation_epoch_end(self, outputs):
-        n = max(self._val_steps, 1)
-        avg_psnr_hs = self._val_psnr_hs_sum / n
-        avg_mae_depth_m_batch = self._val_mae_depth_m_sum / n
-        if self._val_mae_depth_m_valid_px > 0:
-            avg_mae_depth_m = self._val_mae_depth_m_abs_sum / self._val_mae_depth_m_valid_px
-        else:
-            avg_mae_depth_m = float('nan')
-        avg_mae_depth = self._val_mae_depth_sum / n
-        avg_hs_l1_masked = self._val_hs_l1_masked_sum / n
-        avg_depth_tv = self._val_depth_tv_sum / n
-        avg_bg_hs_l1 = self._val_bg_hs_l1_sum / n
+        totals = _all_reduce_validation_totals(
+            self._val_totals, device=self.device)
+        depth_count = totals['depth_valid_count']
+        hs_count = totals['hs_valid_count']
+        if depth_count <= 0.0 or hs_count <= 0.0:
+            raise RuntimeError(
+                'Validation has no globally valid foreground pixels; '
+                'cannot compute model-selection metrics.')
+
+        avg_mae_depth = totals['depth_abs_sum'] / depth_count
+        avg_mse_depth = totals['depth_sq_sum'] / depth_count
+        avg_mae_depth_m = totals['metric_depth_abs_sum'] / depth_count
+        valid_batches = totals['valid_batches']
+        avg_mae_depth_m_batch = (
+            totals['metric_depth_batch_mae_sum'] / valid_batches
+            if valid_batches > 0.0 else float('nan')
+        )
+        avg_hs_l1_masked = totals['hs_abs_sum'] / hs_count
+        mse_hs_masked = totals['hs_sq_sum'] / hs_count
+        avg_psnr_hs = 10.0 * np.log10(
+            1.0 / (mse_hs_masked + 1e-10))
+
+        hs_full_count = totals['hs_full_count']
+        mse_hs_full = (
+            totals['hs_full_sq_sum'] / hs_full_count
+            if hs_full_count > 0.0 else float('nan')
+        )
+        psnr_hs_full = (
+            10.0 * np.log10(1.0 / (mse_hs_full + 1e-10))
+            if np.isfinite(mse_hs_full) else float('nan')
+        )
+        depth_tv_dx = (
+            totals['depth_tv_dx_sum'] / totals['depth_tv_dx_count']
+            if totals['depth_tv_dx_count'] > 0.0 else 0.0
+        )
+        depth_tv_dy = (
+            totals['depth_tv_dy_sum'] / totals['depth_tv_dy_count']
+            if totals['depth_tv_dy_count'] > 0.0 else 0.0
+        )
+        avg_depth_tv = 0.5 * (depth_tv_dx + depth_tv_dy)
+        avg_bg_hs_l1 = (
+            totals['background_hs_abs_sum']
+            / totals['background_hs_count']
+            if totals['background_hs_count'] > 0.0 else 0.0
+        )
         val_loss = (
             self.hparams.image_loss_weight * avg_hs_l1_masked +
             self.hparams.depth_loss_weight * avg_mae_depth +
             float(getattr(self.hparams, 'depth_smooth_weight', 0.0)) * avg_depth_tv +
             float(getattr(self.hparams, 'background_hs_loss_weight', 0.0)) * avg_bg_hs_l1
         )
-        self.log('val_loss', torch.tensor(val_loss, device=self.device))
-        self.log('validation/mae_depth_m', torch.tensor(avg_mae_depth_m, device=self.device))
-        extra = {
+        global_metrics = {
             'val_loss': val_loss,
-            'validation/psnr_hs_masked': avg_psnr_hs,
+            'validation/mae_depthmap': avg_mae_depth,
+            'validation/mse_depthmap': avg_mse_depth,
             'validation/mae_depth_m': avg_mae_depth_m,
             'validation/mae_depth_m_batch_avg': avg_mae_depth_m_batch,
-            'validation/mae_depth_m_valid_px': self._val_mae_depth_m_valid_px,
-            'validation/mae_depthmap': avg_mae_depth,
             'validation/hs_l1_masked': avg_hs_l1_masked,
+            'validation/psnr_hs_masked': avg_psnr_hs,
+            'validation/psnr_hs_full': psnr_hs_full,
             'validation/depth_tv': avg_depth_tv,
             'validation/hs_l1_background': avg_bg_hs_l1,
-            'validation/val_steps': self._val_steps,
-            'validation/skipped_steps': self._val_skipped_steps,
+        }
+        for name, value in global_metrics.items():
+            self.log(
+                name,
+                torch.tensor(value, dtype=torch.float32, device=self.device),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
+        extra = {
+            **global_metrics,
+            'validation/mae_depth_m_valid_px': depth_count,
+            'validation/hs_valid_values': hs_count,
+            'validation/val_steps': valid_batches,
+            'validation/skipped_steps': totals['skipped_batches'],
             'train_misc/nonfinite_count': self._nonfinite_count,
         }
         last_grads = getattr(self, '_last_grad_norms', None)
         if last_grads:
             for k, v in last_grads.items():
                 extra[f'diag/grad_{k}'] = v if isinstance(v, float) else float(v)
+        last_doe_metrics = getattr(self, '_last_doe_metrics', None)
+        if last_doe_metrics:
+            for key, value in last_doe_metrics.items():
+                if key == 'step' or value is None:
+                    continue
+                extra[f'doe/{key}'] = float(value)
+        capture_fraction = getattr(
+            getattr(self, 'camera', None), 'psf_capture_fraction', None)
+        if capture_fraction is not None:
+            capture_fraction = capture_fraction.detach()
+            capture_metrics = {
+                'optics/psf_capture_min': float(
+                    capture_fraction.min().item()),
+                'optics/psf_capture_mean': float(
+                    capture_fraction.mean().item()),
+                'optics/psf_capture_max': float(
+                    capture_fraction.max().item()),
+            }
+            extra.update(capture_metrics)
+            for name, value in capture_metrics.items():
+                self.log(
+                    name,
+                    torch.tensor(
+                        value, dtype=torch.float32, device=self.device),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=False,
+                )
         # Save artifacts (prefer artifact_root over log_dir)
         out_dir = self.artifact_root or self.log_dir
-        if out_dir:
+        if out_dir and self._trainer_is_global_zero():
             self._save_validation_artifacts(extra, out_dir)
 
     def _save_validation_artifacts(self, extra=None, out_dir=None):
         import json, os
-        from torchvision.utils import save_image
+        if not self._trainer_is_global_zero():
+            return
         out_dir = out_dir or self.artifact_root or self.log_dir
         if not out_dir:
             return
@@ -922,7 +1130,7 @@ class SnapshotDepthHS(pl.LightningModule):
             dodo_doe_coeff_norm_limit = float(
                 getattr(hparams, 'dodo_doe_coeff_norm_limit', 1.0))
             dodo_doe_init_coeff_norm = float(
-                getattr(hparams, 'dodo_doe_init_coeff_norm', 1.0))
+                getattr(hparams, 'dodo_doe_init_coeff_norm', 0.2))
             if dodo_zernike_mode not in ('legacy12', 'free'):
                 raise ValueError(
                     'dodo_zernike_mode must be legacy12 or free, got '
@@ -963,6 +1171,8 @@ class SnapshotDepthHS(pl.LightningModule):
             soft_diopter_bandwidth_scale = getattr(hparams, 'soft_diopter_bandwidth_scale', 1.0)
             dodo_sensor_measurement = getattr(hparams, 'dodo_sensor_measurement', 'amplitude')
             dodo_image_formation = getattr(hparams, 'dodo_image_formation', 'whole_field')
+            dodo_psf_optics_version = str(getattr(
+                hparams, 'dodo_psf_optics_version', 'legacy'))
             dodo_psf_layer_mask = getattr(hparams, 'dodo_psf_layer_mask', 'baek_hard')
             dodo_psf_mask_blur_sigma = float(
                 getattr(hparams, 'dodo_psf_mask_blur_sigma', 1.0))
@@ -1165,6 +1375,7 @@ class SnapshotDepthHS(pl.LightningModule):
                 doe_basis_rms_m=dodo_doe_basis_rms_m,
                 doe_coeff_norm_limit=dodo_doe_coeff_norm_limit,
                 doe_init_coeff_norm=dodo_doe_init_coeff_norm,
+                psf_optics_version=dodo_psf_optics_version,
             )
             if hasattr(self.camera.doe1, 'coefficient_limit'):
                 self.camera.doe1.coefficient_limit = (
@@ -1195,6 +1406,9 @@ class SnapshotDepthHS(pl.LightningModule):
                   f'(work_grid={self.camera.prop1_layers[0].work_Mp}, '
                   f'work_L={self.camera.prop1_layers[0].work_L:g}m), '
                   f'image_formation={dodo_image_formation}, '
+                  f'psf_optics_version={dodo_psf_optics_version}, '
+                  f'psf_kernel_size={self.camera.psf_kernel_size}, '
+                  f'sensor_padding_factor={self.camera.sensor_padding_factor}, '
                   f'depth_layering={depth_layering_mode}, '
                   f'psf_layer_mask={dodo_psf_layer_mask}, '
                   f'psf_mask_sigma={dodo_psf_mask_blur_sigma:g}, '
@@ -2314,6 +2528,17 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--dodo_image_formation', type=str, default='whole_field',
                             choices=['whole_field', 'psf_convolution'],
                             help='DoDo image formation: legacy whole-field propagation or Baek-style PSF convolution')
+        parser.add_argument(
+            '--dodo_psf_optics_version',
+            type=str,
+            default='legacy',
+            choices=['legacy', 'consistent_grid_v1'],
+            help=(
+                'PSF 光学离散化版本；legacy 保持旧 checkpoint 语义，'
+                'consistent_grid_v1 使用统一采样、完整传感器工作网格'
+                '与中心 129x129 PSF'
+            ),
+        )
         parser.add_argument('--dodo_psf_layer_mask', type=str, default='baek_hard',
                             choices=['current', 'baek_hard'],
                             help='PSF path depth masks: current layering weights or Baek hard occupancy masks')
@@ -2374,7 +2599,7 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument(
             '--dodo_doe_init_coeff_norm',
             type=float,
-            default=1.0,
+            default=0.2,
             help='orthogonal_rms 模式的初始系数 L2 范数',
         )
         parser.add_argument('--dodo_zernike_terms', type=int, default=150,

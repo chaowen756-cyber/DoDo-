@@ -36,6 +36,7 @@ def _make_model(
     doe_basis_rms_m=3e-6,
     doe_coeff_norm_limit=1.0,
     doe_init_coeff_norm=1.0,
+    psf_optics_version="legacy",
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=0.4,
@@ -68,6 +69,7 @@ def _make_model(
         doe_basis_rms_m=doe_basis_rms_m,
         doe_coeff_norm_limit=doe_coeff_norm_limit,
         doe_init_coeff_norm=doe_init_coeff_norm,
+        psf_optics_version=psf_optics_version,
     )
 
 
@@ -207,6 +209,74 @@ def test_image_formation_mode_does_not_change_state_dict_keys():
     assert set(whole_field.state_dict()) == set(psf_convolution.state_dict())
 
 
+def test_legacy_optics_version_preserves_original_grid_and_checkpoint_keys():
+    legacy = _make_model()
+    consistent = _make_model(psf_optics_version="consistent_grid_v1")
+
+    assert legacy.psf_optics_version == "legacy"
+    assert legacy.prop1_layers[0].Mp == 128
+    assert legacy.prop1_layers[0].L == 0.01
+    assert legacy.prop2.L == 0.006
+    assert legacy.prop3.Mp == 128
+    assert legacy.prop3.L == 0.0048
+    assert legacy.prop3.padding_factor == 1
+    assert legacy.psf_kernel_size == 128
+    assert not legacy.doe1.use_pupil_mask
+    assert legacy.psf_capture_fraction is None
+    assert set(legacy.state_dict()) == set(consistent.state_dict())
+
+
+def test_legacy_optics_version_matches_pre_version_numeric_signature():
+    """Lock the legacy path to the fixed output from commit 5d598db."""
+    model = _make_model(
+        doe_type_a="New",
+        num_depth_layers=2,
+        prop1_padding_factor=2,
+        doe_init_coeff_norm=1.0,
+        psf_optics_version="legacy",
+    ).eval()
+    with torch.no_grad():
+        model.doe1.zernike_coeffs.copy_(torch.linspace(-0.7, 0.8, 12))
+        psf = model.psf_bank(use_cache=False).contiguous()
+        spectral = torch.zeros((1, 25, 128, 128))
+        spectral[:, :, 32, 47] = torch.linspace(0.1, 1.0, 25)
+        depth = torch.full((1, 1, 128, 128), 1.1)
+        output = model(spectral, depth).contiguous()
+
+    def signature(tensor):
+        flat = tensor.flatten().double()
+        index = torch.arange(flat.numel(), dtype=torch.float64)
+        probe = (
+            torch.sin(index * 0.0012345)
+            + 0.5 * torch.cos(index * 0.000371)
+        )
+        return torch.stack((
+            tensor.double().square().sum(),
+            (flat * probe).sum(),
+        ))
+
+    assert psf.shape == (2, 25, 128, 128)
+    assert output.shape == (1, 25, 128, 128)
+    torch.testing.assert_close(
+        signature(psf),
+        torch.tensor(
+            [0.02176754705838957, -0.41372271047027076],
+            dtype=torch.float64,
+        ),
+        atol=2e-8,
+        rtol=2e-5,
+    )
+    torch.testing.assert_close(
+        signature(output),
+        torch.tensor(
+            [0.0003747086780208601, 0.2607653568955358],
+            dtype=torch.float64,
+        ),
+        atol=2e-8,
+        rtol=2e-5,
+    )
+
+
 def test_prop1_padding_parameter_preserves_existing_positional_api():
     orthogonal_parameters = (
         "doe_basis_mode",
@@ -215,6 +285,7 @@ def test_prop1_padding_parameter_preserves_existing_positional_api():
         "doe_basis_rms_m",
         "doe_coeff_norm_limit",
         "doe_init_coeff_norm",
+        "psf_optics_version",
     )
     for model_factory in (
         DepthAwareDoDoForwardModel,
@@ -235,6 +306,152 @@ def test_prop1_padding_parameter_preserves_existing_positional_api():
             parameters[name].kind == inspect.Parameter.KEYWORD_ONLY
             for name in orthogonal_parameters
         )
+
+
+def test_consistent_grid_rejects_unvalidated_optical_chains():
+    with pytest.raises(ValueError, match="defined only"):
+        DepthAwareDoDoForwardModel(
+            skip_prop2=True,
+            psf_optics_version="consistent_grid_v1",
+        )
+
+    with pytest.raises(ValueError, match="requires skip_prop2=True"):
+        DepthAwareDoDoForwardModel(
+            image_formation_mode="psf_convolution",
+            sensor_measurement="intensity",
+            skip_prop2=False,
+            psf_optics_version="consistent_grid_v1",
+        )
+
+    with pytest.raises(ValueError, match="requires use_second_doe=False"):
+        DepthAwareDoDoForwardModel(
+            use_second_doe=True,
+            image_formation_mode="psf_convolution",
+            sensor_measurement="intensity",
+            skip_prop2=True,
+            psf_optics_version="consistent_grid_v1",
+        )
+
+    with pytest.raises(ValueError, match="requires psf_boundary_mode='linear_zero'"):
+        DepthAwareDoDoForwardModel(
+            image_formation_mode="psf_convolution",
+            sensor_measurement="intensity",
+            skip_prop2=True,
+            psf_boundary_mode="circular",
+            psf_optics_version="consistent_grid_v1",
+        )
+
+
+def test_consistent_grid_uses_one_pitch_and_pupil_amplitude_mask():
+    model = _make_model(psf_optics_version="consistent_grid_v1")
+
+    expected_pitch = 0.01 / 128
+    assert all(layer.Mp == 128 for layer in model.prop1_layers)
+    assert all(
+        layer.L / layer.Mp == expected_pitch
+        for layer in model.prop1_layers
+    )
+    assert model.prop3.Mp == 128
+    assert model.prop3.L / model.prop3.Mp == expected_pitch
+    assert model.prop3.padding_factor == 2
+    assert model.prop3.work_Mp == 256
+    assert model.prop3.work_L == 0.02
+    assert model.doe1.use_pupil_mask
+
+    field = torch.ones((1, 25, 128, 128), dtype=torch.complex64)
+    with torch.no_grad():
+        modulated = model.doe1(field)
+    pupil = model.doe1.spiral_p > 0.5
+    torch.testing.assert_close(
+        modulated[..., ~pupil],
+        torch.zeros_like(modulated[..., ~pupil]),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        modulated[..., pupil].abs(),
+        torch.ones_like(modulated[..., pupil].real),
+        atol=1e-6,
+        rtol=0,
+    )
+
+    model._assert_consistent_optical_sampling()
+    model.prop3.L = 0.0048
+    with pytest.raises(ValueError, match="equal sampling pitch"):
+        model._assert_consistent_optical_sampling()
+
+
+def test_consistent_grid_psf_normalizes_full_field_then_crops_129():
+    model = _make_model(
+        num_depth_layers=2,
+        prop1_padding_factor=2,
+        psf_optics_version="consistent_grid_v1",
+    ).eval()
+
+    with torch.no_grad():
+        prop1_fields = model._prop1_impulse_field_bank(
+            128, 128, torch.device("cpu"))
+        sensor_field = model._propagate_after_prop1(
+            prop1_fields,
+            return_sensor_work_grid=True,
+        )
+        full_intensity = sensor_field.abs().square()
+        normalized_full = full_intensity / full_intensity.sum(
+            dim=(-2, -1), keepdim=True)
+        expected = normalized_full[..., 64:193, 64:193]
+        actual = model.psf_bank(use_cache=False)
+
+    assert sensor_field.shape == (2, 25, 256, 256)
+    assert actual.shape == (2, 25, 129, 129)
+    torch.testing.assert_close(
+        normalized_full.sum(dim=(-2, -1)),
+        torch.ones((2, 25)),
+        atol=2e-6,
+        rtol=0,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert model._last_psf_capture_fraction is not None
+    torch.testing.assert_close(
+        actual.sum(dim=(-2, -1)),
+        model.psf_capture_fraction,
+        atol=0,
+        rtol=0,
+    )
+    assert torch.all(model.psf_capture_fraction > 0.99)
+    assert torch.all(model.psf_capture_fraction <= 1.0 + 2e-6)
+
+
+def test_consistent_grid_129_crop_uses_optical_center_not_floor_difference(
+    monkeypatch,
+):
+    model = _make_model(psf_optics_version="consistent_grid_v1").eval()
+
+    def fake_sensor_field(self, field, *, return_sensor_work_grid=False):
+        assert return_sensor_work_grid
+        result = torch.zeros(
+            (self.num_depth_layers, 25, 256, 256),
+            dtype=torch.complex64,
+            device=field.device,
+        )
+        result[..., 128, 128] = 1.0
+        return result
+
+    monkeypatch.setattr(
+        model,
+        "_propagate_after_prop1",
+        types.MethodType(fake_sensor_field, model),
+    )
+    with torch.no_grad():
+        psf = model.psf_bank(use_cache=False)
+
+    assert psf.shape == (1, 25, 129, 129)
+    assert torch.count_nonzero(psf).item() == 25
+    torch.testing.assert_close(
+        psf[..., 64, 64],
+        torch.ones((1, 25)),
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_psf_bank_is_finite_nonnegative_normalized_and_cached(frozen_psf_model):

@@ -146,7 +146,10 @@ class PropagationLayer(nn.Module):
         top, left = crop_offset
         return x[..., top:top + self.Mp, left:left + self.Mp]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _propagate_work_grid(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
         if x.ndim != 4:
             raise ValueError(f"PropagationLayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}")
 
@@ -161,4 +164,20 @@ class PropagationLayer(nn.Module):
         u1f = centered_fft2(x_complex, dim=(-2, -1))
         u2f = u1f * self._kernel(x.device)
         output_work = centered_ifft2(u2f, dim=(-2, -1))
+        return output_work, crop_offset
+
+    def forward_work_grid(self, x: torch.Tensor) -> torch.Tensor:
+        """Propagate on the padded grid without discarding its outer support.
+
+        ``forward`` retains the historical API and center-crops back to
+        ``Mp``.  PSF generation sometimes needs the complete padded sensor
+        field so it can normalize against all propagated energy before
+        selecting a finite convolution kernel; this method exposes that field
+        while sharing the exact same validation, kernel, and FFT path.
+        """
+        output_work, _ = self._propagate_work_grid(x)
+        return output_work
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_work, crop_offset = self._propagate_work_grid(x)
         return self._crop_from_work_grid(output_work, crop_offset)

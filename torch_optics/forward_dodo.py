@@ -56,6 +56,7 @@ _DEPTH_LAYERING_MODES = {"hard_depth", "hard_meter", "soft_diopter"}
 _IMAGE_FORMATION_MODES = {"whole_field", "psf_convolution"}
 _PSF_LAYER_MASK_MODES = {"current", "baek_hard"}
 _PSF_BOUNDARY_MODES = {"linear_zero", "circular"}
+_PSF_OPTICS_VERSIONS = {"legacy", "consistent_grid_v1"}
 
 
 def _next_fast_fft_length(target: int) -> int:
@@ -297,10 +298,38 @@ class DepthAwareDoDoForwardModel(nn.Module):
         doe_basis_rank_rtol: float = 1e-4,
         doe_basis_rms_m: float = 3e-6,
         doe_coeff_norm_limit: float = 1.0,
-        doe_init_coeff_norm: float = 1.0,
+        doe_init_coeff_norm: float = 0.2,
+        psf_optics_version: str = "legacy",
     ):
         super().__init__()
         self.skip_prop2 = bool(skip_prop2)
+        psf_optics_version = str(psf_optics_version).lower()
+        if psf_optics_version not in _PSF_OPTICS_VERSIONS:
+            raise ValueError(
+                "psf_optics_version must be one of "
+                f"{_PSF_OPTICS_VERSIONS}, got '{psf_optics_version}'"
+            )
+        self.psf_optics_version = psf_optics_version
+        self.optical_grid_size = 128
+        self.optical_grid_length_m = 0.01
+        if self.psf_optics_version == "consistent_grid_v1":
+            self.sensor_padding_factor = 2
+            self.psf_kernel_size = 129
+        else:
+            self.sensor_padding_factor = 1
+            self.psf_kernel_size = 128
+        if self.psf_optics_version == "consistent_grid_v1":
+            if not self.skip_prop2:
+                raise ValueError(
+                    "consistent_grid_v1 currently requires skip_prop2=True; "
+                    "the intermediate propagation chain has not been "
+                    "validated for this PSF model"
+                )
+            if use_second_doe:
+                raise ValueError(
+                    "consistent_grid_v1 currently requires "
+                    "use_second_doe=False"
+                )
         if isinstance(prop1_padding_factor, bool) or not isinstance(
             prop1_padding_factor, int
         ):
@@ -335,6 +364,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
             raise ValueError(
                 f"image_formation_mode must be one of {_IMAGE_FORMATION_MODES}, "
                 f"got '{image_formation_mode}'")
+        if (
+            self.psf_optics_version == "consistent_grid_v1"
+            and image_formation_mode != "psf_convolution"
+        ):
+            raise ValueError(
+                "consistent_grid_v1 is defined only for "
+                "image_formation_mode='psf_convolution'"
+            )
         psf_layer_mask_mode = psf_layer_mask_mode.lower()
         if psf_layer_mask_mode not in _PSF_LAYER_MASK_MODES:
             raise ValueError(
@@ -345,6 +382,15 @@ class DepthAwareDoDoForwardModel(nn.Module):
             raise ValueError(
                 f"psf_boundary_mode must be one of {_PSF_BOUNDARY_MODES}, "
                 f"got '{psf_boundary_mode}'")
+        if (
+            self.psf_optics_version == "consistent_grid_v1"
+            and psf_boundary_mode != "linear_zero"
+        ):
+            raise ValueError(
+                "consistent_grid_v1 requires "
+                "psf_boundary_mode='linear_zero': its centered 129x129 PSF "
+                "must not be truncated to the 128x128 scene FFT grid"
+            )
         psf_mask_blur_sigma = float(psf_mask_blur_sigma)
         if psf_mask_blur_sigma < 0:
             raise ValueError(
@@ -418,7 +464,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         self.prop1_layers = nn.ModuleList([
             PropagationLayer(
                 Mp=minput,
-                L=0.01,
+                L=self.optical_grid_length_m,
                 zi=float(z_centers[k]),
                 trainable_z=False,
                 padding_factor=self.prop1_padding_factor,
@@ -432,12 +478,18 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 doe_type=doe_type_a, trainable=train_c,
                 assets_dir=assets_dir, basis_path=zernike_basis_path,
                 phase_scale_mode="legacy_free",
+                use_pupil_mask=(
+                    self.psf_optics_version == "consistent_grid_v1"
+                ),
             )
         else:
             self.doe1 = DOELayer(
                 Mdoe=mss, Mesce=minput, doe_type=doe_type_a,
                 trainable=train_c, assets_dir=assets_dir,
                 phase_scale_mode="legacy_doe",
+                use_pupil_mask=(
+                    self.psf_optics_version == "consistent_grid_v1"
+                ),
                 basis_mode=doe_basis_mode,
                 basis_rank=doe_basis_rank,
                 basis_rank_rtol=doe_basis_rank_rtol,
@@ -446,16 +498,42 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 init_coeff_norm=doe_init_coeff_norm,
             )
 
-        self.prop2 = PropagationLayer(Mp=mss, L=0.006, zi=0.05, trainable_z=False)
+        intermediate_length = (
+            self.optical_grid_length_m
+            if self.psf_optics_version == "consistent_grid_v1"
+            else 0.006
+        )
+        sensor_length = (
+            self.optical_grid_length_m
+            if self.psf_optics_version == "consistent_grid_v1"
+            else 0.0048
+        )
+        self.prop2 = PropagationLayer(
+            Mp=mss,
+            L=intermediate_length,
+            zi=0.05,
+            trainable_z=False,
+        )
         self.doe2 = DOELayer(
             Mdoe=mss, Mesce=mss, doe_type="Spiral", trainable=False,
             assets_dir=assets_dir, phase_scale_mode="legacy_doe",
+            use_pupil_mask=(
+                self.psf_optics_version == "consistent_grid_v1"
+            ),
         )
-        self.prop3 = PropagationLayer(Mp=mss, L=0.0048, zi=0.01, trainable_z=False)
+        self.prop3 = PropagationLayer(
+            Mp=mss,
+            L=sensor_length,
+            zi=0.01,
+            trainable_z=False,
+            padding_factor=self.sensor_padding_factor,
+        )
         self.sensing_unnorm = SensingLayer(Ms=mss, assets_dir=assets_dir, normalize=False,
                                             sensing_mode=sensing_mode,
                                             measurement_channels=measurement_channels,
                                             sensor_measurement=sensor_measurement)
+        if self.psf_optics_version == "consistent_grid_v1":
+            self._assert_consistent_optical_sampling()
         # Frozen-optics inference/Stage-B training can reuse this bank.  It is
         # intentionally a plain attribute, not a persistent buffer, so the new
         # image-formation mode does not change checkpoint state-dict keys.
@@ -467,6 +545,91 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # independently from the trainable DOE-dependent PSF bank.
         self._cached_prop1_field_bank = None
         self._cached_prop1_field_key = None
+        self._last_psf_capture_fraction = None
+
+    def _assert_consistent_optical_sampling(self):
+        """Verify that every represented plane uses one physical sample pitch."""
+        if self.psf_optics_version != "consistent_grid_v1":
+            return
+
+        expected_size = self.optical_grid_size
+        expected_length = self.optical_grid_length_m
+        expected_pitch = expected_length / expected_size
+        propagation_layers = [
+            *self.prop1_layers,
+            self.prop2,
+            self.prop3,
+        ]
+        for layer in propagation_layers:
+            if layer.Mp != expected_size:
+                raise ValueError(
+                    "consistent_grid_v1 requires every propagation plane to "
+                    f"use Mp={expected_size}, got {layer.Mp}"
+                )
+            pitch = layer.L / layer.Mp
+            if abs(pitch - expected_pitch) > 1e-12:
+                raise ValueError(
+                    "consistent_grid_v1 requires equal sampling pitch across "
+                    f"all planes: expected {expected_pitch:g}m, got {pitch:g}m"
+                )
+
+        for name, doe in (("doe1", self.doe1), ("doe2", self.doe2)):
+            if doe.Mesce != expected_size or doe.Mdoe != expected_size:
+                raise ValueError(
+                    "consistent_grid_v1 requires the DOE sampling grid to "
+                    f"remain {expected_size}x{expected_size}; {name} has "
+                    f"Mesce={doe.Mesce}, Mdoe={doe.Mdoe}"
+                )
+            if not doe.use_pupil_mask:
+                raise ValueError(
+                    f"consistent_grid_v1 requires {name} to apply its pupil "
+                    "as an amplitude-domain validity mask"
+                )
+
+        if self.prop3.padding_factor != 2:
+            raise ValueError(
+                "consistent_grid_v1 requires Prop3 padding_factor=2"
+            )
+        if self.prop3.work_Mp != 256 or abs(self.prop3.work_L - 0.02) > 1e-12:
+            raise ValueError(
+                "consistent_grid_v1 requires the Prop3 work grid to be "
+                "256x256 over 0.02m"
+            )
+        if self.psf_kernel_size != 129:
+            raise ValueError(
+                "consistent_grid_v1 requires a centered 129x129 PSF kernel"
+            )
+
+    def _psf_config_signature(self):
+        return (
+            self.psf_optics_version,
+            self.optical_grid_size,
+            self.optical_grid_length_m,
+            self.sensor_padding_factor,
+            self.psf_kernel_size,
+            self.prop1_padding_factor,
+            tuple(
+                (
+                    layer.Mp,
+                    layer.L,
+                    layer.padding_factor,
+                    layer.work_Mp,
+                    layer.work_L,
+                )
+                for layer in (*self.prop1_layers, self.prop2, self.prop3)
+            ),
+            self.doe1.Mesce,
+            self.doe1.Mdoe,
+            self.doe1.use_pupil_mask,
+            self.doe2.Mesce,
+            self.doe2.Mdoe,
+            self.doe2.use_pupil_mask,
+        )
+
+    @property
+    def psf_capture_fraction(self) -> Optional[torch.Tensor]:
+        """Energy fraction retained by the latest consistent-grid PSF crop."""
+        return self._last_psf_capture_fraction
 
     def clamp_parameters_(self):
         if hasattr(self.doe1, "clamp_parameters_"):
@@ -480,6 +643,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
         self._cached_psf_key = None
         self._cached_psf_fft_bank = None
         self._cached_psf_fft_key = None
+        self._last_psf_capture_fraction = None
 
     def clear_static_optics_cache(self):
         self.clear_psf_cache()
@@ -684,12 +848,19 @@ class DepthAwareDoDoForwardModel(nn.Module):
         field = self.prop1_layers[depth_index](field)
         return self._propagate_after_prop1(field)
 
-    def _propagate_after_prop1(self, field: torch.Tensor) -> torch.Tensor:
+    def _propagate_after_prop1(
+        self,
+        field: torch.Tensor,
+        *,
+        return_sensor_work_grid: bool = False,
+    ) -> torch.Tensor:
         field = self.doe1(field)
         if not self.skip_prop2:
             field = self.prop2(field)
         if self.use_second_doe:
             field = self.doe2(field)
+        if return_sensor_work_grid:
+            return self.prop3.forward_work_grid(field)
         return self.prop3(field)
 
     def _optics_are_frozen(self) -> bool:
@@ -707,7 +878,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
         width: int,
         device: torch.device,
     ) -> torch.Tensor:
-        cache_key = (device.type, device.index, height, width)
+        cache_key = (
+            device.type,
+            device.index,
+            height,
+            width,
+            self._psf_config_signature(),
+        )
         prop1_is_frozen = not any(
             parameter.requires_grad
             for layer in self.prop1_layers
@@ -761,6 +938,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             device.index,
             height,
             width,
+            self._psf_config_signature(),
             self._optics_parameter_signature(),
         )
         # Stage-A validation runs without gradients while DOE parameters remain
@@ -776,11 +954,52 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # Depth is represented as the batch dimension, so DOE phase generation
         # and all downstream propagations execute once as batched operations.
         prop1_fields = self._prop1_impulse_field_bank(height, width, device)
-        sensor_field = self._propagate_after_prop1(prop1_fields)
-        psf_bank = torch.abs(sensor_field).to(torch.float32) ** 2
-        psf_bank = psf_bank / psf_bank.sum(
-            dim=(-2, -1), keepdim=True
-        ).clamp_min(1e-8)
+        if self.psf_optics_version == "consistent_grid_v1":
+            self._assert_consistent_optical_sampling()
+            sensor_field = self._propagate_after_prop1(
+                prop1_fields,
+                return_sensor_work_grid=True,
+            )
+            full_intensity = torch.abs(sensor_field).to(torch.float32).square()
+            normalized_full = full_intensity / full_intensity.sum(
+                dim=(-2, -1), keepdim=True
+            ).clamp_min(1e-8)
+
+            full_height, full_width = normalized_full.shape[-2:]
+            half_kernel = self.psf_kernel_size // 2
+            crop_top = full_height // 2 - half_kernel
+            crop_left = full_width // 2 - half_kernel
+            crop_bottom = crop_top + self.psf_kernel_size
+            crop_right = crop_left + self.psf_kernel_size
+            if (
+                crop_top < 0
+                or crop_left < 0
+                or crop_bottom > full_height
+                or crop_right > full_width
+            ):
+                raise ValueError(
+                    f"Cannot center-crop a {self.psf_kernel_size}x"
+                    f"{self.psf_kernel_size} PSF from the "
+                    f"{full_height}x{full_width} sensor work grid"
+                )
+            # Deliberately do not normalize this crop again. Its sum is the
+            # fraction of the complete propagated energy represented by the
+            # finite convolution kernel.
+            psf_bank = normalized_full[
+                ...,
+                crop_top:crop_bottom,
+                crop_left:crop_right,
+            ]
+            self._last_psf_capture_fraction = psf_bank.detach().sum(
+                dim=(-2, -1)
+            )
+        else:
+            sensor_field = self._propagate_after_prop1(prop1_fields)
+            psf_bank = torch.abs(sensor_field).to(torch.float32).square()
+            psf_bank = psf_bank / psf_bank.sum(
+                dim=(-2, -1), keepdim=True
+            ).clamp_min(1e-8)
+            self._last_psf_capture_fraction = None
 
         if can_cache:
             self._cached_psf_bank = psf_bank.detach()
@@ -812,6 +1031,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             psf_bank.dtype,
             tuple(fft_size),
             self.psf_boundary_mode,
+            self._psf_config_signature(),
         )
         can_cache = not psf_bank.requires_grad
         if (
@@ -945,12 +1165,17 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # incoherent intensity model: spectral radiance is convolved directly
         # with normalized intensity PSFs. Do not apply the field-amplitude
         # square root here.
-        # The optical PSF sampling grid stays fixed at the calibrated 128x128
-        # sensor grid. Scene tiles may be larger (for example, a 256x256 tile
-        # with a 64-pixel halo) and are convolved with this fixed kernel.
-        kernel_size = int(self.prop1_layers[0].Mp)
+        # The optical input grid remains 128x128. Legacy mode also returns a
+        # 128x128 kernel, whereas consistent_grid_v1 retains a centered
+        # 129x129 kernel from its complete padded sensor field. Scene tiles may
+        # be larger (for example, a 256x256 tile with a 64-pixel halo).
+        optical_input_size = int(self.prop1_layers[0].Mp)
         psf_bank = self._generate_psf_bank(
-            kernel_size, kernel_size, spectral.device, use_cache=True)
+            optical_input_size,
+            optical_input_size,
+            spectral.device,
+            use_cache=True,
+        )
         response = self._sensor_response_matrix(spectral.device, spectral.dtype)
         y_sum = torch.zeros(
             (batch, response.shape[0], output_height, output_width),
@@ -1040,6 +1265,11 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 "psf_energy",
                 _tensor_stats(psf_bank.detach().sum(dim=(-2, -1))),
             ))
+            if self._last_psf_capture_fraction is not None:
+                stage_diag.append((
+                    "psf_capture_fraction",
+                    _tensor_stats(self._last_psf_capture_fraction),
+                ))
 
         chunk_size = min(self.psf_depth_chunk_size, self.num_depth_layers)
         for chunk_start in range(0, self.num_depth_layers, chunk_size):
@@ -1166,7 +1396,8 @@ def Forward_DM_Spiral_Depth(
     doe_basis_rank_rtol=1e-4,
     doe_basis_rms_m=3e-6,
     doe_coeff_norm_limit=1.0,
-    doe_init_coeff_norm=1.0,
+    doe_init_coeff_norm=0.2,
+    psf_optics_version="legacy",
 ):
     return DepthAwareDoDoForwardModel(
         depth_min=depth_min,
@@ -1200,6 +1431,7 @@ def Forward_DM_Spiral_Depth(
         doe_basis_rms_m=doe_basis_rms_m,
         doe_coeff_norm_limit=doe_coeff_norm_limit,
         doe_init_coeff_norm=doe_init_coeff_norm,
+        psf_optics_version=psf_optics_version,
     )
 
 

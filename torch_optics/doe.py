@@ -169,7 +169,7 @@ class DOELayer(_BaseDOE):
         basis_rank_rtol: float = 1e-4,
         basis_rms_m: float = 3e-6,
         coeff_norm_limit: float = 1.0,
-        init_coeff_norm: float = 1.0,
+        init_coeff_norm: float = 0.2,
     ):
         super().__init__()
         self.Mdoe = int(Mdoe)

@@ -87,17 +87,90 @@ def _project_legacy_doe_wavefront(model, checkpoint_path, legacy_basis_path):
         f'coefficient_max={np.max(np.abs(projected)):.6g}')
     return relative_error
 
-# DoDo
-class DOEParameterClampCallback(Callback):
-    """
-    Mimic Keras constraint=MinMaxNorm(...) for DOE parameters.
-    """
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs):
-        for module in pl_module.modules():
-            clamp_fn = getattr(module, "clamp_parameters_", None)
-            if callable(clamp_fn):
-                clamp_fn()
+def _checkpoint_psf_optics_version(checkpoint):
+    """Read the versioned PSF convention saved by Lightning checkpoints."""
+    if not isinstance(checkpoint, dict):
+        return None
+
+    # Lightning versions differ in whether argparse values are saved directly
+    # in hyper_parameters or below another hparams/args Namespace.
+    metadata_queue = [
+        checkpoint.get('hyper_parameters'),
+        checkpoint.get('hparams'),
+    ]
+    visited = set()
+    while metadata_queue:
+        metadata = metadata_queue.pop(0)
+        if metadata is None or id(metadata) in visited:
+            continue
+        visited.add(id(metadata))
+        if not isinstance(metadata, dict):
+            try:
+                metadata = vars(metadata)
+            except TypeError:
+                continue
+        value = metadata.get(
+            'dodo_psf_optics_version',
+            metadata.get('psf_optics_version'),
+        )
+        if value is not None:
+            return str(value).lower()
+        metadata_queue.extend(
+            metadata.get(key) for key in ('hparams', 'args')
+        )
+
+    # Checkpoints predating the flag used the legacy PSF convention.
+    return 'legacy' if 'state_dict' in checkpoint else None
+
+
+def _ensure_checkpoint_psf_optics_version(
+    checkpoint,
+    requested_version,
+    allow_mismatch=False,
+):
+    """Reject silent weight transfer between incompatible PSF conventions."""
+    requested_version = str(requested_version).lower()
+    checkpoint_version = _checkpoint_psf_optics_version(checkpoint)
+    if (
+        checkpoint_version is not None
+        and checkpoint_version != requested_version
+        and not allow_mismatch
+    ):
+        raise ValueError(
+            'Checkpoint PSF optics version mismatch: checkpoint uses '
+            f'{checkpoint_version!r}, current run requests '
+            f'{requested_version!r}. These versions have different '
+            'sampling/PSF semantics and cannot be resumed silently. '
+            'Use --allow_optics_version_mismatch only for an intentional '
+            'model-weight transfer, including optical weights.'
+        )
+    if (
+        checkpoint_version is None
+        and requested_version != 'legacy'
+        and not allow_mismatch
+    ):
+        raise ValueError(
+            'Cannot determine the PSF optics version of this raw '
+            'state_dict while consistent_grid_v1 is requested. '
+            'Use a versioned Lightning checkpoint or explicitly pass '
+            '--allow_optics_version_mismatch for a model-weight transfer, '
+            'including optical weights.'
+        )
+    return checkpoint_version
+
+
+def _configure_trainer_callbacks(trainer_kwargs, callbacks):
+    """Install explicit callbacks without PL adding a default checkpoint."""
+    trainer_init_params = inspect.signature(Trainer.__init__).parameters
+    if 'callbacks' in trainer_init_params:
+        trainer_kwargs['callbacks'] = callbacks
+    if 'checkpoint_callback' in trainer_init_params:
+        # PL 1.0.2 appends a default ModelCheckpoint unless this legacy switch
+        # is explicitly disabled, even when callbacks already contains our
+        # joint-best and depth-best checkpoint policies.
+        trainer_kwargs['checkpoint_callback'] = False
+    return trainer_kwargs
 
 
 class BestMetricTracker(Callback):
@@ -145,6 +218,11 @@ class BestMetricTracker(Callback):
 
     def _update_from_trainer(self, trainer):
         if getattr(trainer, 'sanity_checking', False):
+            return
+        if hasattr(trainer, 'is_global_zero'):
+            if not bool(trainer.is_global_zero):
+                return
+        elif int(getattr(trainer, 'global_rank', 0) or 0) != 0:
             return
 
         callback_metrics = getattr(trainer, 'callback_metrics', {}) or {}
@@ -588,11 +666,13 @@ def main(args):
     print(f'[artifact] checkpoint dir={ckpt_dir}')
 
     # --- Checkpoint callbacks ---
-    # Default policy: only joint-best writes a checkpoint. Auxiliary best metrics
-    # are tracked in JSON to avoid duplicating large .ckpt files.
-    # Use artifact_dir for checkpoint storage with stable filenames (no fake 0.0000 metric values).
-    ckpt_monitor = getattr(args, 'checkpoint_monitor', 'validation/psnr_hs_masked')
-    ckpt_mode = getattr(args, 'checkpoint_mode', 'max')
+    # Global val_loss selects the joint model.  Keep one independent
+    # depth-best checkpoint as well: HS-only selection can hide a failed depth
+    # reconstruction even when the RGB/HS branch looks good.
+    # SnapshotDepthHS publishes an all-reduced global val_loss. Explicit
+    # legacy --checkpoint_monitor/--checkpoint_mode arguments remain honored.
+    ckpt_monitor = getattr(args, 'checkpoint_monitor', None) or 'val_loss'
+    ckpt_mode = getattr(args, 'checkpoint_mode', None) or 'min'
     try:
         checkpoint_callback = ModelCheckpoint(
             monitor=ckpt_monitor,
@@ -611,39 +691,51 @@ def main(args):
             mode=ckpt_mode,
         )
 
-    auxiliary_best_metrics = [
-        ('depth-best', 'validation/mae_depth_m', 'min'),
+    def make_metric_checkpoint(metric_name, metric_monitor, metric_mode):
+        try:
+            return ModelCheckpoint(
+                monitor=metric_monitor,
+                dirpath=ckpt_dir,
+                filename=f'{metric_name}-{{epoch:03d}}',
+                save_top_k=1,
+                mode=metric_mode,
+                verbose=True,
+            )
+        except TypeError:
+            return ModelCheckpoint(
+                verbose=True,
+                monitor=metric_monitor,
+                filepath=os.path.join(
+                    ckpt_dir, f'{metric_name}-{{epoch:03d}}'),
+                save_top_k=1,
+                mode=metric_mode,
+            )
+
+    depth_checkpoint_callback = make_metric_checkpoint(
+        'depth-best', 'validation/mae_depth_m', 'min')
+    checkpoint_callbacks_for_compat = [
+        checkpoint_callback,
+        depth_checkpoint_callback,
+    ]
+    auxiliary_callbacks = [depth_checkpoint_callback]
+    print('[checkpoint] enabled: joint-best(val_loss), depth-best(mae_depth_m)')
+
+    hs_best_metric = [
         ('hs-best', 'validation/hs_l1_masked', 'min'),
     ]
-    checkpoint_callbacks_for_compat = [checkpoint_callback]
-    auxiliary_callbacks = []
-
     if getattr(args, 'save_aux_best_ckpts', False):
-        for metric_name, metric_monitor, metric_mode in auxiliary_best_metrics:
-            try:
-                auxiliary_callback = ModelCheckpoint(
-                    monitor=metric_monitor,
-                    dirpath=ckpt_dir,
-                    filename=f'{metric_name}-{{epoch:03d}}',
-                    save_top_k=1,
-                    mode=metric_mode,
-                    verbose=True,
-                )
-            except TypeError:
-                auxiliary_callback = ModelCheckpoint(
-                    verbose=True,
-                    monitor=metric_monitor,
-                    filepath=os.path.join(ckpt_dir, f'{metric_name}-{{epoch:03d}}'),
-                    save_top_k=1,
-                    mode=metric_mode,
-                )
-            auxiliary_callbacks.append(auxiliary_callback)
-            checkpoint_callbacks_for_compat.append(auxiliary_callback)
-        print('[checkpoint] auxiliary best checkpoints enabled: depth-best, hs-best')
+        hs_checkpoint_callback = make_metric_checkpoint(*hs_best_metric[0])
+        auxiliary_callbacks.append(hs_checkpoint_callback)
+        checkpoint_callbacks_for_compat.append(hs_checkpoint_callback)
+        print('[checkpoint] optional hs-best checkpoint enabled')
     else:
-        best_metric_path = os.path.join(artifact_dir, 'best_metric_epochs.json')
-        auxiliary_callbacks.append(BestMetricTracker(auxiliary_best_metrics, best_metric_path))
-        print(f'[checkpoint] auxiliary best checkpoints disabled; tracking epochs in {best_metric_path}')
+        best_metric_path = os.path.join(
+            artifact_dir, 'best_metric_epochs.json')
+        auxiliary_callbacks.append(
+            BestMetricTracker(hs_best_metric, best_metric_path))
+        print(
+            '[checkpoint] hs-best checkpoint disabled; '
+            f'tracking its epoch in {best_metric_path}')
 
     model = SnapshotDepth(hparams=args, log_dir=logger.log_dir, artifact_root=artifact_dir)
     zernike_init_checkpoint = getattr(
@@ -670,6 +762,19 @@ def main(args):
     if init_ckpt:
         print(f'[init] Loading checkpoint weights from {init_ckpt}')
         checkpoint = torch.load(init_ckpt, map_location='cpu')
+        requested_optics_version = str(getattr(
+            args, 'dodo_psf_optics_version', 'legacy')).lower()
+        allow_version_mismatch = bool(getattr(
+            args, 'allow_optics_version_mismatch', False))
+        checkpoint_optics_version = _ensure_checkpoint_psf_optics_version(
+            checkpoint,
+            requested_version=requested_optics_version,
+            allow_mismatch=allow_version_mismatch,
+        )
+        print(
+            '[init] PSF optics version: '
+            f'checkpoint={checkpoint_optics_version or "unknown"}, '
+            f'run={requested_optics_version}')
         # Handle both PL checkpoint dict and raw state_dict
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
@@ -692,19 +797,17 @@ def main(args):
         artifact_dir,
         every_n_steps=getattr(args, 'loss_plot_every_n_steps', 50),
     )
-    callbacks = [logmanager_callback, checkpoint_callback] + auxiliary_callbacks + [
-        loss_plot_callback,
-        DOEParameterClampCallback()
-    ]
-    trainer_init_params = inspect.signature(Trainer.__init__).parameters
+    callbacks = (
+        [logmanager_callback, checkpoint_callback]
+        + auxiliary_callbacks
+        + [loss_plot_callback]
+    )
     trainer_kwargs = dict(
         logger=logger,
         sync_batchnorm=True,
         benchmark=True,
     )
-
-    if 'callbacks' in trainer_init_params:
-        trainer_kwargs['callbacks'] = callbacks
+    _configure_trainer_callbacks(trainer_kwargs, callbacks)
 
     trainer = Trainer.from_argparse_args(args, **trainer_kwargs)
 
@@ -767,8 +870,17 @@ if __name__ == '__main__':
                         help='验证/评估标签，记录到 metrics.json')
     parser.add_argument('--init_ckpt_path', type=str, default='',
                         help='从指定 checkpoint 初始化模型权重（optimizer 从零开始）')
+    parser.add_argument(
+        '--allow_optics_version_mismatch',
+        action='store_true',
+        help=(
+            '显式允许在 legacy 与 consistent_grid_v1 之间迁移整个模型权重'
+            '（包含光学权重）；'
+            '默认禁止不同 PSF 语义的 checkpoint 静默混用'
+        ),
+    )
     parser.add_argument('--save_aux_best_ckpts', dest='save_aux_best_ckpts', action='store_true',
-                        help='保存 depth-best/hs-best 辅助 checkpoint；默认只记录 best epoch/score，不落盘 ckpt')
+                        help='额外保存 hs-best checkpoint；joint-best 和 depth-best 始终各保存一个')
     parser.add_argument('--no-save_aux_best_ckpts', dest='save_aux_best_ckpts', action='store_false')
     parser.set_defaults(save_aux_best_ckpts=False)
     parser.add_argument('--loss_plot_every_n_steps', type=int, default=50,
