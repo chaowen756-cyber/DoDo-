@@ -15,7 +15,7 @@ def _center_pad(value: torch.Tensor, target_size: int) -> tuple[torch.Tensor, in
 
 
 def _center_crop(value: torch.Tensor, size: int, offset: int) -> torch.Tensor:
-    return value[..., offset:offset + size, offset:offset + size]
+    return value[..., offset : offset + size, offset : offset + size]
 
 
 def _legacy_propagation(
@@ -175,8 +175,8 @@ def test_forward_work_grid_exposes_the_same_padded_propagation_before_crop():
         cropped_output,
         work_output[
             ...,
-            crop_top:crop_top + layer.Mp,
-            crop_left:crop_left + layer.Mp,
+            crop_top : crop_top + layer.Mp,
+            crop_left : crop_left + layer.Mp,
         ],
         atol=0,
         rtol=0,
@@ -206,10 +206,9 @@ def test_padding_reduces_opposite_edge_periodic_wraparound():
     intensity_pad4 = outputs[4].abs().square()
     opposite_no_pad = intensity_no_pad[..., :16].sum() / intensity_no_pad.sum()
     opposite_pad2 = intensity_pad2[..., :16].sum() / intensity_pad2.sum()
-    pad2_to_pad4_error = (
-        torch.linalg.vector_norm(intensity_pad2 - intensity_pad4)
-        / torch.linalg.vector_norm(intensity_pad4)
-    )
+    pad2_to_pad4_error = torch.linalg.vector_norm(
+        intensity_pad2 - intensity_pad4
+    ) / torch.linalg.vector_norm(intensity_pad4)
 
     assert opposite_no_pad > 0.1
     assert opposite_pad2 < 1e-3
@@ -250,7 +249,7 @@ def test_pad2_converges_to_pad4_for_far_field_intensity_and_doe_gradient():
     }
 
     # lambda*z*N/L^2 aliases at factor 1 and becomes Nyquist-safe at factor 2.
-    sampling_ratio = float(wavelength.item() * 2.0 * size / (0.01 ** 2))
+    sampling_ratio = float(wavelength.item() * 2.0 * size / (0.01**2))
     assert sampling_ratio > 1.0
     assert sampling_ratio / 2.0 < 1.0
     assert intensity_errors[1] > 0.1
@@ -268,9 +267,7 @@ def test_pad2_converges_to_pad4_for_far_field_intensity_and_doe_gradient():
     )
     for factor in (1, 2, 4):
         coefficient = torch.tensor(0.37, requires_grad=True)
-        coded = outputs[factor] * torch.exp(
-            1j * coefficient * doe_mode
-        )[None, None]
+        coded = outputs[factor] * torch.exp(1j * coefficient * doe_mode)[None, None]
         sensor_field = sensor_propagation(coded)
         (sensor_field.abs().square() * sensor_weight).mean().backward()
         gradients[factor] = coefficient.grad.detach()
@@ -409,3 +406,22 @@ def test_padded_depth_aware_forward_has_finite_nonzero_doe_gradient():
     assert gradient is not None
     assert torch.isfinite(gradient).all()
     assert gradient.norm() > 0
+
+
+def test_padded_cropped_propagation_adjoint_satisfies_inner_product():
+    torch.manual_seed(101)
+    layer = PropagationLayer(
+        Mp=16,
+        L=0.01,
+        zi=0.02,
+        wave_lengths=torch.tensor([500e-9, 600e-9]),
+        trainable_z=False,
+        padding_factor=2,
+    )
+    source = torch.complex(torch.randn(1, 2, 16, 16), torch.randn(1, 2, 16, 16))
+    sensor = torch.complex(torch.randn(1, 2, 16, 16), torch.randn(1, 2, 16, 16))
+
+    forward_inner = torch.sum(torch.conj(sensor) * layer(source))
+    adjoint_inner = torch.sum(torch.conj(layer.adjoint(sensor)) * source)
+
+    torch.testing.assert_close(forward_inner, adjoint_inner, rtol=2e-5, atol=2e-5)

@@ -4,7 +4,8 @@
 
 在 `psf卷积` 的 `consistent_grid_v1` 前向上实现不依赖重建网络的 DOE 可编码性
 预优化，对比当前 rank-9 与 free-150 Zernike 在相同 3 μm pupil-RMS 预算下可
-达到的 MTF、波长分离和深度分离能力。
+达到的 MTF、波长分离和深度分离能力；若Zernike容量失败，再验证逐像素包裹
+相位DOE是否能突破表达上限。
 
 ## 范围
 
@@ -12,6 +13,7 @@
 - 复用现有 PSF MTF、传感器加权光谱/深度分离和能量损失。
 - 保存可复用 DOE checkpoint、逐步指标和可视化。
 - 为不同 DOE 基底增加统一物理高度 RMS 投影。
+- 为pixel-phase新增离散相位共轭初始化、单周期物理高度前向和artifact导出。
 
 ## 非目标
 
@@ -23,6 +25,7 @@
 ## 验收
 
 - rank-9/free-150 均可稳定优化并输出相同格式 artifact。
+- pixel-phase宽带前向必须与导出的包裹物理高度完全一致。
 - 两者初始化和最大高度 RMS 预算一致。
 - DOE 梯度、目标函数、checkpoint 恢复和 CPU smoke 通过测试。
 - 现有 DOE/PSF 测试不回归。

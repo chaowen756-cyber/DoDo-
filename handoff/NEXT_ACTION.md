@@ -6,42 +6,43 @@ User / experiment runner
 
 ## Current Change
 
-DOE optical-only PSF coding feasibility experiment
+Pixel-wise wrapped-phase DOE feasibility experiment
 
 ## Status
 
-Branch `DOE可编码性预优化实验` now separates DOE-created monochromatic PSF
-shape coding from information already present in RGB spectral response. The
-sensor-weighted task Fisher remains in the objective. Training logs both the
-warm-up objective and a fixed full objective, and the 3 um RMS constraint uses
-a tangent candidate correction plus a safety retraction.
+The free-150 Zernike parameterization failed consistently after two 3000-step
+runs. Branch `DOE可编码性预优化实验` now provides a 128x128 pixel-wise
+unwrapped phase variable whose optical forward is always converted to a
+single-period wrapped physical height at 550 nm. Initialization uses the exact
+discrete Prop1/Prop3 operators and their adjoint to focus the approximately
+1 m, 550 nm reference point without external camera parameters.
 
 ## Execute
 
-Run free-150 seed 123 on GPU 2 and seed 456 on GPU 3 with identical optical
-shape weights and different output directories. Use the complete commands in
-the final handoff/chat. Do not start joint CNN training from these checkpoints
-before the two optical-only feasibility summaries are compared.
+Run pixelphase seed 123 on GPU 2 and seed 456 on GPU 3 for 1000 steps with
+Adam lr 0.1, optical spectral offsets 1/2/4 and the balanced weights in the
+final handoff commands. Use separate output directories.
 
 ## Decision
 
-- Primary evidence of DOE spectral coding is improvement in
-  `optical_spectral/adjacent_cosine_mean` and offset-2/4 cosine, not sensor
-  spectral cosine or wavelength Fisher alone.
-- Require `loss/full_total` to improve; ignore the expected warm-up rise in
-  `loss/train_total`.
-- Reject a run if MTF collapses, crop capture falls, or the minimum RMS
-  retraction scale is anomalously far below one.
-- Only initialize a joint CNN experiment if both seeds show consistent optical
-  shape improvement with acceptable MTF/energy.
+- Compare against the free-150 3000-step ceiling, not only against the new
+  random initialization.
+- Primary success metrics remain optical adjacent/offset-2/offset-4 cosine,
+  task Fisher depth/wavelength CRLB and MTF p10.
+- The exported `best_heightmap_m.npy` is the physical wrapped height actually
+  used by the wideband forward; do not evaluate only the unwrapped phase.
+- If both seeds preserve the strong 200-step improvement, use the better
+  pixelphase checkpoint for the next controlled joint-CNN experiment.
+- If MTF p10 remains near 0.011 despite better coding, treat propagation/sensor
+  sampling—not DOE capacity—as the next bottleneck.
 
 ## Required Artifact
 
-- `comparison.json`
-- each run's `summary.json`, `best_doe.pt`, height map and PSF montage
-- `best_psf_bank.pt`
+- `comparison.json`, `summary.json`, `history.jsonl`
+- `best_doe.pt`, `best_psf_bank.pt`, PSF montage
+- wrapped physical height and unwrapped phase artifacts
 
 ## Stop Condition
 
-Stop after the two 1000-step DOE-only runs and inspect their optical-only,
-sensor-weighted, Fisher, MTF, energy and RMS-constraint metrics together.
+Stop after the two 1000-step pixelphase runs and inspect both summaries before
+changing the propagation grid or starting joint reconstruction training.

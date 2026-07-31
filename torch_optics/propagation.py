@@ -36,7 +36,9 @@ class PropagationLayer(nn.Module):
         self.work_L = self.L * self.padding_factor
 
         if wave_lengths is None:
-            wave_lengths = torch.from_numpy(np.linspace(420, 660, 25).astype(np.float32) * 1e-9)
+            wave_lengths = torch.from_numpy(
+                np.linspace(420, 660, 25).astype(np.float32) * 1e-9
+            )
         else:
             wave_lengths = torch.as_tensor(wave_lengths, dtype=torch.float32)
         self.register_buffer("wave_lengths", wave_lengths)
@@ -62,16 +64,13 @@ class PropagationLayer(nn.Module):
             dtype=torch.float32,
         )
         ffx, ffy = torch.meshgrid(fx, fx, indexing="xy")
-        freq2 = (ffx ** 2 + ffy ** 2)[None, :, :]
+        freq2 = (ffx**2 + ffy**2)[None, :, :]
 
         # TensorFlow NonNeg constraint parity.
-        z_eff = torch.clamp(self.z, min=0.0).to(
-            device=device, dtype=torch.complex64
-        )
+        z_eff = torch.clamp(self.z, min=0.0).to(device=device, dtype=torch.complex64)
         lambdas = self.wave_lengths.to(device=device, dtype=torch.float32)
         kernel = torch.exp(
-            (-1j * m.pi * lambdas[:, None, None] * z_eff)
-            * freq2.to(torch.complex64)
+            (-1j * m.pi * lambdas[:, None, None] * z_eff) * freq2.to(torch.complex64)
         )
         return torch.fft.fftshift(kernel, dim=(-2, -1)).unsqueeze(0)
 
@@ -144,20 +143,26 @@ class PropagationLayer(nn.Module):
         if self.padding_factor == 1:
             return x
         top, left = crop_offset
-        return x[..., top:top + self.Mp, left:left + self.Mp]
+        return x[..., top : top + self.Mp, left : left + self.Mp]
 
     def _propagate_work_grid(
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[int, int]]:
         if x.ndim != 4:
-            raise ValueError(f"PropagationLayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}")
+            raise ValueError(
+                f"PropagationLayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}"
+            )
 
         b, c, h, w = x.shape
         if h != self.Mp or w != self.Mp:
-            raise ValueError(f"PropagationLayer expects spatial size {self.Mp}x{self.Mp}, got {h}x{w}")
+            raise ValueError(
+                f"PropagationLayer expects spatial size {self.Mp}x{self.Mp}, got {h}x{w}"
+            )
         if c != int(self.wave_lengths.numel()):
-            raise ValueError(f"PropagationLayer expects {self.wave_lengths.numel()} bands, got {c}")
+            raise ValueError(
+                f"PropagationLayer expects {self.wave_lengths.numel()} bands, got {c}"
+            )
 
         x_work, crop_offset = self._pad_to_work_grid(x)
         x_complex = x_work.to(torch.complex64)
@@ -181,3 +186,35 @@ class PropagationLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output_work, crop_offset = self._propagate_work_grid(x)
         return self._crop_from_work_grid(output_work, crop_offset)
+
+    def adjoint(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the discrete adjoint of the padded-and-cropped propagation.
+
+        This is not a negative-distance approximation. It exactly reverses
+        the linear algebra used by :meth:`forward`: the sensor crop is
+        zero-embedded on the work grid, the transfer kernel is conjugated,
+        and the result is cropped back to the DOE grid. It is useful for
+        phase-conjugate initialization and inverse-problem diagnostics.
+        """
+        if x.ndim != 4:
+            raise ValueError(
+                "PropagationLayer.adjoint expects 4D tensor [B,C,H,W], "
+                f"got {tuple(x.shape)}"
+            )
+        if x.shape[-2:] != (self.Mp, self.Mp):
+            raise ValueError(
+                f"PropagationLayer.adjoint expects {self.Mp}x{self.Mp}, "
+                f"got {tuple(x.shape[-2:])}"
+            )
+        if x.shape[1] != int(self.wave_lengths.numel()):
+            raise ValueError(
+                "PropagationLayer.adjoint wavelength count mismatch: "
+                f"expected {self.wave_lengths.numel()}, got {x.shape[1]}"
+            )
+
+        x_work, crop_offset = self._pad_to_work_grid(x)
+        spectrum = centered_fft2(x_work.to(torch.complex64), dim=(-2, -1))
+        backpropagated = centered_ifft2(
+            spectrum * torch.conj(self._kernel(x.device)), dim=(-2, -1)
+        )
+        return self._crop_from_work_grid(backpropagated, crop_offset)

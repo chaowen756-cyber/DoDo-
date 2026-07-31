@@ -119,3 +119,45 @@
 - 摘要：初版同时投影 Adam 一阶动量但未同步二阶动量，压力测试发现一次
   `0.0027` 异常回缩；删除错误的动量投影后重新测试，边界训练恢复稳定下降。
   正式实现只切向化实际候选更新，并保留轻量二阶安全回缩。
+
+## 2026-07-31 Optical-shape 正式实验：free-150双seed，3000 step
+
+- 类型：optical-only DOE正式可行性实验。
+- checkpoint：
+  `experiments/PSF卷积/DOE预优化/opticalShape_free150_seed{123,456}_1000step_commit-7d319b1/free150/seed_*/best_doe.pt`。
+- artifact root：上述两个目录（目录名写1000step，但command确认实际均为3000步）。
+- 推理结果：无。
+- 关键指标：seed123/456相邻波长optical cosine最终均约0.98977；offset-4约
+  0.9133；task Fisher约5.20e5/5.26e5；MTF@0.05 p10仍约0.0116/0.0112。
+- 状态：完成，未通过综合可行性判据。
+- 摘要：两个不同高度图收敛到几乎相同PSF指标，证明free-150平滑Zernike达到
+  稳定表达上限，而非随机初始化或优化步数不足。深度和宽间隔波长稍有编码，
+  相邻10 nm波段与最差空间MTF仍失败，因此不进入联合CNN训练。
+
+## 2026-07-31 Pixel-phase参数化与学习率预检：16 depth，200 step
+
+- 类型：高容量逐像素相位DOE与学习率选择。
+- checkpoint：`/tmp/doe_pixelphase_lr{1e2,5e2,1e1}_200/.../best_doe.pt`及
+  `/tmp/doe_pixelphase_wrapped_lr1e1_200/.../best_doe.pt`。
+- artifact root：上述 `/tmp` 目录。
+- 推理结果：无。
+- 关键指标：未包裹模拟中lr 0.01/0.05/0.1的完整损失分别约0.827/0.786/0.779；
+  最终采用物理包裹参与前向后，lr0.1在200步达到完整损失0.797、task Fisher
+  3.66e5、MTF@0.05 mean/p10 0.0338/0.0111、optical spectral综合cosine
+  0.9567。
+- 状态：完成，方向显著优于free-150，选用lr0.1。
+- 摘要：逐像素相位仅200步就明显超过free-150的3000步Fisher与形状分离；
+  包裹后物理高度严格位于约0–0.98 μm单周期。PSF出现随波长变化的细纹，说明
+  高空间频率/相位包裹表达能力是上一轮关键瓶颈。
+
+## 2026-07-31 Pixel-phase邻近波段权重对照：200 step
+
+- 类型：目标权重消融。
+- checkpoint：`/tmp/doe_pixelphase_adjacent_lr1e1_200/pixelphase/seed_456/best_doe.pt`。
+- artifact root：`/tmp/doe_pixelphase_adjacent_lr1e1_200`。
+- 推理结果：无。
+- 关键指标：仅使用offset1/2并把光谱权重从5升到10，相邻optical cosine由
+  0.98997小幅降至0.98983，但task Fisher由3.66e5变差至3.71e5，MTF无明显收益。
+- 状态：完成，不采用该配置。
+- 摘要：过度强化相邻波段只能换来约1.3e-4额外cosine改善，性价比很低；正式
+  实验保留offset1/2/4、光谱权重5的平衡目标。

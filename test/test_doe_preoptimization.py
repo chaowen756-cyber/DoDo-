@@ -9,17 +9,89 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.preoptimize_psf_doe import main
-from torch_optics.doe import DOELayer
+from torch_optics.doe import DOELayer, DOEPixelPhaseLayer
+from torch_optics.forward_dodo import DepthAwareDoDoForwardModel
 from util.doe_preoptimization import (
     DOEPreoptimizationTargets,
     DOEPreoptimizationWeights,
     doe_preoptimization_objective,
     initialize_doe_height_,
+    initialize_phase_conjugate_doe_,
     load_preoptimized_doe_,
     optical_psf_shape_separation_loss,
     psf_fisher_a_optimality_loss,
     rms_constrained_optimizer_step_,
 )
+
+
+def test_pixel_phase_wrap_is_broadband_physical_and_periodic():
+    doe = DOEPixelPhaseLayer(
+        Mdoe=128,
+        Mesce=128,
+        trainable=True,
+        wave_lengths=torch.tensor([500e-9, 550e-9, 600e-9]),
+        reference_wavelength_m=550e-9,
+        use_pupil_mask=False,
+    )
+    torch.manual_seed(3)
+    with torch.no_grad():
+        doe.zernike_coeffs.normal_(mean=0.0, std=4.0)
+    probe = torch.ones(1, 3, 128, 128, dtype=torch.complex64)
+    before_height = doe.heightmap().detach().clone()
+    before = doe(probe).detach().clone()
+
+    with torch.no_grad():
+        doe.zernike_coeffs.add_(4.0 * torch.pi)
+    after_height = doe.heightmap().detach()
+    after = doe(probe).detach()
+
+    assert before_height.min() >= 0.0
+    torch.testing.assert_close(before_height, after_height, rtol=2e-5, atol=1e-11)
+    torch.testing.assert_close(before, after, rtol=2e-5, atol=2e-5)
+
+
+def test_discrete_phase_conjugate_initialization_raises_reference_center_peak():
+    model = DepthAwareDoDoForwardModel(
+        depth_min=0.4,
+        depth_max=2.0,
+        num_depth_layers=3,
+        use_second_doe=False,
+        train_c=True,
+        free=False,
+        input_format="nchw",
+        output_format="nchw",
+        measurement_norm_mode="none",
+        depth_layering_mode="soft_diopter",
+        sensor_measurement="intensity",
+        skip_prop2=True,
+        prop1_padding_factor=2,
+        image_formation_mode="psf_convolution",
+        psf_boundary_mode="linear_zero",
+        doe_parameterization="pixel_phase",
+        doe_reference_wavelength_m=550e-9,
+        psf_optics_version="consistent_grid_v1",
+    )
+    fields = model._prop1_impulse_field_bank(128, 128, torch.device("cpu"))
+    depth_index = int(torch.argmin(torch.abs(model.z_centers - 1.0)))
+    wavelength_index = int(torch.argmin(torch.abs(model.prop3.wave_lengths - 550e-9)))
+
+    def center_intensity():
+        sensor = model.prop3(model.doe1(fields[depth_index : depth_index + 1]))
+        return sensor[0, wavelength_index, 64, 64].abs().square()
+
+    zero_center = center_intensity()
+    initialization = initialize_phase_conjugate_doe_(
+        model,
+        reference_depth_m=1.0,
+        reference_wavelength_m=550e-9,
+        phase_noise_std_rad=0.0,
+        generator=torch.Generator().manual_seed(5),
+    )
+    focused_center = center_intensity()
+
+    assert initialization["reference_wavelength_index"] == wavelength_index
+    assert initialization["center_intensity_gain"] > 3.0
+    assert focused_center > 3.0 * zero_center
 
 
 def test_common_height_rms_initialization_and_projection():

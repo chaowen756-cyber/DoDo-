@@ -42,7 +42,9 @@ def _phase_scale(phase_scale_mode: str) -> float:
 
 def _idlens_from_lambda(lambda_m: torch.Tensor) -> torch.Tensor:
     lambda_um = lambda_m * 1e6
-    refr_index = 1.5375 + 0.00829045 * (lambda_um ** -2) - 0.000211046 * (lambda_um ** -4)
+    refr_index = (
+        1.5375 + 0.00829045 * (lambda_um**-2) - 0.000211046 * (lambda_um**-4)
+    )
     return refr_index - 1.0
 
 
@@ -158,12 +160,13 @@ class _BaseDOE(nn.Module):
         return True
 
     def clamp_parameters_(self):
-        if hasattr(self, "zernike_coeffs") and isinstance(self.zernike_coeffs, nn.Parameter):
+        if hasattr(self, "zernike_coeffs") and isinstance(
+            self.zernike_coeffs, nn.Parameter
+        ):
             with torch.no_grad():
                 limit = float(getattr(self, "coefficient_limit", 1.0))
                 if limit <= 0:
-                    raise ValueError(
-                        f"coefficient_limit must be > 0, got {limit}")
+                    raise ValueError(f"coefficient_limit must be > 0, got {limit}")
                 self.zernike_coeffs.clamp_(-limit, limit)
 
     def _phase_modulation(self, x: torch.Tensor, hm: torch.Tensor) -> torch.Tensor:
@@ -175,10 +178,18 @@ class _BaseDOE(nn.Module):
         idlens = _idlens_from_lambda(lambdas).to(torch.complex64)
         hm = hm.to(device=x.device, dtype=torch.complex64)
         phase_scale = _phase_scale(self.phase_scale_mode)
-        phase = torch.exp(1j * (phase_scale / lambdas[:, None, None]) * idlens[:, None, None] * hm[None, :, :])
+        phase = torch.exp(
+            1j
+            * (phase_scale / lambdas[:, None, None])
+            * idlens[:, None, None]
+            * hm[None, :, :]
+        )
 
         if self.use_pupil_mask:
-            phase = phase * self.spiral_p.to(device=x.device, dtype=torch.complex64)[None, :, :]
+            phase = (
+                phase
+                * self.spiral_p.to(device=x.device, dtype=torch.complex64)[None, :, :]
+            )
 
         step = int(np.int32(self.Mesce / self.Mdoe))
         if step < 1:
@@ -229,7 +240,9 @@ class DOELayer(_BaseDOE):
                 f"basis_mode must be one of {_DOE_BASIS_MODES}, got '{self.basis_mode}'"
             )
         if self.coeff_norm_limit <= 0.0:
-            raise ValueError(f"coeff_norm_limit must be > 0, got {self.coeff_norm_limit}")
+            raise ValueError(
+                f"coeff_norm_limit must be > 0, got {self.coeff_norm_limit}"
+            )
         if self.init_coeff_norm < 0.0 or self.init_coeff_norm > self.coeff_norm_limit:
             raise ValueError(
                 f"init_coeff_norm must be in [0,{self.coeff_norm_limit}], "
@@ -247,9 +260,13 @@ class DOELayer(_BaseDOE):
 
         self.register_buffer("zernike_basis", torch.empty(0), persistent=False)
         self.register_buffer(
-            "zernike_source_indices", torch.empty(0, dtype=torch.int64), persistent=False
+            "zernike_source_indices",
+            torch.empty(0, dtype=torch.int64),
+            persistent=False,
         )
-        self.register_buffer("zernike_residual_ratios", torch.empty(0), persistent=False)
+        self.register_buffer(
+            "zernike_residual_ratios", torch.empty(0), persistent=False
+        )
         self.zernike_coeffs = None
         if doe_type in ("New", "Zeros"):
             base_mat = loadmat(assets / "Base_zernike_128x128_nopadd.mat")
@@ -296,7 +313,11 @@ class DOELayer(_BaseDOE):
         return self.spiral_hm.to(device=device, dtype=torch.float32)
 
     def clamp_parameters_(self):
-        if hasattr(self, "zernike_coeffs") and isinstance(self.zernike_coeffs, nn.Parameter) and self.zernike_coeffs.requires_grad:
+        if (
+            hasattr(self, "zernike_coeffs")
+            and isinstance(self.zernike_coeffs, nn.Parameter)
+            and self.zernike_coeffs.requires_grad
+        ):
             with torch.no_grad():
                 coeff_norm = self.zernike_coeffs.norm(p=2)
                 if coeff_norm > self.coeff_norm_limit:
@@ -313,12 +334,16 @@ class DOELayer(_BaseDOE):
             dtype=torch.float32,
         )
         idlens = _idlens_from_lambda(wavelength)
-        phase_gain = abs(_phase_scale(self.phase_scale_mode)) * torch.abs(idlens) / wavelength
+        phase_gain = (
+            abs(_phase_scale(self.phase_scale_mode)) * torch.abs(idlens) / wavelength
+        )
         return height_rms_m.to(torch.float32) * phase_gain
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
-            raise ValueError(f"DOELayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}")
+            raise ValueError(
+                f"DOELayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}"
+            )
         hm = self._compute_hm(device=x.device)
         return self._phase_modulation(x, hm)
 
@@ -359,7 +384,9 @@ class DOEFreeLayer(_BaseDOE):
         self.zernike_coeffs = None
         if doe_type in ("New", "Zeros"):
             if basis_path is None:
-                basis_file = assets / f"zernike_volume1_{self.Mdoe}_Nterms_{self.n_terms}.npy"
+                basis_file = (
+                    assets / f"zernike_volume1_{self.Mdoe}_Nterms_{self.n_terms}.npy"
+                )
             else:
                 basis_file = Path(basis_path).expanduser()
                 if not basis_file.is_absolute():
@@ -367,7 +394,8 @@ class DOEFreeLayer(_BaseDOE):
             if not basis_file.exists():
                 if basis_path is not None:
                     raise FileNotFoundError(
-                        f"Explicit DOE_Free basis file does not exist: '{basis_file}'")
+                        f"Explicit DOE_Free basis file does not exist: '{basis_file}'"
+                    )
                 try:
                     import poppy
                 except ImportError:
@@ -375,9 +403,15 @@ class DOEFreeLayer(_BaseDOE):
                         f"Missing DOE_Free basis file '{basis_file}' and 'poppy' package is not installed. "
                         "Install poppy ('pip install poppy') or provide a pre-generated Zernike basis file."
                     )
-                znew = poppy.zernike.zernike_basis(nterms=self.n_terms, npix=self.Mdoe, outside=0.0)
+                znew = poppy.zernike.zernike_basis(
+                    nterms=self.n_terms, npix=self.Mdoe, outside=0.0
+                )
                 basis = np.asarray(znew, dtype=np.float32) * 1e-6
-                if basis.ndim == 3 and basis.shape[-1] == self.n_terms and basis.shape[0] != self.n_terms:
+                if (
+                    basis.ndim == 3
+                    and basis.shape[-1] == self.n_terms
+                    and basis.shape[0] != self.n_terms
+                ):
                     basis = np.transpose(basis, (2, 0, 1))
                 np.save(str(basis_file), basis)
             else:
@@ -387,7 +421,9 @@ class DOEFreeLayer(_BaseDOE):
             if basis.shape[0] != self.n_terms and basis.shape[-1] == self.n_terms:
                 basis = np.transpose(basis, (2, 0, 1))
             if basis.shape[0] != self.n_terms:
-                raise ValueError(f"DOE_Free basis terms mismatch: expected {self.n_terms}, got {basis.shape[0]}")
+                raise ValueError(
+                    f"DOE_Free basis terms mismatch: expected {self.n_terms}, got {basis.shape[0]}"
+                )
 
             self.zernike_basis = torch.from_numpy(basis)
 
@@ -407,6 +443,101 @@ class DOEFreeLayer(_BaseDOE):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
-            raise ValueError(f"DOEFreeLayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}")
+            raise ValueError(
+                f"DOEFreeLayer expects 4D tensor [B, C, H, W], got {tuple(x.shape)}"
+            )
         hm = self._compute_hm(device=x.device)
         return self._phase_modulation(x, hm)
+
+
+class DOEPixelPhaseLayer(_BaseDOE):
+    """Pixel-wise unwrapped reference-phase DOE.
+
+    The trainable tensor stores an unconstrained phase variable in radians at
+    ``reference_wavelength_m``. The optical forward wraps it into one physical
+    ``2π`` height period before applying the dispersive material model. PyTorch
+    differentiates through ``remainder`` almost everywhere, so optimization
+    remains unconstrained while every simulated PSF exactly matches the height
+    map that would be exported for fabrication.
+    """
+
+    def __init__(
+        self,
+        Mdoe: int = 128,
+        Mesce: int = 128,
+        trainable: bool = True,
+        wave_lengths: Optional[torch.Tensor] = None,
+        assets_dir: str = "torch_optics/assets",
+        reference_wavelength_m: float = 550e-9,
+        use_pupil_mask: bool = False,
+    ):
+        super().__init__()
+        self.Mdoe = int(Mdoe)
+        self.Mesce = int(Mesce)
+        self.trainable = bool(trainable)
+        self.phase_scale_mode = "legacy_free"
+        self.use_pupil_mask = bool(use_pupil_mask)
+        self.reference_wavelength_m = float(reference_wavelength_m)
+        if self.Mdoe < 1 or self.Mesce < 1:
+            raise ValueError("Mdoe and Mesce must be positive")
+        if self.reference_wavelength_m <= 0.0:
+            raise ValueError("reference_wavelength_m must be > 0")
+
+        self.register_buffer("wave_lengths", _build_wave_lengths(wave_lengths))
+        assets = _resolve_assets_dir(assets_dir)
+        spiral_mat = loadmat(assets / "Spiral_128x128_nopadd.mat")
+        spiral_p = np.asarray(spiral_mat["P"], dtype=np.float32)
+        if spiral_p.shape != (self.Mdoe, self.Mdoe):
+            raise ValueError(
+                f"pixel-phase pupil shape {spiral_p.shape} does not match "
+                f"Mdoe={self.Mdoe}"
+            )
+        self.register_buffer("spiral_p", torch.from_numpy(spiral_p))
+        self.register_buffer(
+            "spiral_hm", torch.zeros((self.Mdoe, self.Mdoe), dtype=torch.float32)
+        )
+        self.zernike_coeffs = nn.Parameter(
+            torch.zeros((self.Mdoe, self.Mdoe), dtype=torch.float32),
+            requires_grad=self.trainable,
+        )
+
+    def _reference_phase_gain(self, device: torch.device) -> torch.Tensor:
+        wavelength = torch.tensor(
+            self.reference_wavelength_m, device=device, dtype=torch.float32
+        )
+        return (
+            _phase_scale(self.phase_scale_mode)
+            * _idlens_from_lambda(wavelength)
+            / wavelength
+        )
+
+    def unwrapped_heightmap(self) -> torch.Tensor:
+        phase = self.zernike_coeffs
+        return phase / self._reference_phase_gain(phase.device)
+
+    def _compute_hm(self, device: torch.device) -> torch.Tensor:
+        phase = self.zernike_coeffs.to(device=device, dtype=torch.float32)
+        wrapped_phase = torch.remainder(phase, 2.0 * m.pi)
+        return wrapped_phase / self._reference_phase_gain(device)
+
+    def wrapped_phase(self) -> torch.Tensor:
+        return torch.remainder(self.zernike_coeffs, 2.0 * m.pi)
+
+    def wrapped_heightmap(self) -> torch.Tensor:
+        return self._compute_hm(self.zernike_coeffs.device)
+
+    def phase_rms(self) -> torch.Tensor:
+        return self.pupil_rms(self.zernike_coeffs)
+
+    def clamp_parameters_(self):
+        # Deliberately optimize unwrapped phase. Wrapping during training would
+        # introduce discontinuities and is only needed for physical export.
+        return None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "DOEPixelPhaseLayer expects 4D tensor [B,C,H,W], "
+                f"got {tuple(x.shape)}"
+            )
+        return self._phase_modulation(x, self._compute_hm(x.device))

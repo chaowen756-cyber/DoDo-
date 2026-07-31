@@ -96,11 +96,109 @@ def doe_physical_stats(doe) -> Dict[str, torch.Tensor]:
     pupil = doe.spiral_p.to(device=height.device) > 0.5
     selected = height[pupil].to(torch.float32)
     coefficients = doe.zernike_coeffs
-    return {
+    stats = {
         "doe/height_rms_m": doe.pupil_rms(height).detach(),
         "doe/height_min_m": selected.min().detach(),
         "doe/height_max_m": selected.max().detach(),
         "doe/coeff_norm": coefficients.detach().norm(),
+    }
+    if hasattr(doe, "wrapped_heightmap"):
+        wrapped_height = doe.wrapped_heightmap()
+        wrapped_selected = wrapped_height[pupil].to(torch.float32)
+        stats.update(
+            {
+                "doe/wrapped_height_rms_m": doe.pupil_rms(wrapped_height).detach(),
+                "doe/wrapped_height_min_m": wrapped_selected.min().detach(),
+                "doe/wrapped_height_max_m": wrapped_selected.max().detach(),
+                "doe/unwrapped_phase_rms_rad": doe.phase_rms().detach(),
+            }
+        )
+    return stats
+
+
+def initialize_phase_conjugate_doe_(
+    model,
+    *,
+    reference_depth_m: float,
+    reference_wavelength_m: float,
+    phase_noise_std_rad: float,
+    generator: torch.Generator,
+) -> Dict[str, float]:
+    """Initialize a pixel-phase DOE by discrete adjoint phase conjugation.
+
+    The carrier maximizes the center-pixel complex amplitude for the closest
+    available depth/wavelength sample under the exact current Prop1/Prop3
+    operators. No continuous focal-length or sensor-pitch approximation is
+    introduced. A small in-pupil phase perturbation makes repeated seeds a
+    meaningful non-convexity check without destroying the focusing carrier.
+    """
+    doe = model.doe1
+    if not hasattr(doe, "wrapped_heightmap"):
+        raise ValueError("phase-conjugate initialization requires pixel-phase DOE")
+    if not model.skip_prop2 or model.use_second_doe:
+        raise ValueError(
+            "phase-conjugate initialization currently requires direct DOE-to-Prop3 "
+            "propagation"
+        )
+    reference_depth_m = float(reference_depth_m)
+    reference_wavelength_m = float(reference_wavelength_m)
+    phase_noise_std_rad = float(phase_noise_std_rad)
+    if reference_depth_m <= 0.0 or reference_wavelength_m <= 0.0:
+        raise ValueError("reference depth and wavelength must be > 0")
+    if phase_noise_std_rad < 0.0:
+        raise ValueError("phase_noise_std_rad must be >= 0")
+
+    coefficients = doe.zernike_coeffs
+    device = coefficients.device
+    depth_index = int(
+        torch.argmin(torch.abs(model.z_centers.to(device=device) - reference_depth_m))
+    )
+    wavelengths = model.prop3.wave_lengths.to(device=device)
+    wavelength_index = int(
+        torch.argmin(torch.abs(wavelengths - reference_wavelength_m))
+    )
+    height = width = int(doe.Mdoe)
+    with torch.no_grad():
+        incoming_bank = model._prop1_impulse_field_bank(height, width, device)
+        incoming = incoming_bank[depth_index, wavelength_index]
+        baseline_sensor = model.prop3(doe(incoming_bank[depth_index : depth_index + 1]))
+        baseline_center = (
+            baseline_sensor[0, wavelength_index, height // 2, width // 2].abs().square()
+        )
+        target = torch.zeros(
+            (1, int(wavelengths.numel()), height, width),
+            device=device,
+            dtype=torch.complex64,
+        )
+        target[:, wavelength_index, height // 2, width // 2] = 1.0
+        backpropagated = model.prop3.adjoint(target)[0, wavelength_index]
+        carrier = torch.angle(backpropagated) - torch.angle(incoming)
+        pupil = doe.spiral_p.to(device=device) > 0.5
+        carrier = torch.where(pupil, carrier, torch.zeros_like(carrier))
+        if phase_noise_std_rad > 0.0:
+            noise = torch.randn(
+                carrier.shape,
+                device=device,
+                dtype=carrier.dtype,
+                generator=generator,
+            )
+            carrier = carrier + phase_noise_std_rad * noise * pupil
+        coefficients.copy_(carrier)
+        focused_sensor = model.prop3(doe(incoming_bank[depth_index : depth_index + 1]))
+        focused_center = (
+            focused_sensor[0, wavelength_index, height // 2, width // 2].abs().square()
+        )
+
+    return {
+        "reference_depth_index": depth_index,
+        "reference_depth_m": float(model.z_centers[depth_index]),
+        "reference_wavelength_index": wavelength_index,
+        "reference_wavelength_m": float(wavelengths[wavelength_index]),
+        "center_intensity_before": float(baseline_center),
+        "center_intensity_after": float(focused_center),
+        "center_intensity_gain": float(
+            focused_center / baseline_center.clamp_min(1e-20)
+        ),
     }
 
 

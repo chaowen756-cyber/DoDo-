@@ -18,6 +18,21 @@
   分量，再做数值回缩，从而保留沿 RMS 边界的有效优化方向。
 - rank-9 与 free-150 的差异因此主要是表达容量，而不是允许的总高度预算。
 
+前两轮正式实验已经确认 free-150 在两个seed、3000步下收敛到相同指标上限：
+相邻波长 optical cosine 仍约0.9898，MTF@0.05 p10仍约0.011。为检验瓶颈是否
+来自平滑Zernike表达空间，新增：
+
+- `pixelphase`：128×128逐像素未包裹参考相位，共16384个自由度；
+- 默认参考波长550 nm，光学前向把相位包裹到一个物理2π高度周期，再按现有
+  DOE材料色散计算所有25个波长；
+- 初始化不套用外部焦距/像元尺寸，而是用当前Prop1参考输入场和Prop3严格离散
+  伴随，在约1 m、550 nm处构造相位共轭聚焦载波；
+- 加入0.05 rad随机扰动，使不同seed仍能检验非凸稳定性。
+
+这一实现与Baek等补充材料中“优化未包裹相位、以Fresnel DOE初始化、最终相位
+包裹成物理高度”的处理一致，并进一步让包裹物理高度直接参与宽带训练，避免
+优化结束后再包裹造成非参考波长PSF退化。
+
 优化目标包括：
 
 1. 单色点源 RGB PSF 的任务加权 Fisher A-optimality；
@@ -65,17 +80,18 @@ nuisance 参数参与深度/波长 CRLB；损失权重设为 `(0.1,0.1,1,1)`，�
 
 ## 当前实验命令
 
-正式实验仅继续使用已证明明显优于 rank-9 的 free-150，并用 seed 123/456
-在两张卡上复核。完整命令中的关键新增参数如下；聊天交付给出两张卡的可直接
-复制版本：
+正式实验改用已在200步预检中明显超过free-150 3000步结果的pixel-phase，
+并用seed 123/456在两张卡上复核。完整命令中的关键参数如下；聊天交付给出
+两张卡的可直接复制版本：
 
 ```bash
 /home/wenchao/conda_envs/ld_clean/bin/python scripts/preoptimize_psf_doe.py \
-  --modes free150 --steps 1000 --lr 1e-2 \
+  --modes pixelphase --steps 1000 --lr 1e-1 \
   --final_lr_ratio 0.05 --gradient_clip_norm 1.0 \
   --separation_warmup_steps 100 \
-  --initial_height_rms_um 0.6 --maximum_height_rms_um 3.0 \
-  --rms_boundary_fraction 0.999 \
+  --phase_reference_depth_m 1.0 \
+  --phase_reference_wavelength_nm 550 \
+  --phase_initial_noise_std_rad 0.05 \
   --fisher_weight 1.0 --mtf_weight 20.0 \
   --optical_spectral_weight 5.0 --optical_depth_weight 2.0 \
   --sensor_spectral_weight 0.0 --sensor_depth_weight 0.5 \
@@ -88,6 +104,9 @@ nuisance 参数参与深度/波长 CRLB；损失权重设为 `(0.1,0.1,1,1)`，�
 
 - `best_doe.pt`：可复用的 DOE checkpoint、构造配置和最佳指标；
 - `best_coefficients.npy`、`best_heightmap_m.npy`；
+- pixel-phase额外保存 `best_unwrapped_phase_rad.npy` 与
+  `best_unwrapped_heightmap_m.npy`；其中 `best_heightmap_m.npy` 始终是实际参与
+  宽带前向的单周期包裹物理高度；
 - `best_heightmap.png`、`best_psf_montage.png`；
 - `history.jsonl`、`summary.json`；
 - 可选的 `best_psf_bank.pt`。
@@ -117,6 +136,8 @@ load_preoptimized_doe_(camera.doe1, "/path/to/best_doe.pt")
 - `loss/full_total` 是否下降；不要用 warm-up 期间的 `loss/train_total` 跨步
   比较；
 - `constraint/minimum_retraction_scale` 应接近1，若远小于1说明边界更新失稳；
+- pixel-phase没有Zernike RMS投影；检查 `doe/wrapped_height_min/max_m` 是否位于
+  单个参考相位周期内，并检查初始化记录中的 `center_intensity_gain`；
 - MTF 提升是否伴随 r90 无限扩大或 129×129 capture 明显下降。
 
 如果 rank-9 和 free-150 都无法明显改善，说明瓶颈更可能来自当前光路本身或
@@ -127,5 +148,7 @@ load_preoptimized_doe_(camera.doe1, "/path/to/best_doe.pt")
 
 - Baek et al., [Single-Shot Hyperspectral-Depth Imaging with Learned
   Diffractive Optics](https://arxiv.org/abs/2009.00463)，补充材料第6节。
+- 同论文[官方CVF补充材料](https://openaccess.thecvf.com/content/ICCV2021/supplemental/Baek_Single-Shot_Hyperspectral-Depth_Imaging_ICCV_2021_supplemental.pdf)：
+  未包裹相位优化、Fresnel DOE初始化与最终物理高度包裹。
 - Hazineh et al., [D-Flat](https://arxiv.org/abs/2207.14780)。
 - Wang et al., [dO: A differentiable engine for Deep Lens design](https://github.com/vccimaging/DiffOptics)。

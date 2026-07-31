@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_optics.doe import DOELayer, DOEFreeLayer
+from torch_optics.doe import DOELayer, DOEFreeLayer, DOEPixelPhaseLayer
 from torch_optics.propagation import PropagationLayer
 from torch_optics.sensing import SensingLayer
 
@@ -14,11 +14,11 @@ def _tensor_stats(t: torch.Tensor) -> dict:
     t_real = t.real if t.is_complex() else t
     finite = bool(torch.isfinite(t_real).all().item())
     return {
-        'finite': finite,
-        'min': float(t_real.min().item()),
-        'max': float(t_real.max().item()),
-        'mean': float(t_real.mean().item()),
-        'std': float(t_real.std().item()),
+        "finite": finite,
+        "min": float(t_real.min().item()),
+        "max": float(t_real.max().item()),
+        "mean": float(t_real.mean().item()),
+        "std": float(t_real.std().item()),
     }
 
 
@@ -30,12 +30,12 @@ def _tensor_stats_real(t: torch.Tensor) -> dict:
         t_mag = t
     finite = bool(torch.isfinite(t_mag).all().item())
     return {
-        'finite': finite,
-        'min': float(t_mag.min().item()),
-        'max': float(t_mag.max().item()),
-        'mean': float(t_mag.mean().item()),
-        'std': float(t_mag.std().item()),
-        'has_nonfinite': bool((~torch.isfinite(t_mag)).any().item()),
+        "finite": finite,
+        "min": float(t_mag.min().item()),
+        "max": float(t_mag.max().item()),
+        "mean": float(t_mag.mean().item()),
+        "std": float(t_mag.std().item()),
+        "has_nonfinite": bool((~torch.isfinite(t_mag)).any().item()),
     }
 
 
@@ -57,6 +57,7 @@ _IMAGE_FORMATION_MODES = {"whole_field", "psf_convolution"}
 _PSF_LAYER_MASK_MODES = {"current", "baek_hard"}
 _PSF_BOUNDARY_MODES = {"linear_zero", "circular"}
 _PSF_OPTICS_VERSIONS = {"legacy", "consistent_grid_v1"}
+_DOE_PARAMETERIZATIONS = {"zernike", "pixel_phase"}
 
 
 def _next_fast_fft_length(target: int) -> int:
@@ -122,7 +123,9 @@ class SoftDiopterBinner(nn.Module):
         return_debug: bool = False,
     ):
         if depth.ndim != 4 or depth.shape[1] != 1:
-            raise ValueError(f"depth must have shape [B,1,H,W], got {tuple(depth.shape)}")
+            raise ValueError(
+                f"depth must have shape [B,1,H,W], got {tuple(depth.shape)}"
+            )
 
         b, _, h, w = depth.shape
         calc_dtype = torch.float32
@@ -132,15 +135,29 @@ class SoftDiopterBinner(nn.Module):
             valid = finite_positive.to(dtype=calc_dtype)
         else:
             if valid_mask.ndim != 4 or valid_mask.shape[1] != 1:
-                raise ValueError(f"valid_mask must have shape [B,1,H,W], got {tuple(valid_mask.shape)}")
+                raise ValueError(
+                    f"valid_mask must have shape [B,1,H,W], got {tuple(valid_mask.shape)}"
+                )
             valid = (finite_positive & (valid_mask > 0)).to(dtype=calc_dtype)
 
         if self.num_layers == 1:
-            weights = torch.ones((b, 1, h, w), device=depth.device, dtype=calc_dtype) * valid
-            debug = {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+            weights = (
+                torch.ones((b, 1, h, w), device=depth.device, dtype=calc_dtype) * valid
+            )
+            debug = (
+                {"weight_sum": weights.sum(dim=1, keepdim=True)}
+                if return_debug
+                else None
+            )
             if return_debug:
-                return weights.to(dtype=depth.dtype), self.z_centers.to(depth.device, depth.dtype), debug
-            return weights.to(dtype=depth.dtype), self.z_centers.to(depth.device, depth.dtype)
+                return (
+                    weights.to(dtype=depth.dtype),
+                    self.z_centers.to(depth.device, depth.dtype),
+                    debug,
+                )
+            return weights.to(dtype=depth.dtype), self.z_centers.to(
+                depth.device, depth.dtype
+            )
 
         z_safe = torch.where(
             finite_positive,
@@ -149,8 +166,12 @@ class SoftDiopterBinner(nn.Module):
         )
         u = (1.0 / z_safe).clamp(min=1.0 / self.z_max, max=1.0 / self.z_min)
 
-        centers_u = self.centers_u.to(device=depth.device, dtype=calc_dtype).view(1, self.num_layers, 1, 1)
-        bandwidth = (self.du.to(device=depth.device, dtype=calc_dtype) * self.bandwidth_scale).view(1, 1, 1, 1)
+        centers_u = self.centers_u.to(device=depth.device, dtype=calc_dtype).view(
+            1, self.num_layers, 1, 1
+        )
+        bandwidth = (
+            self.du.to(device=depth.device, dtype=calc_dtype) * self.bandwidth_scale
+        ).view(1, 1, 1, 1)
         raw_w = torch.relu(1.0 - torch.abs(u - centers_u) / bandwidth)
         raw_w = raw_w * valid
         weights = raw_w / (raw_w.sum(dim=1, keepdim=True) + self.eps)
@@ -224,8 +245,13 @@ class DoDoForwardModel(nn.Module):
             phase_scale_mode="legacy_doe",
         )
         self.prop3 = PropagationLayer(Mp=mss, L=0.0048, zi=0.01, trainable_z=False)
-        self.sensing = SensingLayer(Ms=mss, assets_dir=assets_dir, normalize=True, normalize_mode=sensing_normalize_mode,
-                                     sensor_measurement=sensor_measurement)
+        self.sensing = SensingLayer(
+            Ms=mss,
+            assets_dir=assets_dir,
+            normalize=True,
+            normalize_mode=sensing_normalize_mode,
+            sensor_measurement=sensor_measurement,
+        )
 
     def _to_nchw(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_format == "nchw":
@@ -299,6 +325,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         doe_basis_rms_m: float = 3e-6,
         doe_coeff_norm_limit: float = 1.0,
         doe_init_coeff_norm: float = 0.2,
+        doe_parameterization: str = "zernike",
+        doe_reference_wavelength_m: float = 550e-9,
         psf_optics_version: str = "legacy",
     ):
         super().__init__()
@@ -310,6 +338,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 f"{_PSF_OPTICS_VERSIONS}, got '{psf_optics_version}'"
             )
         self.psf_optics_version = psf_optics_version
+        doe_parameterization = str(doe_parameterization).lower()
+        if doe_parameterization not in _DOE_PARAMETERIZATIONS:
+            raise ValueError(
+                "doe_parameterization must be one of "
+                f"{_DOE_PARAMETERIZATIONS}, got '{doe_parameterization}'"
+            )
+        self.doe_parameterization = doe_parameterization
         self.optical_grid_size = 128
         self.optical_grid_length_m = 0.01
         if self.psf_optics_version == "consistent_grid_v1":
@@ -329,8 +364,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 )
             if use_second_doe:
                 raise ValueError(
-                    "consistent_grid_v1 currently requires "
-                    "use_second_doe=False"
+                    "consistent_grid_v1 currently requires " "use_second_doe=False"
                 )
         if isinstance(prop1_padding_factor, bool) or not isinstance(
             prop1_padding_factor, int
@@ -345,15 +379,21 @@ class DepthAwareDoDoForwardModel(nn.Module):
             )
         self.prop1_padding_factor = prop1_padding_factor
         if depth_min >= depth_max:
-            raise ValueError(f"depth_min ({depth_min}) must be < depth_max ({depth_max})")
+            raise ValueError(
+                f"depth_min ({depth_min}) must be < depth_max ({depth_max})"
+            )
         if num_depth_layers < 1:
             raise ValueError(f"num_depth_layers must be >= 1, got {num_depth_layers}")
         fmt_in = input_format.lower()
         fmt_out = output_format.lower()
         if fmt_in not in _VALID_FORMATS:
-            raise ValueError(f"input_format must be one of {_VALID_FORMATS}, got '{input_format}'")
+            raise ValueError(
+                f"input_format must be one of {_VALID_FORMATS}, got '{input_format}'"
+            )
         if fmt_out not in _VALID_FORMATS:
-            raise ValueError(f"output_format must be one of {_VALID_FORMATS}, got '{output_format}'")
+            raise ValueError(
+                f"output_format must be one of {_VALID_FORMATS}, got '{output_format}'"
+            )
         self.depth_min = depth_min
         self.depth_max = depth_max
         self.num_depth_layers = num_depth_layers
@@ -365,7 +405,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if image_formation_mode not in _IMAGE_FORMATION_MODES:
             raise ValueError(
                 f"image_formation_mode must be one of {_IMAGE_FORMATION_MODES}, "
-                f"got '{image_formation_mode}'")
+                f"got '{image_formation_mode}'"
+            )
         if (
             self.psf_optics_version == "consistent_grid_v1"
             and image_formation_mode != "psf_convolution"
@@ -378,12 +419,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if psf_layer_mask_mode not in _PSF_LAYER_MASK_MODES:
             raise ValueError(
                 f"psf_layer_mask_mode must be one of {_PSF_LAYER_MASK_MODES}, "
-                f"got '{psf_layer_mask_mode}'")
+                f"got '{psf_layer_mask_mode}'"
+            )
         psf_boundary_mode = psf_boundary_mode.lower()
         if psf_boundary_mode not in _PSF_BOUNDARY_MODES:
             raise ValueError(
                 f"psf_boundary_mode must be one of {_PSF_BOUNDARY_MODES}, "
-                f"got '{psf_boundary_mode}'")
+                f"got '{psf_boundary_mode}'"
+            )
         if (
             self.psf_optics_version == "consistent_grid_v1"
             and psf_boundary_mode != "linear_zero"
@@ -396,7 +439,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         psf_mask_blur_sigma = float(psf_mask_blur_sigma)
         if psf_mask_blur_sigma < 0:
             raise ValueError(
-                f"psf_mask_blur_sigma must be >= 0, got {psf_mask_blur_sigma}")
+                f"psf_mask_blur_sigma must be >= 0, got {psf_mask_blur_sigma}"
+            )
         if isinstance(psf_depth_chunk_size, bool) or not isinstance(
             psf_depth_chunk_size, int
         ):
@@ -406,12 +450,16 @@ class DepthAwareDoDoForwardModel(nn.Module):
             )
         if psf_depth_chunk_size < 1:
             raise ValueError(
-                "psf_depth_chunk_size must be >= 1, "
-                f"got {psf_depth_chunk_size}")
-        if image_formation_mode == "psf_convolution" and sensor_measurement.lower() != "intensity":
+                "psf_depth_chunk_size must be >= 1, " f"got {psf_depth_chunk_size}"
+            )
+        if (
+            image_formation_mode == "psf_convolution"
+            and sensor_measurement.lower() != "intensity"
+        ):
             raise ValueError(
                 "psf_convolution forms an incoherent intensity image and therefore requires "
-                "sensor_measurement='intensity'")
+                "sensor_measurement='intensity'"
+            )
         if free and doe_basis_mode != "legacy_raw12":
             raise ValueError(
                 "doe_basis_mode applies only to the legacy 12-term DOE; "
@@ -426,16 +474,25 @@ class DepthAwareDoDoForwardModel(nn.Module):
         depth_layering_mode = depth_layering_mode.lower()
         if depth_layering_mode not in _DEPTH_LAYERING_MODES:
             raise ValueError(
-                f"depth_layering_mode must be one of {_DEPTH_LAYERING_MODES}, got '{depth_layering_mode}'")
+                f"depth_layering_mode must be one of {_DEPTH_LAYERING_MODES}, got '{depth_layering_mode}'"
+            )
         self.depth_layering_mode = depth_layering_mode
-        if measurement_norm_mode not in ("legacy_max", "none", "per_sample_max", "fixed_scale"):
+        if measurement_norm_mode not in (
+            "legacy_max",
+            "none",
+            "per_sample_max",
+            "fixed_scale",
+        ):
             raise ValueError(
                 f"measurement_norm_mode must be one of legacy_max/none/per_sample_max/fixed_scale, "
-                f"got '{measurement_norm_mode}'")
+                f"got '{measurement_norm_mode}'"
+            )
         self.measurement_norm_mode = measurement_norm_mode
         measurement_norm_scale = float(measurement_norm_scale)
         if measurement_norm_mode == "fixed_scale" and measurement_norm_scale <= 0.0:
-            raise ValueError("measurement_norm_scale must be > 0 when measurement_norm_mode='fixed_scale'")
+            raise ValueError(
+                "measurement_norm_scale must be > 0 when measurement_norm_mode='fixed_scale'"
+            )
         self.register_buffer(
             "measurement_norm_scale",
             torch.tensor(max(measurement_norm_scale, 1e-8), dtype=torch.float32),
@@ -463,35 +520,49 @@ class DepthAwareDoDoForwardModel(nn.Module):
         self.register_buffer("z_centers", z_centers)
 
         # One prop1 per depth bin (fixed zi = bin center)
-        self.prop1_layers = nn.ModuleList([
-            PropagationLayer(
-                Mp=minput,
-                L=self.optical_grid_length_m,
-                zi=float(z_centers[k]),
-                trainable_z=False,
-                padding_factor=self.prop1_padding_factor,
-            )
-            for k in range(num_depth_layers)
-        ])
+        self.prop1_layers = nn.ModuleList(
+            [
+                PropagationLayer(
+                    Mp=minput,
+                    L=self.optical_grid_length_m,
+                    zi=float(z_centers[k]),
+                    trainable_z=False,
+                    padding_factor=self.prop1_padding_factor,
+                )
+                for k in range(num_depth_layers)
+            ]
+        )
 
-        if free:
+        if self.doe_parameterization == "pixel_phase":
+            self.doe1 = DOEPixelPhaseLayer(
+                Mdoe=mss,
+                Mesce=minput,
+                trainable=train_c,
+                assets_dir=assets_dir,
+                reference_wavelength_m=doe_reference_wavelength_m,
+                use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
+            )
+        elif free:
             self.doe1 = DOEFreeLayer(
-                Mdoe=mss, Mesce=minput, n_terms=n_terms,
-                doe_type=doe_type_a, trainable=train_c,
-                assets_dir=assets_dir, basis_path=zernike_basis_path,
+                Mdoe=mss,
+                Mesce=minput,
+                n_terms=n_terms,
+                doe_type=doe_type_a,
+                trainable=train_c,
+                assets_dir=assets_dir,
+                basis_path=zernike_basis_path,
                 phase_scale_mode="legacy_free",
-                use_pupil_mask=(
-                    self.psf_optics_version == "consistent_grid_v1"
-                ),
+                use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
             )
         else:
             self.doe1 = DOELayer(
-                Mdoe=mss, Mesce=minput, doe_type=doe_type_a,
-                trainable=train_c, assets_dir=assets_dir,
+                Mdoe=mss,
+                Mesce=minput,
+                doe_type=doe_type_a,
+                trainable=train_c,
+                assets_dir=assets_dir,
                 phase_scale_mode="legacy_doe",
-                use_pupil_mask=(
-                    self.psf_optics_version == "consistent_grid_v1"
-                ),
+                use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
                 basis_mode=doe_basis_mode,
                 basis_rank=doe_basis_rank,
                 basis_rank_rtol=doe_basis_rank_rtol,
@@ -517,11 +588,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
             trainable_z=False,
         )
         self.doe2 = DOELayer(
-            Mdoe=mss, Mesce=mss, doe_type="Spiral", trainable=False,
-            assets_dir=assets_dir, phase_scale_mode="legacy_doe",
-            use_pupil_mask=(
-                self.psf_optics_version == "consistent_grid_v1"
-            ),
+            Mdoe=mss,
+            Mesce=mss,
+            doe_type="Spiral",
+            trainable=False,
+            assets_dir=assets_dir,
+            phase_scale_mode="legacy_doe",
+            use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
         )
         self.prop3 = PropagationLayer(
             Mp=mss,
@@ -530,10 +603,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
             trainable_z=False,
             padding_factor=self.sensor_padding_factor,
         )
-        self.sensing_unnorm = SensingLayer(Ms=mss, assets_dir=assets_dir, normalize=False,
-                                            sensing_mode=sensing_mode,
-                                            measurement_channels=measurement_channels,
-                                            sensor_measurement=sensor_measurement)
+        self.sensing_unnorm = SensingLayer(
+            Ms=mss,
+            assets_dir=assets_dir,
+            normalize=False,
+            sensing_mode=sensing_mode,
+            measurement_channels=measurement_channels,
+            sensor_measurement=sensor_measurement,
+        )
         if self.psf_optics_version == "consistent_grid_v1":
             self._assert_consistent_optical_sampling()
         # Frozen-optics inference/Stage-B training can reuse this bank.  It is
@@ -589,9 +666,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 )
 
         if self.prop3.padding_factor != 2:
-            raise ValueError(
-                "consistent_grid_v1 requires Prop3 padding_factor=2"
-            )
+            raise ValueError("consistent_grid_v1 requires Prop3 padding_factor=2")
         if self.prop3.work_Mp != 256 or abs(self.prop3.work_L - 0.02) > 1e-12:
             raise ValueError(
                 "consistent_grid_v1 requires the Prop3 work grid to be "
@@ -695,9 +770,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
         valid_mask: Optional[torch.Tensor],
     ):
         if spectral.ndim != 4:
-            raise ValueError(f"spectral must be 4D (B,H,W,C) or (B,C,H,W), got {spectral.ndim}D")
+            raise ValueError(
+                f"spectral must be 4D (B,H,W,C) or (B,C,H,W), got {spectral.ndim}D"
+            )
         if depth.ndim not in (3, 4):
-            raise ValueError(f"depth must be 3D (B,H,W) or 4D (B,1,H,W), got {depth.ndim}D")
+            raise ValueError(
+                f"depth must be 3D (B,H,W) or 4D (B,1,H,W), got {depth.ndim}D"
+            )
 
         spectral = self._to_nchw(spectral).to(torch.float32)
         if depth.ndim == 3:
@@ -707,16 +786,23 @@ class DepthAwareDoDoForwardModel(nn.Module):
         batch_s, channels, height_s, width_s = spectral.shape
         batch_d, depth_channels, height_d, width_d = depth.shape
         if depth_channels != 1:
-            raise ValueError(f"depth must have one channel, got shape {tuple(depth.shape)}")
+            raise ValueError(
+                f"depth must have one channel, got shape {tuple(depth.shape)}"
+            )
         if batch_s != batch_d:
-            raise ValueError(f"spectral batch size ({batch_s}) != depth batch size ({batch_d})")
+            raise ValueError(
+                f"spectral batch size ({batch_s}) != depth batch size ({batch_d})"
+            )
         if height_s != height_d or width_s != width_d:
             raise ValueError(
                 f"spectral spatial size ({height_s}x{width_s}) != "
-                f"depth spatial size ({height_d}x{width_d})")
+                f"depth spatial size ({height_d}x{width_d})"
+            )
         expected_bands = int(self.prop3.wave_lengths.numel())
         if channels != expected_bands:
-            raise ValueError(f"spectral must have {expected_bands} bands, got {channels}")
+            raise ValueError(
+                f"spectral must have {expected_bands} bands, got {channels}"
+            )
 
         if valid_mask is not None:
             if valid_mask.ndim == 3:
@@ -724,11 +810,16 @@ class DepthAwareDoDoForwardModel(nn.Module):
             if valid_mask.ndim != 4 or valid_mask.shape[1] != 1:
                 raise ValueError(
                     f"valid_mask must be 3D [B,H,W] or 4D [B,1,H,W], "
-                    f"got {tuple(valid_mask.shape)}")
-            if valid_mask.shape[0] != batch_s or valid_mask.shape[-2:] != (height_s, width_s):
+                    f"got {tuple(valid_mask.shape)}"
+                )
+            if valid_mask.shape[0] != batch_s or valid_mask.shape[-2:] != (
+                height_s,
+                width_s,
+            ):
                 raise ValueError(
                     f"valid_mask shape {tuple(valid_mask.shape)} is incompatible with "
-                    f"spectral/depth shape batch={batch_s}, spatial={height_s}x{width_s}")
+                    f"spectral/depth shape batch={batch_s}, spatial={height_s}x{width_s}"
+                )
             valid_mask = valid_mask.to(device=spectral.device, dtype=torch.float32)
 
         return spectral, depth, valid_mask
@@ -759,12 +850,18 @@ class DepthAwareDoDoForwardModel(nn.Module):
             lo = self.bin_edges[k]
             hi = self.bin_edges[k + 1]
             if k < self.num_depth_layers - 1:
-                layer_weight = ((depth_clamped >= lo) & (depth_clamped < hi)).to(torch.float32)
+                layer_weight = ((depth_clamped >= lo) & (depth_clamped < hi)).to(
+                    torch.float32
+                )
             else:
-                layer_weight = ((depth_clamped >= lo) & (depth_clamped <= hi)).to(torch.float32)
+                layer_weight = ((depth_clamped >= lo) & (depth_clamped <= hi)).to(
+                    torch.float32
+                )
             layer_weights.append(layer_weight)
         weights = torch.cat(layer_weights, dim=1)
-        debug = {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+        debug = (
+            {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+        )
         return weights, debug
 
     def _gaussian_blur_layer_weights(self, weights: torch.Tensor) -> torch.Tensor:
@@ -772,10 +869,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if sigma <= 0:
             return weights
         radius = max(1, int(3.0 * sigma + 0.5))
-        coords = torch.arange(-radius, radius + 1, device=weights.device, dtype=weights.dtype)
+        coords = torch.arange(
+            -radius, radius + 1, device=weights.device, dtype=weights.dtype
+        )
         kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
         kernel_1d = kernel_1d / kernel_1d.sum()
-        kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, 2 * radius + 1, 2 * radius + 1)
+        kernel_2d = torch.outer(kernel_1d, kernel_1d).view(
+            1, 1, 2 * radius + 1, 2 * radius + 1
+        )
 
         batch, layers, height, width = weights.shape
         flattened = weights.reshape(batch * layers, 1, height, width)
@@ -803,11 +904,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if self.depth_layering_mode == "soft_diopter":
             inverse_depth = 1.0 / depth_safe
             centers_u = self.diopter_binner.centers_u.to(
-                device=depth.device, dtype=depth.dtype).view(1, self.num_depth_layers, 1, 1)
+                device=depth.device, dtype=depth.dtype
+            ).view(1, self.num_depth_layers, 1, 1)
             layer_index = torch.argmin(torch.abs(inverse_depth - centers_u), dim=1)
         else:
             layer_index = torch.bucketize(
-                depth_safe[:, 0], self.bin_edges[1:-1].to(depth.device))
+                depth_safe[:, 0], self.bin_edges[1:-1].to(depth.device)
+            )
 
         weights = F.one_hot(layer_index, num_classes=self.num_depth_layers)
         weights = weights.permute(0, 3, 1, 2).to(dtype=depth.dtype)
@@ -820,7 +923,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
             weights / weight_sum.clamp_min(1e-8),
             torch.zeros_like(weights),
         )
-        debug = {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+        debug = (
+            {"weight_sum": weights.sum(dim=1, keepdim=True)} if return_debug else None
+        )
         return weights, debug
 
     def _psf_depth_weights(
@@ -833,7 +938,11 @@ class DepthAwareDoDoForwardModel(nn.Module):
             return self._baek_depth_weights(depth, valid_mask, return_debug)
         weights, debug = self._current_depth_weights(depth, valid_mask, return_debug)
         finite_positive = torch.isfinite(depth) & (depth > 0)
-        valid = finite_positive if valid_mask is None else (finite_positive & (valid_mask > 0))
+        valid = (
+            finite_positive
+            if valid_mask is None
+            else (finite_positive & (valid_mask > 0))
+        )
         if self.psf_mask_blur_sigma > 0:
             weights = self._gaussian_blur_layer_weights(weights)
         weights = weights * valid.to(dtype=weights.dtype)
@@ -846,7 +955,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
             debug = {"weight_sum": weights.sum(dim=1, keepdim=True)}
         return weights, debug
 
-    def _propagate_to_sensor(self, field: torch.Tensor, depth_index: int) -> torch.Tensor:
+    def _propagate_to_sensor(
+        self, field: torch.Tensor, depth_index: int
+    ) -> torch.Tensor:
         field = self.prop1_layers[depth_index](field)
         return self._propagate_after_prop1(field)
 
@@ -933,7 +1044,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if height != expected_size or width != expected_size:
             raise ValueError(
                 f"PSF convolution expects spatial size {expected_size}x{expected_size}, "
-                f"got {height}x{width}")
+                f"got {height}x{width}"
+            )
 
         cache_key = (
             device.type,
@@ -947,10 +1059,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # unchanged. Reuse one detached PSF bank across validation batches;
         # training forwards still rebuild a live autograd graph.
         can_cache = bool(
-            use_cache
-            and (self._optics_are_frozen() or not torch.is_grad_enabled())
+            use_cache and (self._optics_are_frozen() or not torch.is_grad_enabled())
         )
-        if can_cache and self._cached_psf_key == cache_key and self._cached_psf_bank is not None:
+        if (
+            can_cache
+            and self._cached_psf_key == cache_key
+            and self._cached_psf_bank is not None
+        ):
             return self._cached_psf_bank
 
         # Depth is represented as the batch dimension, so DOE phase generation
@@ -992,15 +1107,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 crop_top:crop_bottom,
                 crop_left:crop_right,
             ]
-            self._last_psf_capture_fraction = psf_bank.detach().sum(
-                dim=(-2, -1)
-            )
+            self._last_psf_capture_fraction = psf_bank.detach().sum(dim=(-2, -1))
         else:
             sensor_field = self._propagate_after_prop1(prop1_fields)
             psf_bank = torch.abs(sensor_field).to(torch.float32).square()
-            psf_bank = psf_bank / psf_bank.sum(
-                dim=(-2, -1), keepdim=True
-            ).clamp_min(1e-8)
+            psf_bank = psf_bank / psf_bank.sum(dim=(-2, -1), keepdim=True).clamp_min(
+                1e-8
+            )
             self._last_psf_capture_fraction = None
 
         if can_cache:
@@ -1018,7 +1131,11 @@ class DepthAwareDoDoForwardModel(nn.Module):
         if device is None:
             device = self.z_centers.device
         return self._generate_psf_bank(
-            int(spatial_size[0]), int(spatial_size[1]), torch.device(device), use_cache=use_cache)
+            int(spatial_size[0]),
+            int(spatial_size[1]),
+            torch.device(device),
+            use_cache=use_cache,
+        )
 
     def _psf_frequency_bank(
         self,
@@ -1046,18 +1163,21 @@ class DepthAwareDoDoForwardModel(nn.Module):
         kernels = psf_bank
         if self.psf_boundary_mode == "circular":
             kernels = torch.fft.ifftshift(kernels, dim=(-2, -1))
-        frequency_bank = torch.fft.rfft2(
-            kernels, s=fft_size, dim=(-2, -1))
+        frequency_bank = torch.fft.rfft2(kernels, s=fft_size, dim=(-2, -1))
         if can_cache:
             self._cached_psf_fft_bank = frequency_bank.detach()
             self._cached_psf_fft_key = cache_key
             return self._cached_psf_fft_bank
         return frequency_bank
 
-    def _sensor_response_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _sensor_response_matrix(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         sensing = self.sensing_unnorm
         if sensing.sensing_mode == "rgb":
-            response = torch.stack([sensing.sensor_r, sensing.sensor_g, sensing.sensor_b], dim=0)
+            response = torch.stack(
+                [sensing.sensor_r, sensing.sensor_g, sensing.sensor_b], dim=0
+            )
         else:
             response = sensing.response.transpose(0, 1)
         return response.to(device=device, dtype=dtype)
@@ -1070,7 +1190,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
             return y_sum / (y_max + 1e-8)
         if self.measurement_norm_mode == "fixed_scale":
             return torch.clamp(
-                y_sum / (self.measurement_norm_scale.to(y_sum.device) + 1e-8), 0.0, 1.0)
+                y_sum / (self.measurement_norm_scale.to(y_sum.device) + 1e-8), 0.0, 1.0
+            )
         return _normalize_once(y_sum)
 
     def _forward_whole_field(
@@ -1084,12 +1205,19 @@ class DepthAwareDoDoForwardModel(nn.Module):
         stage_diag = [] if debug_stages else None
         if debug_stages:
             stage_diag.append(("image_formation_mode", {"mode": "whole_field"}))
-            stage_diag.append(("depth_layering_mode", {"mode": self.depth_layering_mode}))
+            stage_diag.append(
+                ("depth_layering_mode", {"mode": self.depth_layering_mode})
+            )
             if binner_debug is not None:
-                stage_diag.append(("depth_weight_sum", _tensor_stats(binner_debug["weight_sum"].detach())))
+                stage_diag.append(
+                    (
+                        "depth_weight_sum",
+                        _tensor_stats(binner_debug["weight_sum"].detach()),
+                    )
+                )
 
         for k in range(self.num_depth_layers):
-            layer_weight = weights[:, k:k + 1].to(dtype=spectral.dtype)
+            layer_weight = weights[:, k : k + 1].to(dtype=spectral.dtype)
             # Dataset values are spectral radiance/intensity, while coherent
             # propagation operates on field amplitude. Apply the depth weight
             # in the intensity domain first, then take sqrt, so
@@ -1155,13 +1283,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 raise ValueError(
                     "PSF convolution output_size must be positive and no "
                     f"larger than the {height}x{width} input, got "
-                    f"{output_height}x{output_width}")
+                    f"{output_height}x{output_width}"
+                )
         output_top = (height - output_height) // 2
         output_left = (width - output_width) // 2
         output_weights = weights[
             ...,
-            output_top:output_top + output_height,
-            output_left:output_left + output_width,
+            output_top : output_top + output_height,
+            output_left : output_left + output_width,
         ]
         # Unlike the coherent whole-field path, this path is already an
         # incoherent intensity model: spectral radiance is convolved directly
@@ -1187,26 +1316,17 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
         if self.psf_boundary_mode == "linear_zero":
             kernel_height, kernel_width = psf_bank.shape[-2:]
-            use_overlap_save = (
-                output_height < height or output_width < width)
+            use_overlap_save = output_height < height or output_width < width
             if use_overlap_save:
                 # Only the center output tile enters the decoder. Overlap-save
                 # needs output+kernel-1 samples, reducing halo64 FFTs from
                 # 384x384 to 256x256 without changing that center tile.
                 fft_size = (
-                    _next_fast_fft_length(
-                        output_height + kernel_height - 1),
-                    _next_fast_fft_length(
-                        output_width + kernel_width - 1),
+                    _next_fast_fft_length(output_height + kernel_height - 1),
+                    _next_fast_fft_length(output_width + kernel_width - 1),
                 )
-                block_top = (
-                    output_top + kernel_height // 2
-                    - (kernel_height - 1)
-                )
-                block_left = (
-                    output_left + kernel_width // 2
-                    - (kernel_width - 1)
-                )
+                block_top = output_top + kernel_height // 2 - (kernel_height - 1)
+                block_left = output_left + kernel_width // 2 - (kernel_width - 1)
                 source_top = max(block_top, 0)
                 source_left = max(block_left, 0)
                 source_bottom = min(block_top + fft_size[0], height)
@@ -1218,16 +1338,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 ]
                 pad_top = source_top - block_top
                 pad_left = source_left - block_left
-                pad_bottom = (
-                    fft_size[0] - pad_top - spectral_block.shape[-2])
-                pad_right = (
-                    fft_size[1] - pad_left - spectral_block.shape[-1])
+                pad_bottom = fft_size[0] - pad_top - spectral_block.shape[-2]
+                pad_right = fft_size[1] - pad_left - spectral_block.shape[-1]
                 spectral_block = F.pad(
                     spectral_block,
                     (pad_left, pad_right, pad_top, pad_bottom),
                 )
-                spectral_fft = torch.fft.rfft2(
-                    spectral_block, dim=(-2, -1))
+                spectral_fft = torch.fft.rfft2(spectral_block, dim=(-2, -1))
                 convolution_crop_top = kernel_height - 1
                 convolution_crop_left = kernel_width - 1
             else:
@@ -1240,8 +1357,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                     _next_fast_fft_length(full_height),
                     _next_fast_fft_length(full_width),
                 )
-                spectral_fft = torch.fft.rfft2(
-                    spectral, s=fft_size, dim=(-2, -1))
+                spectral_fft = torch.fft.rfft2(spectral, s=fft_size, dim=(-2, -1))
                 convolution_crop_top = kernel_height // 2
                 convolution_crop_left = kernel_width // 2
         else:
@@ -1257,57 +1373,63 @@ class DepthAwareDoDoForwardModel(nn.Module):
         stage_diag = [] if debug_stages else None
         if debug_stages:
             stage_diag.append(("image_formation_mode", {"mode": "psf_convolution"}))
-            stage_diag.append(("depth_layering_mode", {"mode": self.depth_layering_mode}))
-            stage_diag.append(("psf_layer_mask_mode", {"mode": self.psf_layer_mask_mode}))
+            stage_diag.append(
+                ("depth_layering_mode", {"mode": self.depth_layering_mode})
+            )
+            stage_diag.append(
+                ("psf_layer_mask_mode", {"mode": self.psf_layer_mask_mode})
+            )
             stage_diag.append(("psf_boundary_mode", {"mode": self.psf_boundary_mode}))
             if binner_debug is not None:
-                stage_diag.append(("depth_weight_sum", _tensor_stats(binner_debug["weight_sum"].detach())))
+                stage_diag.append(
+                    (
+                        "depth_weight_sum",
+                        _tensor_stats(binner_debug["weight_sum"].detach()),
+                    )
+                )
             stage_diag.append(("psf_bank", _tensor_stats(psf_bank.detach())))
-            stage_diag.append((
-                "psf_energy",
-                _tensor_stats(psf_bank.detach().sum(dim=(-2, -1))),
-            ))
+            stage_diag.append(
+                (
+                    "psf_energy",
+                    _tensor_stats(psf_bank.detach().sum(dim=(-2, -1))),
+                )
+            )
             if self._last_psf_capture_fraction is not None:
-                stage_diag.append((
-                    "psf_capture_fraction",
-                    _tensor_stats(self._last_psf_capture_fraction),
-                ))
+                stage_diag.append(
+                    (
+                        "psf_capture_fraction",
+                        _tensor_stats(self._last_psf_capture_fraction),
+                    )
+                )
 
         chunk_size = min(self.psf_depth_chunk_size, self.num_depth_layers)
         for chunk_start in range(0, self.num_depth_layers, chunk_size):
-            chunk_end = min(
-                chunk_start + chunk_size, self.num_depth_layers)
+            chunk_end = min(chunk_start + chunk_size, self.num_depth_layers)
             if cached_psf_fft_bank is not None:
-                psf_fft_chunk = cached_psf_fft_bank[
-                    chunk_start:chunk_end]
+                psf_fft_chunk = cached_psf_fft_bank[chunk_start:chunk_end]
             else:
                 kernels = psf_bank[chunk_start:chunk_end]
                 if self.psf_boundary_mode == "circular":
-                    kernels = torch.fft.ifftshift(
-                        kernels, dim=(-2, -1))
-                psf_fft_chunk = torch.fft.rfft2(
-                    kernels, s=fft_size, dim=(-2, -1))
+                    kernels = torch.fft.ifftshift(kernels, dim=(-2, -1))
+                psf_fft_chunk = torch.fft.rfft2(kernels, s=fft_size, dim=(-2, -1))
             mixed_fft = torch.einsum(
                 "bcxy,kcxy,oc->bkoxy",
                 spectral_fft,
                 psf_fft_chunk,
                 response_complex,
             )
-            full = torch.fft.irfft2(
-                mixed_fft, s=fft_size, dim=(-2, -1))
+            full = torch.fft.irfft2(mixed_fft, s=fft_size, dim=(-2, -1))
             if self.psf_boundary_mode == "linear_zero":
                 blurred_chunk = full[
                     ...,
-                    convolution_crop_top:
-                    convolution_crop_top + output_height,
-                    convolution_crop_left:
-                    convolution_crop_left + output_width,
+                    convolution_crop_top : convolution_crop_top + output_height,
+                    convolution_crop_left : convolution_crop_left + output_width,
                 ]
             else:
                 blurred_chunk = full[
                     ...,
-                    output_top:output_top + output_height,
-                    output_left:output_left + output_width,
+                    output_top : output_top + output_height,
+                    output_left : output_left + output_width,
                 ]
 
             # Preserve the historical layer summation order while amortizing
@@ -1316,15 +1438,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 blurred_sensor = blurred_chunk[:, local_index]
                 # Baek et al. Eq. (3): depth occupancy is applied after each
                 # wavelength-dependent PSF convolution.
-                layered_sensor = blurred_sensor * output_weights[
-                    :, k:k + 1
-                ].to(dtype=blurred_sensor.dtype)
+                layered_sensor = blurred_sensor * output_weights[:, k : k + 1].to(
+                    dtype=blurred_sensor.dtype
+                )
                 y_sum = y_sum + layered_sensor
                 if debug_stages and k == 0:
-                    stage_diag.append((
-                        "blurred_sensor", _tensor_stats(blurred_sensor)))
-                    stage_diag.append((
-                        "layered_sensor", _tensor_stats(layered_sensor)))
+                    stage_diag.append(("blurred_sensor", _tensor_stats(blurred_sensor)))
+                    stage_diag.append(("layered_sensor", _tensor_stats(layered_sensor)))
 
         if debug_stages:
             stage_diag.append(("y_sum_before_norm", _tensor_stats_real(y_sum)))
@@ -1349,7 +1469,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
         psf_bank = None
         if self.image_formation_mode == "psf_convolution":
             weights, binner_debug = self._psf_depth_weights(
-                depth, valid_mask, return_debug=debug_stages)
+                depth, valid_mask, return_debug=debug_stages
+            )
             y, psf_bank = self._forward_psf_convolution(
                 spectral,
                 weights,
@@ -1360,9 +1481,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
             )
         else:
             weights, binner_debug = self._current_depth_weights(
-                depth, valid_mask, return_debug=debug_stages)
-            y = self._forward_whole_field(
-                spectral, weights, binner_debug, debug_stages)
+                depth, valid_mask, return_debug=debug_stages
+            )
+            y = self._forward_whole_field(spectral, weights, binner_debug, debug_stages)
         y = self._from_nchw(y)
         if return_psf:
             return y, psf_bank

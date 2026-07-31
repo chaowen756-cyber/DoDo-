@@ -34,13 +34,30 @@ from util.doe_preoptimization import (
     doe_physical_stats,
     doe_preoptimization_objective,
     initialize_doe_height_,
+    initialize_phase_conjugate_doe_,
     rms_constrained_optimizer_step_,
 )
 
 
 MODE_SPECS = {
-    "rank9": {"free": False, "n_terms": 12, "basis_mode": "orthogonal_rms"},
-    "free150": {"free": True, "n_terms": 150, "basis_mode": "legacy_raw12"},
+    "rank9": {
+        "free": False,
+        "n_terms": 12,
+        "basis_mode": "orthogonal_rms",
+        "parameterization": "zernike",
+    },
+    "free150": {
+        "free": True,
+        "n_terms": 150,
+        "basis_mode": "legacy_raw12",
+        "parameterization": "zernike",
+    },
+    "pixelphase": {
+        "free": False,
+        "n_terms": 12,
+        "basis_mode": "legacy_raw12",
+        "parameterization": "pixel_phase",
+    },
 }
 
 
@@ -92,6 +109,8 @@ def build_model(args, mode: str, device: torch.device):
         doe_basis_rms_m=3e-6,
         doe_coeff_norm_limit=1.0,
         doe_init_coeff_norm=0.2,
+        doe_parameterization=spec["parameterization"],
+        doe_reference_wavelength_m=args.phase_reference_wavelength_nm * 1e-9,
         psf_optics_version="consistent_grid_v1",
     ).to(device)
     for parameter in model.parameters():
@@ -111,7 +130,26 @@ def build_model(args, mode: str, device: torch.device):
 
 
 def _save_heightmap(doe, output_dir: Path) -> None:
-    height_um = doe.heightmap().detach().cpu().numpy() * 1e6
+    unwrapped_height = (
+        doe.unwrapped_heightmap().detach()
+        if hasattr(doe, "unwrapped_heightmap")
+        else doe.heightmap().detach()
+    )
+    if hasattr(doe, "wrapped_heightmap"):
+        height = doe.wrapped_heightmap().detach()
+        np.save(
+            output_dir / "best_unwrapped_heightmap_m.npy",
+            unwrapped_height.cpu().numpy(),
+        )
+        np.save(
+            output_dir / "best_unwrapped_phase_rad.npy",
+            doe.zernike_coeffs.detach().cpu().numpy(),
+        )
+        title = "Best wrapped physical DOE height map"
+    else:
+        height = unwrapped_height
+        title = "Best DOE height map"
+    height_um = height.cpu().numpy() * 1e6
     np.save(output_dir / "best_heightmap_m.npy", height_um * 1e-6)
     np.save(
         output_dir / "best_coefficients.npy",
@@ -122,7 +160,7 @@ def _save_heightmap(doe, output_dir: Path) -> None:
     plt.figure(figsize=(5.2, 4.4))
     image = plt.imshow(display, cmap="coolwarm")
     plt.colorbar(image, fraction=0.046, pad=0.04, label="height (μm)")
-    plt.title("Best DOE height map")
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(output_dir / "best_heightmap.png", dpi=180)
     plt.close()
@@ -164,11 +202,26 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     generator.manual_seed(seed)
 
     model = build_model(args, mode, device)
-    initialize_doe_height_(
-        model.doe1,
-        target_rms_m=args.initial_height_rms_um * 1e-6,
-        generator=generator,
-    )
+    spec = MODE_SPECS[mode]
+    if spec["parameterization"] == "pixel_phase":
+        initialization = initialize_phase_conjugate_doe_(
+            model,
+            reference_depth_m=args.phase_reference_depth_m,
+            reference_wavelength_m=args.phase_reference_wavelength_nm * 1e-9,
+            phase_noise_std_rad=args.phase_initial_noise_std_rad,
+            generator=generator,
+        )
+        initialization["type"] = "discrete_phase_conjugate"
+    else:
+        initialize_doe_height_(
+            model.doe1,
+            target_rms_m=args.initial_height_rms_um * 1e-6,
+            generator=generator,
+        )
+        initialization = {
+            "height_rms_m": args.initial_height_rms_um * 1e-6,
+            "type": "random_height_rms",
+        }
     coefficients = model.doe1.zernike_coeffs
     optimizer = torch.optim.Adam([coefficients], lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -212,9 +265,11 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     config = {
         **vars(args),
         "mode": mode,
+        "parameterization": spec["parameterization"],
         "seed": seed,
         "weights": asdict(weights),
         "targets": asdict(targets),
+        "initialization": initialization,
         "branch": "DOE可编码性预优化实验",
     }
     config["output_dir"] = str(output_dir)
@@ -293,18 +348,21 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
             )
             if not torch.isfinite(grad_norm):
                 raise FloatingPointError(f"non-finite DOE gradient at step {step}")
-            constraint_stats = rms_constrained_optimizer_step_(
-                model.doe1,
-                optimizer,
-                maximum_rms_m=args.maximum_height_rms_um * 1e-6,
-                boundary_fraction=args.rms_boundary_fraction,
-            )
-            retraction_count += int(constraint_stats["retracted"])
-            tangent_correction_count += int(constraint_stats["tangent_correction"])
-            minimum_retraction_scale = min(
-                minimum_retraction_scale,
-                constraint_stats["retraction_scale"],
-            )
+            if spec["parameterization"] == "pixel_phase":
+                optimizer.step()
+            else:
+                constraint_stats = rms_constrained_optimizer_step_(
+                    model.doe1,
+                    optimizer,
+                    maximum_rms_m=args.maximum_height_rms_um * 1e-6,
+                    boundary_fraction=args.rms_boundary_fraction,
+                )
+                retraction_count += int(constraint_stats["retracted"])
+                tangent_correction_count += int(constraint_stats["tangent_correction"])
+                minimum_retraction_scale = min(
+                    minimum_retraction_scale,
+                    constraint_stats["retraction_scale"],
+                )
             scheduler.step()
 
     if best_coefficients is None or best_metrics is None:
@@ -316,6 +374,7 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     checkpoint = {
         "format": "doe_psf_preoptimization_v1",
         "mode": mode,
+        "parameterization": spec["parameterization"],
         "seed": seed,
         "best_step": best_step,
         "config": config,
@@ -324,7 +383,16 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
             name: value.detach().cpu() for name, value in model.state_dict().items()
         },
         "doe_coefficients": best_coefficients,
-        "doe_heightmap_m": model.doe1.heightmap().detach().cpu(),
+        "doe_heightmap_m": (
+            model.doe1.wrapped_heightmap().detach().cpu()
+            if hasattr(model.doe1, "wrapped_heightmap")
+            else model.doe1.heightmap().detach().cpu()
+        ),
+        "doe_unwrapped_heightmap_m": (
+            model.doe1.unwrapped_heightmap().detach().cpu()
+            if hasattr(model.doe1, "unwrapped_heightmap")
+            else model.doe1.heightmap().detach().cpu()
+        ),
     }
     torch.save(checkpoint, output_dir / "best_doe.pt")
     if args.save_psf_bank:
@@ -334,10 +402,16 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
 
     summary = {
         "mode": mode,
+        "parameterization": spec["parameterization"],
         "seed": seed,
         "best_step": best_step,
         "projection_count": retraction_count,
         "constraint": {
+            "kind": (
+                "single_period_wrapped_phase"
+                if spec["parameterization"] == "pixel_phase"
+                else "pupil_height_rms_ball"
+            ),
             "retraction_count": retraction_count,
             "tangent_correction_count": tangent_correction_count,
             "minimum_retraction_scale": minimum_retraction_scale,
@@ -431,6 +505,9 @@ def _parse_args(argv: Iterable[str] = None):
     parser.add_argument("--initial_height_rms_um", type=float, default=0.6)
     parser.add_argument("--maximum_height_rms_um", type=float, default=3.0)
     parser.add_argument("--rms_boundary_fraction", type=float, default=0.999)
+    parser.add_argument("--phase_reference_depth_m", type=float, default=1.0)
+    parser.add_argument("--phase_reference_wavelength_nm", type=float, default=550.0)
+    parser.add_argument("--phase_initial_noise_std_rad", type=float, default=0.05)
 
     parser.add_argument("--fisher_weight", type=float, default=1.0)
     parser.add_argument("--fisher_ridge", type=float, default=1e-8)
@@ -497,6 +574,12 @@ def _parse_args(argv: Iterable[str] = None):
         parser.error("at least one Fisher CRLB weight must be > 0")
     if args.initial_height_rms_um > args.maximum_height_rms_um:
         parser.error("initial DOE height RMS cannot exceed the maximum")
+    if args.phase_reference_depth_m <= 0.0:
+        parser.error("--phase_reference_depth_m must be > 0")
+    if args.phase_reference_wavelength_nm <= 0.0:
+        parser.error("--phase_reference_wavelength_nm must be > 0")
+    if args.phase_initial_noise_std_rad < 0.0:
+        parser.error("--phase_initial_noise_std_rad must be >= 0")
     if not 0.0 < args.rms_boundary_fraction <= 1.0:
         parser.error("--rms_boundary_fraction must lie in (0,1]")
     if any(offset < 1 for offset in args.optical_spectral_offsets):
