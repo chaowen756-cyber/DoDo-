@@ -117,6 +117,46 @@ def _build_orthogonal_rms_basis(
 
 
 class _BaseDOE(nn.Module):
+    def heightmap(self) -> torch.Tensor:
+        """Return the current physical DOE height map in metres."""
+        coefficients = getattr(self, "zernike_coeffs", None)
+        if isinstance(coefficients, nn.Parameter):
+            device = coefficients.device
+        else:
+            device = self.spiral_hm.device
+        return self._compute_hm(device=device)
+
+    def pupil_rms(self, value: torch.Tensor) -> torch.Tensor:
+        """Compute RMS over the active DOE pupil rather than the square grid."""
+        pupil = self.spiral_p.to(device=value.device) > 0.5
+        selected = value[pupil]
+        if selected.numel() == 0:
+            return torch.zeros((), device=value.device, dtype=value.dtype)
+        return torch.sqrt(torch.mean(selected.to(torch.float32) ** 2))
+
+    def project_height_rms_(self, maximum_rms_m: float) -> bool:
+        """Project a linear trainable DOE height map into a pupil-RMS ball.
+
+        This is intentionally separate from the historical coefficient clamp:
+        different Zernike bases use different physical scales, whereas a
+        height-RMS constraint gives low- and high-capacity bases the same
+        physical budget for DOE-only feasibility experiments.
+        """
+        maximum_rms_m = float(maximum_rms_m)
+        if maximum_rms_m <= 0.0:
+            raise ValueError("maximum_rms_m must be > 0")
+        coefficients = getattr(self, "zernike_coeffs", None)
+        if not isinstance(coefficients, nn.Parameter) or not coefficients.requires_grad:
+            return False
+        with torch.no_grad():
+            current_rms = self.pupil_rms(self.heightmap())
+            if not torch.isfinite(current_rms):
+                raise FloatingPointError("DOE height RMS is non-finite")
+            if current_rms <= maximum_rms_m:
+                return False
+            coefficients.mul_(maximum_rms_m / current_rms.clamp_min(1e-20))
+        return True
+
     def clamp_parameters_(self):
         if hasattr(self, "zernike_coeffs") and isinstance(self.zernike_coeffs, nn.Parameter):
             with torch.no_grad():
@@ -261,20 +301,6 @@ class DOELayer(_BaseDOE):
                 coeff_norm = self.zernike_coeffs.norm(p=2)
                 if coeff_norm > self.coeff_norm_limit:
                     self.zernike_coeffs.mul_(self.coeff_norm_limit / coeff_norm)
-
-    def heightmap(self) -> torch.Tensor:
-        if isinstance(self.zernike_coeffs, nn.Parameter):
-            device = self.zernike_coeffs.device
-        else:
-            device = self.spiral_hm.device
-        return self._compute_hm(device=device)
-
-    def pupil_rms(self, value: torch.Tensor) -> torch.Tensor:
-        pupil = self.spiral_p.to(device=value.device) > 0.5
-        selected = value[pupil]
-        if selected.numel() == 0:
-            return torch.zeros((), device=value.device, dtype=value.dtype)
-        return torch.sqrt(torch.mean(selected.to(torch.float32) ** 2))
 
     def phase_rms_from_height_rms(
         self,

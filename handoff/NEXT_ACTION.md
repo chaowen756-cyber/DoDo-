@@ -2,57 +2,42 @@
 
 ## Owner
 
-Pending user scope / Claude after Codex plan
-
-## Role
-
-Round 24 Spectral Modification Planning
+User / experiment runner
 
 ## Current Change
 
-DoDo-change / next spectral-side modification
+DOE PSF preoptimization feasibility experiment
 
-## Context
+## Status
 
-Round 23 intensity sensing and the LowFG measurement-energy diagnostic repair are accepted by Codex review.
+Branch `DOE可编码性预优化实验` contains an independently reviewed DOE-only
+search. It preserves the current `consistent_grid_v1` optical forward and
+compares rank-9 with free-150 under the same physical pupil-height RMS budget.
 
-Accepted review files:
+## Execute
 
-- `reviews/review-DoDo-change-round23-intensity-sensing-2026-05-09.md`
-- `reviews/review-DoDo-change-round23-repair-lowfg-2026-05-09.md`
+Run the first-stage 1000-step comparison command from
+`docs/doe_psf_preoptimization.md` on an available GPU. Do not start joint CNN
+training before this comparison finishes.
 
-Current status:
+## Decision
 
-- `sensor_measurement={amplitude,intensity}` core implementation is accepted.
-- Soft diopter regression remains passing per Claude report.
-- LowFG diagnostic now computes true DoDo measurement energy and confirms pure-background lowfg tiles generate finite measurement energy.
-- No checkpoint is promoted.
-- Full-scene deployment remains not approved.
-- Do not run long training until the next spectral-side change is specified and reviewed.
+- If neither mode materially raises MTF and lowers spectral/depth cosine without
+  losing crop energy, treat the current optical grid/propagation contract or the
+  3 um RMS budget as the limiting factor.
+- If free-150 is consistently better, repeat free-150 with seeds 123/456/789,
+  then use its best DOE checkpoint as the only changed initialization in a
+  controlled joint-training experiment.
+- If rank-9 is already comparable, retain rank-9 and investigate the joint
+  objective/decoder instead of increasing DOE capacity.
 
-## Awaiting User Scope
+## Required Artifact
 
-Before Claude implements Round 24, define the spectral modification target precisely. The next prompt should specify which spectral-side change is intended, for example:
-
-- spectral loss / SAM loss changes;
-- spectral metric contract changes;
-- spectral sensing/channel response changes;
-- decoder spectral-head architecture changes;
-- dataset spectral normalization or band selection changes;
-- full-scene spectral artifact mitigation.
-
-## Required Before Implementation
-
-Codex should create a patch plan for the chosen spectral modification before Claude writes code.
-
-The plan must include:
-
-- files/classes/functions to modify;
-- explicit in-scope and out-of-scope items;
-- expected tests/smokes;
-- whether any training is allowed;
-- artifact cleanup expectations.
+- `comparison.json`
+- each run's `summary.json`, `best_doe.pt`, height map and PSF montage
+- optional `best_psf_bank.pt` for offline inspection
 
 ## Stop Condition
 
-No active Claude implementation task until the user provides the spectral modification scope and Codex writes/approves a plan.
+Stop after the DOE-only comparison and inspect its metrics. Do not infer full
+reconstruction success from this experiment alone.
