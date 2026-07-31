@@ -191,6 +191,9 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     targets = DOEPreoptimizationTargets(
         fisher_ridge=args.fisher_ridge,
         fisher_loss_scale=args.fisher_loss_scale,
+        fisher_spatial_crlb_weight=args.fisher_spatial_crlb_weight,
+        fisher_depth_crlb_weight=args.fisher_depth_crlb_weight,
+        fisher_wavelength_crlb_weight=args.fisher_wavelength_crlb_weight,
         mtf_min_frequency=args.mtf_min_frequency,
         mtf_max_frequency=args.mtf_max_frequency,
         mtf_at_005=args.mtf_target_005,
@@ -284,7 +287,7 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
                 print(
                     f"[{mode} seed={seed} step={step:04d}] "
                     f"loss={metrics_float['loss/total']:.6f} "
-                    f"FisherA={metrics_float['fisher/a_optimality_mean']:.3e} "
+                    f"FisherTask={metrics_float['fisher/task_a_optimality_mean']:.3e} "
                     f"MTF005(p10/mean)={metrics_float['mtf/005_p10']:.4f}/"
                     f"{metrics_float['mtf/005_mean']:.4f} "
                     f"spec_cos={metrics_float['spectral/adjacent_cosine_mean']:.4f} "
@@ -346,6 +349,12 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
             "fisher_a_optimality": initial_metrics[
                 "fisher/a_optimality_mean"
             ] - best_metrics["fisher/a_optimality_mean"],
+            "fisher_task_a_optimality": initial_metrics[
+                "fisher/task_a_optimality_mean"
+            ] - best_metrics["fisher/task_a_optimality_mean"],
+            "fisher_weighted_a_optimality": initial_metrics[
+                "fisher/weighted_a_optimality_mean"
+            ] - best_metrics["fisher/weighted_a_optimality_mean"],
             "fisher_minimum_eigenvalue": best_metrics[
                 "fisher/minimum_eigenvalue_mean"
             ] - initial_metrics["fisher/minimum_eigenvalue_mean"],
@@ -367,6 +376,10 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
                 best_metrics["fisher/a_optimality_mean"]
                 < initial_metrics["fisher/a_optimality_mean"]
             ),
+            "fisher_task_a_optimality_improved": (
+                best_metrics["fisher/task_a_optimality_mean"]
+                < initial_metrics["fisher/task_a_optimality_mean"]
+            ),
             "mtf_floor_satisfied": best_metrics["loss/mtf"] <= 1e-6,
             "spectral_margin_satisfied": (
                 best_metrics["loss/spectral_separation"] <= 1e-6
@@ -375,8 +388,8 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
                 best_metrics["loss/depth_separation"] <= 1e-6
             ),
             "all_information_targets_satisfied": (
-                best_metrics["fisher/a_optimality_mean"]
-                < initial_metrics["fisher/a_optimality_mean"]
+                best_metrics["fisher/task_a_optimality_mean"]
+                < initial_metrics["fisher/task_a_optimality_mean"]
                 and best_metrics["loss/mtf"] <= 1e-6
                 and best_metrics["loss/spectral_separation"] <= 1e-6
                 and best_metrics["loss/depth_separation"] <= 1e-6
@@ -414,6 +427,9 @@ def _parse_args(argv: Iterable[str] = None):
     parser.add_argument("--fisher_weight", type=float, default=1.0)
     parser.add_argument("--fisher_ridge", type=float, default=1e-8)
     parser.add_argument("--fisher_loss_scale", type=float, default=1e-7)
+    parser.add_argument("--fisher_spatial_crlb_weight", type=float, default=0.10)
+    parser.add_argument("--fisher_depth_crlb_weight", type=float, default=1.0)
+    parser.add_argument("--fisher_wavelength_crlb_weight", type=float, default=1.0)
     parser.add_argument("--mtf_weight", type=float, default=20.0)
     parser.add_argument("--spectral_weight", type=float, default=1.0)
     parser.add_argument("--depth_weight", type=float, default=1.0)
@@ -445,6 +461,17 @@ def _parse_args(argv: Iterable[str] = None):
         parser.error("learning rate and final_lr_ratio must be > 0")
     if args.fisher_ridge <= 0.0 or args.fisher_loss_scale <= 0.0:
         parser.error("Fisher ridge and loss scale must be > 0")
+    fisher_parameter_weights = (
+        args.fisher_spatial_crlb_weight,
+        args.fisher_depth_crlb_weight,
+        args.fisher_wavelength_crlb_weight,
+    )
+    if any(value < 0.0 for value in fisher_parameter_weights):
+        parser.error("Fisher CRLB weights must be >= 0")
+    if args.fisher_spatial_crlb_weight * 2.0 + sum(
+        fisher_parameter_weights[1:]
+    ) <= 0.0:
+        parser.error("at least one Fisher CRLB weight must be > 0")
     if args.initial_height_rms_um > args.maximum_height_rms_um:
         parser.error("initial DOE height RMS cannot exceed the maximum")
     if args.device.startswith("cuda") and not torch.cuda.is_available():

@@ -19,15 +19,18 @@
 
 优化目标包括：
 
-1. 单色点源 RGB PSF 关于 x、y、深度和波长的 Fisher A-optimality；
+1. 单色点源 RGB PSF 的任务加权 Fisher A-optimality；
 2. PSF MTF floor，保护 0.02–0.15 cycle/pixel 空间带宽；
 3. RGB 传感器加权的相邻波长 PSF 分离；
 4. RGB 传感器加权的相邻深度 PSF 分离；
 5. 宽松的 r16/r24 能量护栏，防止通过无限扩散伪造区分度。
 
-Fisher 项直接对应 Baek 等人在同一 HS-D 任务中使用的 DOE 初始化方法。
-四个导数均按一个离散采样 bin 定标，避免米、纳米等单位选择任意改变
-A-optimality；PSF 不做逐核归一化，因此低 capture 不能伪装成高信息量。
+Fisher 项以 Baek 等人在同一 HS-D 任务中使用的 DOE 初始化方法为基础。
+实现始终对完整 `(x,y,depth,wavelength)` Fisher 矩阵求逆，因此 x/y 仍作为
+nuisance 参数参与深度/波长 CRLB；损失权重设为 `(0.1,0.1,1,1)`，避免上一轮
+把大部分自由度用于 x/y 定位。四个导数均按一个离散采样 bin 定标，避免米、
+纳米等单位选择任意改变 A-optimality；PSF 不做逐核归一化，因此低 capture
+不能伪装成高信息量。
 
 ## 优化器依据
 
@@ -63,6 +66,9 @@ CUDA_VISIBLE_DEVICES=2 python /home/wenchao/autodl-tmp/scripts/preoptimize_psf_d
   --fisher_weight 1.0 \
   --fisher_ridge 1e-8 \
   --fisher_loss_scale 1e-7 \
+  --fisher_spatial_crlb_weight 0.1 \
+  --fisher_depth_crlb_weight 1.0 \
+  --fisher_wavelength_crlb_weight 1.0 \
   --log_every 10 \
   --save_psf_bank
 ```
@@ -84,6 +90,9 @@ CUDA_VISIBLE_DEVICES=3 python /home/wenchao/autodl-tmp/scripts/preoptimize_psf_d
   --fisher_weight 1.0 \
   --fisher_ridge 1e-8 \
   --fisher_loss_scale 1e-7 \
+  --fisher_spatial_crlb_weight 0.1 \
+  --fisher_depth_crlb_weight 1.0 \
+  --fisher_wavelength_crlb_weight 1.0 \
   --log_every 10 \
   --save_psf_bank
 ```
@@ -105,6 +114,9 @@ CUDA_VISIBLE_DEVICES=2 python /home/wenchao/autodl-tmp/scripts/preoptimize_psf_d
   --fisher_weight 1.0 \
   --fisher_ridge 1e-8 \
   --fisher_loss_scale 1e-7 \
+  --fisher_spatial_crlb_weight 0.1 \
+  --fisher_depth_crlb_weight 1.0 \
+  --fisher_wavelength_crlb_weight 1.0 \
   --log_every 10 \
   --save_psf_bank
 ```
@@ -134,7 +146,8 @@ load_preoptimized_doe_(camera.doe1, "/path/to/best_doe.pt")
 `summary.json` 会分别报告 MTF、波长 margin 和深度 margin 是否满足。重点观察：
 
 - `mtf/005_p10`、`mtf/005_mean` 是否显著高于当前约 0.011/0.031；
-- `fisher/a_optimality_mean` 是否显著下降、最小特征值是否提高；
+- `fisher/task_a_optimality_mean` 和 depth/wavelength CRLB 是否显著下降；
+- `fisher/a_optimality_mean` 与最小特征值用于和上一轮完整 Fisher 横向比较；
 - `spectral/adjacent_cosine_mean` 是否显著低于当前约 0.974；
 - `depth/adjacent_cosine_mean` 是否显著低于当前约 0.965；
 - MTF 提升是否伴随 r90 无限扩大或 129×129 capture 明显下降。

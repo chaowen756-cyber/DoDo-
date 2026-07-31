@@ -60,3 +60,17 @@
 - 摘要：Fresnel 是原论文全相位自由度 Fisher 优化的合理起点，但在当前
   rank-9/free-150 公平容量对照中并未形成一致优势；采用固定 seed 随机初始化
   可以避免把基底拟合误差和初始化差异混入容量结论。
+
+## 2026-07-31 Task-Fisher preflight：free-150，16 depth，20 step
+
+- 类型：任务 CRLB 目标与学习率 preflight。
+- checkpoint：`/tmp/doe_taskfisher_free150_20step/free150/seed_123/best_doe.pt`。
+- artifact root：`/tmp/doe_taskfisher_free150_20step`。
+- 推理结果：无。
+- 关键指标：task A-optimality `6.635e5 → 5.979e5`，MTF@0.05 mean
+  `0.0320 → 0.0332`，depth cosine `0.9647 → 0.9642`，高度 RMS
+  `0.600 → 0.956 μm`。
+- 状态：完成。
+- 摘要：在完整16深度/25波长上，任务加权 Fisher 在 `lr=1e-2` 下稳定下降，
+  且未牺牲平均 MTF 或能量范围。20步仅确认目标与梯度方向，可进入1000步双
+  seed GPU 对照。

@@ -13,15 +13,15 @@ DOE PSF preoptimization feasibility experiment
 Branch `DOE可编码性预优化实验` contains an independently reviewed DOE-only
 search. It preserves the current `consistent_grid_v1` optical forward and
 compares rank-9 with free-150 under the same physical pupil-height RMS budget.
-The final objective includes the task-matched Fisher A-optimality from Baek et
-al. in addition to MTF, direct separation, and energy guards.
+The final objective includes task-weighted Fisher A-optimality. It keeps x/y as
+nuisance variables but weights their CRLB at 0.1 versus 1.0 for depth and
+wavelength, in addition to MTF, direct separation, and energy guards.
 
 ## Execute
 
-Run rank-9 on GPU 2 and free-150 on GPU 3 with separate output directories,
-using the full commands in the final handoff/chat and the Fisher parameters in
-`docs/doe_psf_preoptimization.md`. Do not start joint CNN training before both
-runs finish.
+Run free-150 seed 123 on GPU 2 and seed 456 on GPU 3 with separate output
+directories, using the full commands in the final handoff/chat. Do not start
+joint CNN training before both runs finish.
 
 ## Decision
 

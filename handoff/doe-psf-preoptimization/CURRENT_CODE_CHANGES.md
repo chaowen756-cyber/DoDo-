@@ -2,36 +2,37 @@
 
 ## util/doe_preoptimization.py
 
-- 区域：DOE-only 目标函数与指标。
-- 目的：补齐 Baek ICCV 2021 同任务 DOE 初始化所用的 Fisher 信息目标。
-- 修改：构造单色点源 RGB PSF 关于 x/y/深度/波长的离散 Fisher 矩阵，加入
-  A-optimality、ridge、数值缩放和特征值/条件数指标；与原 MTF、cosine、能量
-  护栏共同优化。
-- 风险：Fisher 项增加显存和计算；A-optimality 对参数单位敏感，因此四个参数
-  明确定义为一个采样 bin，并由测试锁定信号强度行为。
-- 验证：Fisher 梯度/信号尺度测试、完整16深度20步预检、端到端 CLI smoke。
+- 区域：`psf_fisher_a_optimality_loss` 与预优化 targets。
+- 目的：把优化重点从 x/y 空间定位转向 HS-D 任务真正需要的深度/波长估计。
+- 修改：仍求完整4×4 Fisher 逆矩阵，将 x/y 作为 nuisance 参数保留；新增
+  可配置 CRLB 权重，默认 `(x,y,z,lambda)=(0.1,0.1,1,1)`；同时输出完整、
+  任务加权、纯 z/lambda A-optimality 和四个单项 CRLB。
+- 风险：新默认值改变后续实验目标，但不影响已有 checkpoint；权重归一化保持
+  损失量级可比较。
+- 验证：完整/任务权重公式测试、梯度测试、16深度 free-150 预检。
 
 ## scripts/preoptimize_psf_doe.py
 
-- 区域：优化参数、日志和结果摘要。
-- 目的：让正式 rank-9/free-150 实验显式记录和比较 Fisher 可辨识性。
-- 修改：新增 Fisher weight/ridge/scale CLI；日志输出 A-optimality；summary 记录
-  A-optimality 与最小特征值改善，并增加参数合法性检查。
-- 风险：旧命令会采用新的默认 Fisher 项，符合本轮“最后修改”后的实验定义。
-- 验证：CPU CLI smoke、参数解析和 artifact 测试。
+- 区域：CLI、日志、summary 与 feasibility。
+- 目的：显式控制并审计任务 Fisher 权重。
+- 修改：新增三项 CRLB 权重参数；日志改报 task A-optimality；摘要同时保存
+  full/task/weighted 改善，成功判据使用 task A-optimality。
+- 风险：旧命令未显式指定时会采用新的任务权重，符合本轮实验定义。
+- 验证：CLI smoke、summary artifact 测试、参数合法性检查。
 
 ## test/test_doe_preoptimization.py
 
-- 区域：Fisher 目标回归。
-- 目的：确保损失有限、可微，并保留物理信号强度而非逐 PSF 归一化。
-- 修改：验证放大 PSF 强度会提高 Fisher 信息并降低 A-optimality loss。
+- 区域：Fisher nuisance/权重回归。
+- 目的：防止“聚焦 z/lambda”被错误实现为删除 x/y Fisher 子空间。
+- 修改：验证 full trace 不随损失权重改变，纯任务权重等于完整逆矩阵中
+  depth/wavelength CRLB 的加权和。
 - 风险：无生产运行时影响。
-- 验证：本测试文件全部通过。
+- 验证：新增测试文件5项全部通过。
 
 ## docs/doe_psf_preoptimization.md
 
-- 区域：实验依据、命令与判读。
-- 目的：记录 Baek/D-Flat/dO 对照以及为何保留 `Adam lr=1e-2` 和随机初始化。
-- 修改：加入 Fisher 原理、参数、参考资料及预检依据。
+- 区域：目标说明、参数和判读。
+- 目的：记录任务 CRLB 的数学含义和正式命令。
+- 修改：加入 `(0.1,0.1,1,1)` 权重、nuisance 处理和 task 指标。
 - 风险：无运行时影响。
-- 验证：命令参数由 CLI smoke 覆盖。
+- 验证：文档参数由 CLI 覆盖。

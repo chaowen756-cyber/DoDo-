@@ -109,6 +109,39 @@ def test_fisher_a_optimality_preserves_signal_strength_and_gradients():
     assert psf.grad.norm() > 0
 
 
+def test_fisher_task_weights_keep_full_nuisance_inverse():
+    torch.manual_seed(29)
+    psf = torch.rand(3, 4, 7, 7)
+    response = torch.rand(3, 4)
+
+    full_loss, full_stats = psf_fisher_a_optimality_loss(
+        psf,
+        response,
+        ridge=1e-6,
+        loss_scale=1e-6,
+        parameter_weights=(1.0, 1.0, 1.0, 1.0),
+    )
+    task_loss, task_stats = psf_fisher_a_optimality_loss(
+        psf,
+        response,
+        ridge=1e-6,
+        loss_scale=1e-6,
+        parameter_weights=(0.0, 0.0, 1.0, 1.0),
+    )
+
+    torch.testing.assert_close(
+        full_stats["a_optimality_mean"], task_stats["a_optimality_mean"]
+    )
+    torch.testing.assert_close(
+        full_loss, 1e-6 * full_stats["a_optimality_mean"]
+    )
+    torch.testing.assert_close(
+        task_loss, 2e-6 * task_stats["task_a_optimality_mean"]
+    )
+    assert task_stats["crlb_depth_mean"] > 0
+    assert task_stats["crlb_wavelength_mean"] > 0
+
+
 def test_rank9_cpu_smoke_writes_reusable_best_doe(tmp_path):
     output_dir = tmp_path / "preopt"
     result = main(

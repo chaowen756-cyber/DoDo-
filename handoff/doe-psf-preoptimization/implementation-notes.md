@@ -28,3 +28,14 @@
 - Fresnel 投影在当前 rank-9 基底中拟合较差，且在 free-150 中初始 Fisher
   不优，因此保留相同 seed、相同物理 RMS 的随机初始化。
 - 最终新增测试4项、原有 DOE/PSF 回归37项全部通过。
+
+## 4. Task-Fisher 深度/波长聚焦
+
+- 上一轮结果显示 free-150 的 full Fisher 明显改善，但主要来自 x/y，直接
+  光谱/深度 cosine 几乎不变。
+- 本轮仍对完整 Fisher 求逆，只把 CRLB trace 权重改为 x/y 各0.1、depth与
+  wavelength各1.0；这保留了 nuisance coupling，避免乐观的2×2子矩阵指标。
+- 新增 full/task/weighted A-optimality、四参数 CRLB 指标，便于判断自由度到底
+  花在何处。
+- 完整16深度20步 free-150 preflight 稳定，task A-optimality下降约9.9%。
+- 新增测试5项、原有 DOE/PSF 回归37项全部通过。

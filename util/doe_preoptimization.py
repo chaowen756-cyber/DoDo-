@@ -31,6 +31,9 @@ class DOEPreoptimizationTargets:
 
     fisher_ridge: float = 1e-8
     fisher_loss_scale: float = 1e-7
+    fisher_spatial_crlb_weight: float = 0.10
+    fisher_depth_crlb_weight: float = 1.0
+    fisher_wavelength_crlb_weight: float = 1.0
     mtf_min_frequency: float = 0.02
     mtf_max_frequency: float = 0.15
     mtf_at_005: float = 0.12
@@ -158,8 +161,9 @@ def psf_fisher_a_optimality_loss(
     *,
     ridge: float = 1e-8,
     loss_scale: float = 1e-7,
+    parameter_weights: Tuple[float, float, float, float] = (0.10, 0.10, 1.0, 1.0),
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """A-optimal Fisher loss for monochromatic RGB point-source PSFs.
+    """Task-weighted A-optimal Fisher loss for monochromatic RGB PSFs.
 
     This is the discrete counterpart of the DOE initialization objective in
     Baek et al., ICCV 2021.  The four source coordinates are x pixel, y pixel,
@@ -167,8 +171,11 @@ def psf_fisher_a_optimality_loss(
     derivative per sampling bin makes the A-optimal trace independent of the
     arbitrary choice of metre versus nanometre units.
 
-    The PSFs deliberately retain their captured-energy scale: normalizing each
-    PSF here would incorrectly make a low-throughput design look informative.
+    The inverse is always taken over the complete x/y/depth/wavelength Fisher
+    matrix, so x/y remain nuisance variables even when their CRLB weights are
+    small or zero.  The PSFs deliberately retain their captured-energy scale:
+    normalizing each PSF here would incorrectly make a low-throughput design
+    look informative.
     """
     if psf_bank.ndim != 4:
         raise ValueError(
@@ -190,6 +197,14 @@ def psf_fisher_a_optimality_loss(
     loss_scale = float(loss_scale)
     if ridge <= 0.0 or loss_scale <= 0.0:
         raise ValueError("Fisher ridge and loss_scale must both be > 0")
+    parameter_weights = tuple(float(value) for value in parameter_weights)
+    if len(parameter_weights) != 4:
+        raise ValueError("Fisher parameter_weights must contain x/y/depth/wavelength")
+    if any(value < 0.0 for value in parameter_weights):
+        raise ValueError("Fisher parameter weights must be >= 0")
+    parameter_weight_sum = sum(parameter_weights)
+    if parameter_weight_sum <= 0.0:
+        raise ValueError("at least one Fisher parameter weight must be > 0")
     if (
         not torch.isfinite(psf_bank).all()
         or not torch.isfinite(sensor_response).all()
@@ -226,8 +241,17 @@ def psf_fisher_a_optimality_loss(
     identity = torch.eye(4, device=psf.device, dtype=psf.dtype)
     regularized = fisher + ridge * identity
     inverse = torch.linalg.solve(regularized, identity.expand_as(regularized))
-    a_optimality = inverse.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-    loss = loss_scale * a_optimality.mean()
+    crlb_diagonal = inverse.diagonal(dim1=-2, dim2=-1)
+    full_a_optimality = crlb_diagonal.sum(dim=-1)
+    task_a_optimality = crlb_diagonal[..., 2:].sum(dim=-1)
+    weight_tensor = torch.tensor(
+        parameter_weights, device=psf.device, dtype=psf.dtype
+    )
+    # Keep the numerical scale identical to the historical full trace when all
+    # four weights equal one, and comparable when users reweight parameters.
+    normalized_weights = 4.0 * weight_tensor / parameter_weight_sum
+    weighted_a_optimality = (crlb_diagonal * normalized_weights).sum(dim=-1)
+    loss = loss_scale * weighted_a_optimality.mean()
 
     with torch.no_grad():
         eigenvalues = torch.linalg.eigvalsh(fisher.detach()).clamp_min(0.0)
@@ -235,9 +259,23 @@ def psf_fisher_a_optimality_loss(
         maximum = eigenvalues[..., -1]
         condition = (maximum + ridge) / (minimum + ridge)
         stats = {
-            "a_optimality_mean": a_optimality.mean().detach(),
-            "a_optimality_p90": torch.quantile(a_optimality.flatten(), 0.9),
-            "a_optimality_max": a_optimality.max().detach(),
+            "a_optimality_mean": full_a_optimality.mean().detach(),
+            "a_optimality_p90": torch.quantile(
+                full_a_optimality.flatten(), 0.9
+            ),
+            "a_optimality_max": full_a_optimality.max().detach(),
+            "task_a_optimality_mean": task_a_optimality.mean().detach(),
+            "task_a_optimality_p90": torch.quantile(
+                task_a_optimality.flatten(), 0.9
+            ),
+            "weighted_a_optimality_mean": weighted_a_optimality.mean().detach(),
+            "weighted_a_optimality_p90": torch.quantile(
+                weighted_a_optimality.flatten(), 0.9
+            ),
+            "crlb_x_mean": crlb_diagonal[..., 0].mean().detach(),
+            "crlb_y_mean": crlb_diagonal[..., 1].mean().detach(),
+            "crlb_depth_mean": crlb_diagonal[..., 2].mean().detach(),
+            "crlb_wavelength_mean": crlb_diagonal[..., 3].mean().detach(),
             "minimum_eigenvalue_mean": minimum.mean().detach(),
             "minimum_eigenvalue_p10": torch.quantile(minimum.flatten(), 0.1),
             "minimum_eigenvalue_min": minimum.min().detach(),
@@ -272,6 +310,12 @@ def doe_preoptimization_objective(
         sensor_response,
         ridge=targets.fisher_ridge,
         loss_scale=targets.fisher_loss_scale,
+        parameter_weights=(
+            targets.fisher_spatial_crlb_weight,
+            targets.fisher_spatial_crlb_weight,
+            targets.fisher_depth_crlb_weight,
+            targets.fisher_wavelength_crlb_weight,
+        ),
     )
     mtf_loss, mtf_stats = psf_mtf_floor_loss(
         psf_bank,
