@@ -39,3 +39,16 @@
   花在何处。
 - 完整16深度20步 free-150 preflight 稳定，task A-optimality下降约9.9%。
 - 新增测试5项、原有 DOE/PSF 回归37项全部通过。
+
+## 5. Optical-only 编码与 RMS 边界优化
+
+- 双 seed 正式结果表明 task Fisher 改善没有转化成单色 PSF 波长形状分离；
+  新增对总强度和 RGB response 不敏感的 optical-only PSF cosine 目标。
+- 波长同时比较1/2/4 band offset，深度比较相邻层；sensor-weighted Fisher
+  和分离指标继续计算，确保光学图样改善仍可由真实 RGB 测量观察。
+- 历史同时记录 warm-up 训练目标与固定完整目标，最佳 DOE 改为始终按完整目标
+  选择，消除早期日志假上升。
+- 3 μm RMS 约束改为候选更新的边界切向修正加安全回缩。压力测试发现并删除了
+  不正确的 Adam 一阶动量投影；修复后从2.99 μm开始的50步完整损失稳定下降。
+- 新增 optical shape 尺度不变性/梯度测试和 RMS 边界测试；完整16深度30/200步
+  GPU preflight 均稳定。

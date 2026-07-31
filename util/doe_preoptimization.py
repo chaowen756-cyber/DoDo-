@@ -2,9 +2,10 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from util.psf_regularization import (
     multiscale_psf_energy_concentration_loss,
@@ -20,8 +21,10 @@ class DOEPreoptimizationWeights:
 
     fisher: float = 1.0
     mtf: float = 20.0
-    spectral_separation: float = 1.0
-    depth_separation: float = 1.0
+    optical_spectral_separation: float = 5.0
+    optical_depth_separation: float = 2.0
+    sensor_spectral_separation: float = 0.0
+    sensor_depth_separation: float = 0.5
     energy_guard: float = 0.10
 
 
@@ -41,6 +44,8 @@ class DOEPreoptimizationTargets:
     mtf_at_015: float = 0.025
     spectral_margin: float = 0.90
     depth_margin: float = 0.90
+    optical_spectral_offsets: Tuple[int, ...] = (1, 2, 4)
+    optical_depth_offsets: Tuple[int, ...] = (1,)
     energy_radii: Tuple[float, float] = (16.0, 24.0)
     energy_outside_budgets: Tuple[float, float] = (0.75, 0.55)
 
@@ -63,7 +68,10 @@ def initialize_doe_height_(
     if target_rms_m <= 0.0:
         raise ValueError("target_rms_m must be > 0")
     coefficients = getattr(doe, "zernike_coeffs", None)
-    if not isinstance(coefficients, torch.nn.Parameter) or not coefficients.requires_grad:
+    if (
+        not isinstance(coefficients, torch.nn.Parameter)
+        or not coefficients.requires_grad
+    ):
         raise ValueError("DOE must expose trainable zernike_coeffs")
     with torch.no_grad():
         coefficients.normal_(generator=generator)
@@ -94,6 +102,151 @@ def doe_physical_stats(doe) -> Dict[str, torch.Tensor]:
         "doe/height_max_m": selected.max().detach(),
         "doe/coeff_norm": coefficients.detach().norm(),
     }
+
+
+def rms_constrained_optimizer_step_(
+    doe,
+    optimizer: torch.optim.Optimizer,
+    *,
+    maximum_rms_m: float,
+    boundary_fraction: float = 0.999,
+) -> Dict[str, float]:
+    """Take an optimizer step inside a physical pupil-RMS ball.
+
+    Once the DOE reaches the boundary, the outward component of the proposed
+    coefficient update is removed in the local RMS-normal direction.  A tiny
+    radial retraction remains as a numerical safeguard for the second-order
+    radius increase of a tangent step.  This avoids repeatedly shrinking a
+    strongly outward Adam proposal and preserves motion along the boundary.
+    """
+    maximum_rms_m = float(maximum_rms_m)
+    boundary_fraction = float(boundary_fraction)
+    if maximum_rms_m <= 0.0:
+        raise ValueError("maximum_rms_m must be > 0")
+    if not 0.0 < boundary_fraction <= 1.0:
+        raise ValueError("boundary_fraction must lie in (0,1]")
+    coefficients = getattr(doe, "zernike_coeffs", None)
+    if not isinstance(coefficients, torch.nn.Parameter):
+        raise ValueError("DOE must expose trainable zernike_coeffs")
+
+    before = coefficients.detach().clone()
+    rms_before_tensor = doe.pupil_rms(doe.heightmap())
+    rms_before = float(rms_before_tensor.detach())
+    normal = None
+    if rms_before >= boundary_fraction * maximum_rms_m:
+        normal = torch.autograd.grad(
+            rms_before_tensor,
+            coefficients,
+            retain_graph=False,
+            create_graph=False,
+        )[0].detach()
+
+    optimizer.step()
+    tangent_correction = False
+    retracted = False
+    retraction_scale = 1.0
+    with torch.no_grad():
+        if normal is not None:
+            normal_norm_sq = normal.square().sum().clamp_min(1e-30)
+            proposed_delta = coefficients - before
+            outward_delta = (proposed_delta * normal).sum()
+            if outward_delta > 0.0:
+                proposed_delta.sub_(outward_delta / normal_norm_sq * normal)
+                coefficients.copy_(before + proposed_delta)
+                tangent_correction = True
+
+        rms_after = float(doe.pupil_rms(doe.heightmap()).detach())
+        if rms_after > maximum_rms_m:
+            retraction_scale = maximum_rms_m / max(rms_after, 1e-30)
+            coefficients.mul_(retraction_scale)
+            retracted = True
+            rms_after = float(doe.pupil_rms(doe.heightmap()).detach())
+
+    return {
+        "rms_before_m": rms_before,
+        "rms_after_m": rms_after,
+        "tangent_correction": float(tangent_correction),
+        "retracted": float(retracted),
+        "retraction_scale": retraction_scale,
+    }
+
+
+def optical_psf_shape_separation_loss(
+    psf_bank: torch.Tensor,
+    *,
+    dimension: str,
+    margin: float = 0.90,
+    offsets: Sequence[int] = (1,),
+    hard_fraction: float = 0.20,
+    hard_weight: float = 0.50,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Separate normalized monochromatic PSF shapes without sensor response.
+
+    Removing total intensity and RGB spectral response makes this a direct
+    test of whether the DOE itself changes the spatial PSF with wavelength or
+    depth.  Centroid shifts remain part of the signature because they are a
+    valid coding cue in the convolutional measurement.
+    """
+    if psf_bank.ndim != 4:
+        raise ValueError(
+            "psf_bank must have shape [depth,wavelength,H,W], "
+            f"got {tuple(psf_bank.shape)}"
+        )
+    if dimension not in ("spectral", "depth"):
+        raise ValueError("dimension must be 'spectral' or 'depth'")
+    if not -1.0 <= float(margin) <= 1.0:
+        raise ValueError("margin must lie in [-1,1]")
+    if not torch.isfinite(psf_bank).all():
+        raise ValueError("PSF bank must be finite")
+
+    comparison_dim = 1 if dimension == "spectral" else 0
+    comparison_size = psf_bank.shape[comparison_dim]
+    signatures = F.normalize(
+        psf_bank.to(torch.float32).flatten(start_dim=2),
+        p=2,
+        dim=-1,
+        eps=1e-12,
+    )
+    cosine_groups = []
+    offset_means = {}
+    for raw_offset in offsets:
+        offset = int(raw_offset)
+        if offset < 1 or offset >= comparison_size:
+            raise ValueError(
+                f"{dimension} offset must be in [1,{comparison_size - 1}], "
+                f"got {offset}"
+            )
+        leading = [slice(None)] * signatures.ndim
+        trailing = [slice(None)] * signatures.ndim
+        leading[comparison_dim] = slice(None, -offset)
+        trailing[comparison_dim] = slice(offset, None)
+        cosine = (signatures[tuple(leading)] * signatures[tuple(trailing)]).sum(dim=-1)
+        cosine_groups.append(cosine.flatten())
+        offset_means[f"offset_{offset}_cosine_mean"] = cosine.mean().detach()
+
+    if not cosine_groups:
+        raise ValueError("at least one separation offset is required")
+    all_cosine = torch.cat(cosine_groups)
+    violation = F.relu(all_cosine - float(margin))
+    loss = violation.mean()
+    if hard_weight > 0.0:
+        count = max(1, int(round(violation.numel() * float(hard_fraction))))
+        count = min(count, violation.numel())
+        loss = (
+            loss
+            + float(hard_weight)
+            * torch.topk(violation, count, largest=True).values.mean()
+        )
+
+    with torch.no_grad():
+        stats = {
+            "cosine_mean": all_cosine.mean().detach(),
+            "cosine_p90": torch.quantile(all_cosine.detach(), 0.9),
+            "cosine_max": all_cosine.max().detach(),
+            "active_fraction": (violation > 0).to(all_cosine.dtype).mean(),
+            **offset_means,
+        }
+    return loss, stats
 
 
 def load_preoptimized_doe_(
@@ -183,16 +336,9 @@ def psf_fisher_a_optimality_loss(
             f"got {tuple(psf_bank.shape)}"
         )
     if psf_bank.shape[0] < 2 or psf_bank.shape[1] < 2:
-        raise ValueError(
-            "Fisher loss requires at least two depths and wavelengths"
-        )
-    if (
-        sensor_response.ndim != 2
-        or sensor_response.shape[1] != psf_bank.shape[1]
-    ):
-        raise ValueError(
-            "sensor_response must have shape [sensor_channel,wavelength]"
-        )
+        raise ValueError("Fisher loss requires at least two depths and wavelengths")
+    if sensor_response.ndim != 2 or sensor_response.shape[1] != psf_bank.shape[1]:
+        raise ValueError("sensor_response must have shape [sensor_channel,wavelength]")
     ridge = float(ridge)
     loss_scale = float(loss_scale)
     if ridge <= 0.0 or loss_scale <= 0.0:
@@ -205,16 +351,11 @@ def psf_fisher_a_optimality_loss(
     parameter_weight_sum = sum(parameter_weights)
     if parameter_weight_sum <= 0.0:
         raise ValueError("at least one Fisher parameter weight must be > 0")
-    if (
-        not torch.isfinite(psf_bank).all()
-        or not torch.isfinite(sensor_response).all()
-    ):
+    if not torch.isfinite(psf_bank).all() or not torch.isfinite(sensor_response).all():
         raise ValueError("PSF bank and sensor response must be finite")
 
     psf = psf_bank.to(torch.float32)
-    response = sensor_response.to(
-        device=psf.device, dtype=psf.dtype
-    ).transpose(0, 1)
+    response = sensor_response.to(device=psf.device, dtype=psf.dtype).transpose(0, 1)
     response_power = response.square().sum(dim=-1)
     dx = _unit_grid_finite_difference(psf, -1)
     dy = _unit_grid_finite_difference(psf, -2)
@@ -229,9 +370,9 @@ def psf_fisher_a_optimality_loss(
     entries = [[None for _ in range(4)] for _ in range(4)]
     for row, first in enumerate(spatial_depth_derivatives):
         for column, second in enumerate(spatial_depth_derivatives):
-            entries[row][column] = (
-                (first * second).sum(dim=(-2, -1)) * response_power[None, :]
-            )
+            entries[row][column] = (first * second).sum(dim=(-2, -1)) * response_power[
+                None, :
+            ]
         cross = torch.einsum("dlhw,dlchw,lc->dl", first, dlambda, response)
         entries[row][3] = cross
         entries[3][row] = cross
@@ -244,9 +385,7 @@ def psf_fisher_a_optimality_loss(
     crlb_diagonal = inverse.diagonal(dim1=-2, dim2=-1)
     full_a_optimality = crlb_diagonal.sum(dim=-1)
     task_a_optimality = crlb_diagonal[..., 2:].sum(dim=-1)
-    weight_tensor = torch.tensor(
-        parameter_weights, device=psf.device, dtype=psf.dtype
-    )
+    weight_tensor = torch.tensor(parameter_weights, device=psf.device, dtype=psf.dtype)
     # Keep the numerical scale identical to the historical full trace when all
     # four weights equal one, and comparable when users reweight parameters.
     normalized_weights = 4.0 * weight_tensor / parameter_weight_sum
@@ -260,14 +399,10 @@ def psf_fisher_a_optimality_loss(
         condition = (maximum + ridge) / (minimum + ridge)
         stats = {
             "a_optimality_mean": full_a_optimality.mean().detach(),
-            "a_optimality_p90": torch.quantile(
-                full_a_optimality.flatten(), 0.9
-            ),
+            "a_optimality_p90": torch.quantile(full_a_optimality.flatten(), 0.9),
             "a_optimality_max": full_a_optimality.max().detach(),
             "task_a_optimality_mean": task_a_optimality.mean().detach(),
-            "task_a_optimality_p90": torch.quantile(
-                task_a_optimality.flatten(), 0.9
-            ),
+            "task_a_optimality_p90": torch.quantile(task_a_optimality.flatten(), 0.9),
             "weighted_a_optimality_mean": weighted_a_optimality.mean().detach(),
             "weighted_a_optimality_p90": torch.quantile(
                 weighted_a_optimality.flatten(), 0.9
@@ -327,7 +462,26 @@ def doe_preoptimization_objective(
         worst_fraction=0.10,
         worst_weight=0.25,
     )
-    spectral_loss, spectral_stats = sensor_weighted_spectral_psf_separation_loss(
+    optical_spectral_loss, optical_spectral_stats = optical_psf_shape_separation_loss(
+        psf_bank,
+        dimension="spectral",
+        margin=targets.spectral_margin,
+        offsets=targets.optical_spectral_offsets,
+        hard_fraction=0.20,
+        hard_weight=0.50,
+    )
+    optical_depth_loss, optical_depth_stats = optical_psf_shape_separation_loss(
+        psf_bank,
+        dimension="depth",
+        margin=targets.depth_margin,
+        offsets=targets.optical_depth_offsets,
+        hard_fraction=0.20,
+        hard_weight=0.50,
+    )
+    (
+        sensor_spectral_loss,
+        sensor_spectral_stats,
+    ) = sensor_weighted_spectral_psf_separation_loss(
         psf_bank,
         sensor_response,
         margin=targets.spectral_margin,
@@ -335,7 +489,7 @@ def doe_preoptimization_objective(
         hard_fraction=0.20,
         hard_weight=0.50,
     )
-    depth_loss, depth_stats = sensor_weighted_depth_psf_separation_loss(
+    sensor_depth_loss, sensor_depth_stats = sensor_weighted_depth_psf_separation_loss(
         psf_bank,
         sensor_response,
         margin=targets.depth_margin,
@@ -357,32 +511,63 @@ def doe_preoptimization_objective(
 
     weighted_fisher = float(weights.fisher) * fisher_loss
     weighted_mtf = float(weights.mtf) * mtf_loss
-    weighted_spectral = (
-        separation_scale * float(weights.spectral_separation) * spectral_loss
+    full_weighted_optical_spectral = (
+        float(weights.optical_spectral_separation) * optical_spectral_loss
     )
-    weighted_depth = (
-        separation_scale * float(weights.depth_separation) * depth_loss
+    full_weighted_optical_depth = (
+        float(weights.optical_depth_separation) * optical_depth_loss
+    )
+    full_weighted_sensor_spectral = (
+        float(weights.sensor_spectral_separation) * sensor_spectral_loss
+    )
+    full_weighted_sensor_depth = (
+        float(weights.sensor_depth_separation) * sensor_depth_loss
     )
     weighted_energy = float(weights.energy_guard) * energy_loss
-    total = (
-        weighted_fisher
-        + weighted_mtf
-        + weighted_spectral
-        + weighted_depth
-        + weighted_energy
+    full_separation = (
+        full_weighted_optical_spectral
+        + full_weighted_optical_depth
+        + full_weighted_sensor_spectral
+        + full_weighted_sensor_depth
     )
+    full_total = weighted_fisher + weighted_mtf + full_separation + weighted_energy
+    total = full_total - full_separation + separation_scale * full_separation
 
     metrics: Dict[str, torch.Tensor] = {
         "loss/total": total.detach(),
+        "loss/train_total": total.detach(),
+        "loss/full_total": full_total.detach(),
         "loss/fisher_a_optimality": fisher_loss.detach(),
         "loss/mtf": mtf_loss.detach(),
-        "loss/spectral_separation": spectral_loss.detach(),
-        "loss/depth_separation": depth_loss.detach(),
+        "loss/optical_spectral_separation": optical_spectral_loss.detach(),
+        "loss/optical_depth_separation": optical_depth_loss.detach(),
+        "loss/sensor_spectral_separation": sensor_spectral_loss.detach(),
+        "loss/sensor_depth_separation": sensor_depth_loss.detach(),
         "loss/energy_guard": energy_loss.detach(),
         "weighted/fisher_a_optimality": weighted_fisher.detach(),
         "weighted/mtf": weighted_mtf.detach(),
-        "weighted/spectral_separation": weighted_spectral.detach(),
-        "weighted/depth_separation": weighted_depth.detach(),
+        "weighted/optical_spectral_separation": (
+            separation_scale * full_weighted_optical_spectral
+        ).detach(),
+        "weighted/optical_depth_separation": (
+            separation_scale * full_weighted_optical_depth
+        ).detach(),
+        "weighted/sensor_spectral_separation": (
+            separation_scale * full_weighted_sensor_spectral
+        ).detach(),
+        "weighted/sensor_depth_separation": (
+            separation_scale * full_weighted_sensor_depth
+        ).detach(),
+        "weighted_full/optical_spectral_separation": (
+            full_weighted_optical_spectral.detach()
+        ),
+        "weighted_full/optical_depth_separation": (
+            full_weighted_optical_depth.detach()
+        ),
+        "weighted_full/sensor_spectral_separation": (
+            full_weighted_sensor_spectral.detach()
+        ),
+        "weighted_full/sensor_depth_separation": (full_weighted_sensor_depth.detach()),
         "weighted/energy_guard": weighted_energy.detach(),
         "schedule/separation_scale": torch.tensor(
             separation_scale, device=psf_bank.device, dtype=psf_bank.dtype
@@ -392,13 +577,31 @@ def doe_preoptimization_objective(
         "mtf/010_mean": mtf_stats["mtf_010_mean"],
         "mtf/010_p10": mtf_stats["mtf_010_p10"],
         "mtf/020_mean": mtf_stats["mtf_020_mean"],
-        "spectral/adjacent_cosine_mean": spectral_stats["adjacent_cosine_mean"],
-        "spectral/adjacent_cosine_p90": spectral_stats["adjacent_cosine_p90"],
-        "spectral/adjacent_cosine_max": spectral_stats["adjacent_cosine_max"],
-        "depth/adjacent_cosine_mean": depth_stats["adjacent_cosine_mean"],
-        "depth/adjacent_cosine_p90": depth_stats["adjacent_cosine_p90"],
-        "depth/adjacent_cosine_max": depth_stats["adjacent_cosine_max"],
+        "optical_spectral/cosine_mean": optical_spectral_stats["cosine_mean"],
+        "optical_spectral/cosine_p90": optical_spectral_stats["cosine_p90"],
+        "optical_spectral/cosine_max": optical_spectral_stats["cosine_max"],
+        "optical_spectral/adjacent_cosine_mean": (
+            optical_spectral_stats["offset_1_cosine_mean"]
+        ),
+        "optical_depth/cosine_mean": optical_depth_stats["cosine_mean"],
+        "optical_depth/cosine_p90": optical_depth_stats["cosine_p90"],
+        "optical_depth/cosine_max": optical_depth_stats["cosine_max"],
+        "optical_depth/adjacent_cosine_mean": (
+            optical_depth_stats["offset_1_cosine_mean"]
+        ),
+        "spectral/adjacent_cosine_mean": sensor_spectral_stats["adjacent_cosine_mean"],
+        "spectral/adjacent_cosine_p90": sensor_spectral_stats["adjacent_cosine_p90"],
+        "spectral/adjacent_cosine_max": sensor_spectral_stats["adjacent_cosine_max"],
+        "depth/adjacent_cosine_mean": sensor_depth_stats["adjacent_cosine_mean"],
+        "depth/adjacent_cosine_p90": sensor_depth_stats["adjacent_cosine_p90"],
+        "depth/adjacent_cosine_max": sensor_depth_stats["adjacent_cosine_max"],
     }
+    for name, value in optical_spectral_stats.items():
+        if name.startswith("offset_"):
+            metrics[f"optical_spectral/{name}"] = value
+    for name, value in optical_depth_stats.items():
+        if name.startswith("offset_"):
+            metrics[f"optical_depth/{name}"] = value
     for name, value in fisher_stats.items():
         metrics[f"fisher/{name}"] = value
     for name in (

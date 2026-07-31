@@ -2,37 +2,42 @@
 
 ## util/doe_preoptimization.py
 
-- 区域：`psf_fisher_a_optimality_loss` 与预优化 targets。
-- 目的：把优化重点从 x/y 空间定位转向 HS-D 任务真正需要的深度/波长估计。
-- 修改：仍求完整4×4 Fisher 逆矩阵，将 x/y 作为 nuisance 参数保留；新增
-  可配置 CRLB 权重，默认 `(x,y,z,lambda)=(0.1,0.1,1,1)`；同时输出完整、
-  任务加权、纯 z/lambda A-optimality 和四个单项 CRLB。
-- 风险：新默认值改变后续实验目标，但不影响已有 checkpoint；权重归一化保持
-  损失量级可比较。
-- 验证：完整/任务权重公式测试、梯度测试、16深度 free-150 预检。
+- 区域：`DOEPreoptimizationWeights/Targets`、`optical_psf_shape_separation_loss`、
+  `rms_constrained_optimizer_step_`、组合目标。
+- 目的：只把 DOE 实际造成的单色 PSF 形状变化认作光谱/深度编码，并稳定处理
+  3 μm RMS 活跃约束。
+- 修改：新增波长1/2/4 offset和深度相邻层的 optical-only cosine；保留
+  sensor-weighted 分离/Fisher；同时返回 warm-up train total 与固定 full total；
+  候选 Adam 更新在边界移除向外法向分量后再安全回缩。
+- 潜在风险：新目标比旧 sensor cosine 更严格且量级更大；通过独立权重显式控制。
+  切向修正基于局部一阶 RMS 法向，仍需二阶回缩保证严格可行。
+- 验证：尺度不变性/梯度单测、边界向外更新单测、2.99 μm GPU压力测试。
 
 ## scripts/preoptimize_psf_doe.py
 
-- 区域：CLI、日志、summary 与 feasibility。
-- 目的：显式控制并审计任务 Fisher 权重。
-- 修改：新增三项 CRLB 权重参数；日志改报 task A-optimality；摘要同时保存
-  full/task/weighted 改善，成功判据使用 task A-optimality。
-- 风险：旧命令未显式指定时会采用新的任务权重，符合本轮实验定义。
-- 验证：CLI smoke、summary artifact 测试、参数合法性检查。
+- 区域：CLI、训练循环、日志、最佳状态选择与 summary。
+- 目的：让实验日志可跨 warm-up 比较，并暴露新的光学编码与约束诊断。
+- 修改：新增四类 separation 权重、optical offsets 和边界参数；控制台输出
+  train/full loss及optical spectral cosine；最佳状态按固定 full loss选择；记录
+  tangent/retraction计数、最小回缩比例和 optical feasibility。
+- 潜在风险：历史 `--spectral_weight/--depth_weight` 不再是当前CLI参数；正式命令
+  已完整显式指定新参数，旧实验 artifact 不受影响。
+- 验证：CLI smoke、30/200步完整16深度GPU preflight、summary检查。
 
 ## test/test_doe_preoptimization.py
 
-- 区域：Fisher nuisance/权重回归。
-- 目的：防止“聚焦 z/lambda”被错误实现为删除 x/y Fisher 子空间。
-- 修改：验证 full trace 不随损失权重改变，纯任务权重等于完整逆矩阵中
-  depth/wavelength CRLB 的加权和。
-- 风险：无生产运行时影响。
-- 验证：新增测试文件5项全部通过。
+- 区域：目标函数与约束回归测试。
+- 目的：防止仅靠波段强度变化骗过 optical 编码目标，防止 RMS 边界更新越界。
+- 修改：验证光学形状损失对逐波段尺度不敏感、区分不同图样并可反传；验证固定
+  full loss不随warm-up缩放；验证纯向外Adam更新被切向修正。
+- 潜在风险：无生产运行时影响。
+- 验证：本文件7项测试全部通过。
 
-## docs/doe_psf_preoptimization.md
+## docs 与 handoff
 
-- 区域：目标说明、参数和判读。
-- 目的：记录任务 CRLB 的数学含义和正式命令。
-- 修改：加入 `(0.1,0.1,1,1)` 权重、nuisance 处理和 task 指标。
-- 风险：无运行时影响。
-- 验证：文档参数由 CLI 覆盖。
+- 区域：实验说明、实现记录、实验台账和下一动作。
+- 目的：记录双seed负结果、新目标含义、压力测试修复及正式命令判读口径。
+- 修改：更新 `docs/doe_psf_preoptimization.md`、`EXPERIMENTS.md`、
+  `implementation-notes.md`、`NEXT_ACTION.md`。
+- 潜在风险：无运行时影响。
+- 验证：文档参数名与CLI逐项核对。

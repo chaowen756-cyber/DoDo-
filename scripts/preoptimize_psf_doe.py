@@ -34,6 +34,7 @@ from util.doe_preoptimization import (
     doe_physical_stats,
     doe_preoptimization_objective,
     initialize_doe_height_,
+    rms_constrained_optimizer_step_,
 )
 
 
@@ -44,10 +45,7 @@ MODE_SPECS = {
 
 
 def _float_metrics(metrics: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    return {
-        name: float(value.detach().cpu().item())
-        for name, value in metrics.items()
-    }
+    return {name: float(value.detach().cpu().item()) for name, value in metrics.items()}
 
 
 def _write_json(path: Path, value) -> None:
@@ -143,9 +141,7 @@ def _save_psf_montage(psf_bank: torch.Tensor, output_dir: Path) -> None:
             value = psf[depth_index, wavelength_index]
             log_value = np.log10(value / max(float(value.max()), 1e-20) + 1e-6)
             axes[row, column].imshow(log_value, cmap="magma", vmin=-6.0, vmax=0.0)
-            axes[row, column].set_title(
-                f"depth#{depth_index}, λ#{wavelength_index}"
-            )
+            axes[row, column].set_title(f"depth#{depth_index}, λ#{wavelength_index}")
             axes[row, column].axis("off")
     figure.suptitle("Best PSF bank (log10 normalized intensity)")
     figure.tight_layout()
@@ -184,8 +180,10 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     weights = DOEPreoptimizationWeights(
         fisher=args.fisher_weight,
         mtf=args.mtf_weight,
-        spectral_separation=args.spectral_weight,
-        depth_separation=args.depth_weight,
+        optical_spectral_separation=args.optical_spectral_weight,
+        optical_depth_separation=args.optical_depth_weight,
+        sensor_spectral_separation=args.sensor_spectral_weight,
+        sensor_depth_separation=args.sensor_depth_weight,
         energy_guard=args.energy_weight,
     )
     targets = DOEPreoptimizationTargets(
@@ -201,6 +199,8 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
         mtf_at_015=args.mtf_target_015,
         spectral_margin=args.spectral_margin,
         depth_margin=args.depth_margin,
+        optical_spectral_offsets=tuple(args.optical_spectral_offsets),
+        optical_depth_offsets=tuple(args.optical_depth_offsets),
         energy_radii=(args.energy_radius, args.energy_outer_radius),
         energy_outside_budgets=(
             args.energy_outside_budget,
@@ -226,15 +226,15 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     best_metrics = None
     initial_metrics = None
     history_path = output_dir / "history.jsonl"
-    projection_count = 0
+    retraction_count = 0
+    tangent_correction_count = 0
+    minimum_retraction_scale = 1.0
 
     with history_path.open("w", encoding="utf-8") as history_file:
         for step in range(args.steps + 1):
             optimizer.zero_grad(set_to_none=True)
             psf_bank = model.psf_bank(use_cache=False)
-            separation_scale = _separation_scale(
-                step, args.separation_warmup_steps
-            )
+            separation_scale = _separation_scale(step, args.separation_warmup_steps)
             total_loss, metrics = doe_preoptimization_objective(
                 psf_bank,
                 response,
@@ -247,50 +247,37 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
             metrics_float = _float_metrics(metrics)
             metrics_float["step"] = step
             metrics_float["optimizer/lr"] = float(optimizer.param_groups[0]["lr"])
+            metrics_float["constraint/retraction_count"] = retraction_count
+            metrics_float[
+                "constraint/tangent_correction_count"
+            ] = tangent_correction_count
+            metrics_float[
+                "constraint/minimum_retraction_scale"
+            ] = minimum_retraction_scale
 
             if initial_metrics is None:
-                if separation_scale < 1.0:
-                    _, initial_full_metrics = doe_preoptimization_objective(
-                        psf_bank,
-                        response,
-                        energy_reference=model.psf_energy_reference,
-                        weights=weights,
-                        targets=targets,
-                        separation_scale=1.0,
-                    )
-                    initial_full_metrics.update(doe_physical_stats(model.doe1))
-                    initial_metrics = _float_metrics(initial_full_metrics)
-                    initial_metrics["step"] = 0
-                    initial_metrics["optimizer/lr"] = float(
-                        optimizer.param_groups[0]["lr"]
-                    )
-                else:
-                    initial_metrics = dict(metrics_float)
-            eligible_for_best = step >= args.separation_warmup_steps
-            if eligible_for_best and metrics_float["loss/total"] < best_loss:
-                best_loss = metrics_float["loss/total"]
+                initial_metrics = dict(metrics_float)
+            if metrics_float["loss/full_total"] < best_loss:
+                best_loss = metrics_float["loss/full_total"]
                 best_step = step
                 best_coefficients = coefficients.detach().cpu().clone()
                 best_metrics = dict(metrics_float)
 
-            should_log = (
-                step == 0
-                or step == args.steps
-                or step % args.log_every == 0
-            )
+            should_log = step == 0 or step == args.steps or step % args.log_every == 0
             if should_log:
                 history_file.write(
-                    json.dumps(metrics_float, ensure_ascii=False, sort_keys=True)
-                    + "\n"
+                    json.dumps(metrics_float, ensure_ascii=False, sort_keys=True) + "\n"
                 )
                 history_file.flush()
                 print(
                     f"[{mode} seed={seed} step={step:04d}] "
-                    f"loss={metrics_float['loss/total']:.6f} "
+                    f"train/full={metrics_float['loss/train_total']:.6f}/"
+                    f"{metrics_float['loss/full_total']:.6f} "
                     f"FisherTask={metrics_float['fisher/task_a_optimality_mean']:.3e} "
                     f"MTF005(p10/mean)={metrics_float['mtf/005_p10']:.4f}/"
                     f"{metrics_float['mtf/005_mean']:.4f} "
                     f"spec_cos={metrics_float['spectral/adjacent_cosine_mean']:.4f} "
+                    f"opt_spec={metrics_float['optical_spectral/cosine_mean']:.4f} "
                     f"depth_cos={metrics_float['depth/adjacent_cosine_mean']:.4f} "
                     f"r90={metrics_float.get('energy/r90_mean', float('nan')):.2f} "
                     f"height_rms={metrics_float['doe/height_rms_m'] * 1e6:.3f}μm"
@@ -306,9 +293,18 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
             )
             if not torch.isfinite(grad_norm):
                 raise FloatingPointError(f"non-finite DOE gradient at step {step}")
-            optimizer.step()
-            if model.doe1.project_height_rms_(args.maximum_height_rms_um * 1e-6):
-                projection_count += 1
+            constraint_stats = rms_constrained_optimizer_step_(
+                model.doe1,
+                optimizer,
+                maximum_rms_m=args.maximum_height_rms_um * 1e-6,
+                boundary_fraction=args.rms_boundary_fraction,
+            )
+            retraction_count += int(constraint_stats["retracted"])
+            tangent_correction_count += int(constraint_stats["tangent_correction"])
+            minimum_retraction_scale = min(
+                minimum_retraction_scale,
+                constraint_stats["retraction_scale"],
+            )
             scheduler.step()
 
     if best_coefficients is None or best_metrics is None:
@@ -325,8 +321,7 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
         "config": config,
         "metrics": best_metrics,
         "camera_state_dict": {
-            name: value.detach().cpu()
-            for name, value in model.state_dict().items()
+            name: value.detach().cpu() for name, value in model.state_dict().items()
         },
         "doe_coefficients": best_coefficients,
         "doe_heightmap_m": model.doe1.heightmap().detach().cpu(),
@@ -341,35 +336,47 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
         "mode": mode,
         "seed": seed,
         "best_step": best_step,
-        "projection_count": projection_count,
+        "projection_count": retraction_count,
+        "constraint": {
+            "retraction_count": retraction_count,
+            "tangent_correction_count": tangent_correction_count,
+            "minimum_retraction_scale": minimum_retraction_scale,
+        },
         "initial": initial_metrics,
         "best": best_metrics,
         "improvement": {
-            "loss_total": initial_metrics["loss/total"] - best_metrics["loss/total"],
-            "fisher_a_optimality": initial_metrics[
-                "fisher/a_optimality_mean"
-            ] - best_metrics["fisher/a_optimality_mean"],
-            "fisher_task_a_optimality": initial_metrics[
-                "fisher/task_a_optimality_mean"
-            ] - best_metrics["fisher/task_a_optimality_mean"],
+            "loss_full_total": initial_metrics["loss/full_total"]
+            - best_metrics["loss/full_total"],
+            "fisher_a_optimality": initial_metrics["fisher/a_optimality_mean"]
+            - best_metrics["fisher/a_optimality_mean"],
+            "fisher_task_a_optimality": initial_metrics["fisher/task_a_optimality_mean"]
+            - best_metrics["fisher/task_a_optimality_mean"],
             "fisher_weighted_a_optimality": initial_metrics[
                 "fisher/weighted_a_optimality_mean"
-            ] - best_metrics["fisher/weighted_a_optimality_mean"],
-            "fisher_minimum_eigenvalue": best_metrics[
-                "fisher/minimum_eigenvalue_mean"
-            ] - initial_metrics["fisher/minimum_eigenvalue_mean"],
+            ]
+            - best_metrics["fisher/weighted_a_optimality_mean"],
+            "fisher_minimum_eigenvalue": best_metrics["fisher/minimum_eigenvalue_mean"]
+            - initial_metrics["fisher/minimum_eigenvalue_mean"],
             "mtf_005_p10": (
                 best_metrics["mtf/005_p10"] - initial_metrics["mtf/005_p10"]
             ),
             "mtf_005_mean": (
                 best_metrics["mtf/005_mean"] - initial_metrics["mtf/005_mean"]
             ),
-            "spectral_cosine_mean": initial_metrics[
-                "spectral/adjacent_cosine_mean"
-            ] - best_metrics["spectral/adjacent_cosine_mean"],
-            "depth_cosine_mean": initial_metrics[
-                "depth/adjacent_cosine_mean"
-            ] - best_metrics["depth/adjacent_cosine_mean"],
+            "spectral_cosine_mean": initial_metrics["spectral/adjacent_cosine_mean"]
+            - best_metrics["spectral/adjacent_cosine_mean"],
+            "optical_spectral_cosine_mean": initial_metrics[
+                "optical_spectral/cosine_mean"
+            ]
+            - best_metrics["optical_spectral/cosine_mean"],
+            "optical_spectral_adjacent_cosine_mean": initial_metrics[
+                "optical_spectral/adjacent_cosine_mean"
+            ]
+            - best_metrics["optical_spectral/adjacent_cosine_mean"],
+            "depth_cosine_mean": initial_metrics["depth/adjacent_cosine_mean"]
+            - best_metrics["depth/adjacent_cosine_mean"],
+            "optical_depth_cosine_mean": initial_metrics["optical_depth/cosine_mean"]
+            - best_metrics["optical_depth/cosine_mean"],
         },
         "feasibility": {
             "fisher_a_optimality_improved": (
@@ -381,18 +388,18 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
                 < initial_metrics["fisher/task_a_optimality_mean"]
             ),
             "mtf_floor_satisfied": best_metrics["loss/mtf"] <= 1e-6,
-            "spectral_margin_satisfied": (
-                best_metrics["loss/spectral_separation"] <= 1e-6
+            "optical_spectral_margin_satisfied": (
+                best_metrics["loss/optical_spectral_separation"] <= 1e-6
             ),
-            "depth_margin_satisfied": (
-                best_metrics["loss/depth_separation"] <= 1e-6
+            "optical_depth_margin_satisfied": (
+                best_metrics["loss/optical_depth_separation"] <= 1e-6
             ),
             "all_information_targets_satisfied": (
                 best_metrics["fisher/task_a_optimality_mean"]
                 < initial_metrics["fisher/task_a_optimality_mean"]
                 and best_metrics["loss/mtf"] <= 1e-6
-                and best_metrics["loss/spectral_separation"] <= 1e-6
-                and best_metrics["loss/depth_separation"] <= 1e-6
+                and best_metrics["loss/optical_spectral_separation"] <= 1e-6
+                and best_metrics["loss/optical_depth_separation"] <= 1e-6
             ),
         },
     }
@@ -423,6 +430,7 @@ def _parse_args(argv: Iterable[str] = None):
     parser.add_argument("--depth_layers", type=int, default=16)
     parser.add_argument("--initial_height_rms_um", type=float, default=0.6)
     parser.add_argument("--maximum_height_rms_um", type=float, default=3.0)
+    parser.add_argument("--rms_boundary_fraction", type=float, default=0.999)
 
     parser.add_argument("--fisher_weight", type=float, default=1.0)
     parser.add_argument("--fisher_ridge", type=float, default=1e-8)
@@ -431,8 +439,10 @@ def _parse_args(argv: Iterable[str] = None):
     parser.add_argument("--fisher_depth_crlb_weight", type=float, default=1.0)
     parser.add_argument("--fisher_wavelength_crlb_weight", type=float, default=1.0)
     parser.add_argument("--mtf_weight", type=float, default=20.0)
-    parser.add_argument("--spectral_weight", type=float, default=1.0)
-    parser.add_argument("--depth_weight", type=float, default=1.0)
+    parser.add_argument("--optical_spectral_weight", type=float, default=5.0)
+    parser.add_argument("--optical_depth_weight", type=float, default=2.0)
+    parser.add_argument("--sensor_spectral_weight", type=float, default=0.0)
+    parser.add_argument("--sensor_depth_weight", type=float, default=0.5)
     parser.add_argument("--energy_weight", type=float, default=0.10)
     parser.add_argument("--mtf_min_frequency", type=float, default=0.02)
     parser.add_argument("--mtf_max_frequency", type=float, default=0.15)
@@ -441,6 +451,10 @@ def _parse_args(argv: Iterable[str] = None):
     parser.add_argument("--mtf_target_015", type=float, default=0.025)
     parser.add_argument("--spectral_margin", type=float, default=0.90)
     parser.add_argument("--depth_margin", type=float, default=0.90)
+    parser.add_argument(
+        "--optical_spectral_offsets", nargs="+", type=int, default=[1, 2, 4]
+    )
+    parser.add_argument("--optical_depth_offsets", nargs="+", type=int, default=[1])
     parser.add_argument("--energy_radius", type=float, default=16.0)
     parser.add_argument("--energy_outer_radius", type=float, default=24.0)
     parser.add_argument("--energy_outside_budget", type=float, default=0.75)
@@ -459,6 +473,17 @@ def _parse_args(argv: Iterable[str] = None):
         parser.error("--separation_warmup_steps cannot exceed --steps")
     if args.lr <= 0.0 or args.final_lr_ratio <= 0.0:
         parser.error("learning rate and final_lr_ratio must be > 0")
+    objective_weights = (
+        args.fisher_weight,
+        args.mtf_weight,
+        args.optical_spectral_weight,
+        args.optical_depth_weight,
+        args.sensor_spectral_weight,
+        args.sensor_depth_weight,
+        args.energy_weight,
+    )
+    if any(weight < 0.0 for weight in objective_weights):
+        parser.error("all objective weights must be >= 0")
     if args.fisher_ridge <= 0.0 or args.fisher_loss_scale <= 0.0:
         parser.error("Fisher ridge and loss scale must be > 0")
     fisher_parameter_weights = (
@@ -468,12 +493,19 @@ def _parse_args(argv: Iterable[str] = None):
     )
     if any(value < 0.0 for value in fisher_parameter_weights):
         parser.error("Fisher CRLB weights must be >= 0")
-    if args.fisher_spatial_crlb_weight * 2.0 + sum(
-        fisher_parameter_weights[1:]
-    ) <= 0.0:
+    if args.fisher_spatial_crlb_weight * 2.0 + sum(fisher_parameter_weights[1:]) <= 0.0:
         parser.error("at least one Fisher CRLB weight must be > 0")
     if args.initial_height_rms_um > args.maximum_height_rms_um:
         parser.error("initial DOE height RMS cannot exceed the maximum")
+    if not 0.0 < args.rms_boundary_fraction <= 1.0:
+        parser.error("--rms_boundary_fraction must lie in (0,1]")
+    if any(offset < 1 for offset in args.optical_spectral_offsets):
+        parser.error("optical spectral offsets must all be >= 1")
+    if any(
+        offset < 1 or offset >= args.depth_layers
+        for offset in args.optical_depth_offsets
+    ):
+        parser.error("optical depth offsets must lie in [1,depth_layers-1]")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error(f"CUDA device requested but unavailable: {args.device}")
     return args

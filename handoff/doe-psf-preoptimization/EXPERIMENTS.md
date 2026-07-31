@@ -74,3 +74,48 @@
 - 摘要：在完整16深度/25波长上，任务加权 Fisher 在 `lr=1e-2` 下稳定下降，
   且未牺牲平均 MTF 或能量范围。20步仅确认目标与梯度方向，可进入1000步双
   seed GPU 对照。
+
+## 2026-07-31 Task-Fisher 正式实验：free-150 双 seed，1000 step
+
+- 类型：DOE-only 正式可行性实验。
+- checkpoint：
+  `experiments/PSF卷积/DOE预优化/taskFisher_free150_seed{123,456}_1000step/free150/seed_*/best_doe.pt`。
+- artifact root：上述两个 `taskFisher_*` 目录。
+- 推理结果：无。
+- 关键指标：seed123/456 task A-optimality 分别约下降25.2%/23.2%，深度
+  CRLB下降37.6%/35.5%，波长CRLB只下降11.7%/10.1%；sensor-weighted
+  spectral cosine 均未改善，MTF floor 均未满足。
+- 状态：完成，未通过综合可行性判据。
+- 摘要：双 seed 一致证明 free-150 能改善局部 Fisher，尤其是深度导数信息，
+  但没有学出明显的波长 PSF 形状差异。日志中0–100步总损失上升来自 separation
+  warm-up 的目标口径变化；最优点后只有约0.1%–0.2%反弹。该结果促使下一轮
+  将 DOE optical-only 形状编码从 RGB response 信息中显式拆出。
+
+## 2026-07-31 Optical-shape preflight：free-150，16 depth
+
+- 类型：新目标、固定日志口径与学习率预检。
+- checkpoint：`/tmp/doe_optical_shape_preflight_46f93ec/free150/seed_123/best_doe.pt`
+  与 `/tmp/doe_optical_shape_boundary_preflight/free150/seed_456/best_doe.pt`。
+- artifact root：上述两个 `/tmp` 目录。
+- 推理结果：无。
+- 关键指标：30步固定完整损失 `0.9423 → 0.9038`，optical spectral cosine
+  `0.9621 → 0.9605`；200步固定完整损失 `0.9282 → 0.8749`，optical
+  spectral cosine `0.9612 → 0.9584`，sensor spectral cosine
+  `0.9737 → 0.9733`。
+- 状态：完成。
+- 摘要：`loss/train_total` 在 warm-up 中随新项加入而上升，但
+  `loss/full_total` 从第一步开始持续下降，确认日志口径和目标梯度正确。该短跑
+  未达到3 μm边界，只用于确认 optical-only 目标确实能推动单色 PSF 形状变化。
+
+## 2026-07-31 RMS 边界压力测试：free-150，50 step
+
+- 类型：约束优化压力测试。
+- checkpoint：`/tmp/doe_optical_shape_boundary_hit_v2/free150/seed_789/best_doe.pt`。
+- artifact root：`/tmp/doe_optical_shape_boundary_hit_v2`。
+- 推理结果：无。
+- 关键指标：从2.99 μm RMS初始化，50步完整损失 `0.9074 → 0.8918`；
+  49次切向修正、50次安全回缩，最小回缩比例 `0.9895`。
+- 状态：完成。
+- 摘要：初版同时投影 Adam 一阶动量但未同步二阶动量，压力测试发现一次
+  `0.0027` 异常回缩；删除错误的动量投影后重新测试，边界训练恢复稳定下降。
+  正式实现只切向化实际候选更新，并保留轻量二阶安全回缩。

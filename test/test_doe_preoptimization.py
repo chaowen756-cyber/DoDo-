@@ -16,7 +16,9 @@ from util.doe_preoptimization import (
     doe_preoptimization_objective,
     initialize_doe_height_,
     load_preoptimized_doe_,
+    optical_psf_shape_separation_loss,
     psf_fisher_a_optimality_loss,
+    rms_constrained_optimizer_step_,
 )
 
 
@@ -57,8 +59,10 @@ def test_preoptimization_objective_is_finite_and_differentiable():
     response = torch.rand(3, 25)
     weights = DOEPreoptimizationWeights(
         mtf=2.0,
-        spectral_separation=0.7,
-        depth_separation=0.4,
+        optical_spectral_separation=0.7,
+        optical_depth_separation=0.4,
+        sensor_spectral_separation=0.2,
+        sensor_depth_separation=0.1,
         energy_guard=0.1,
     )
     targets = DOEPreoptimizationTargets(
@@ -80,12 +84,79 @@ def test_preoptimization_objective_is_finite_and_differentiable():
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
     assert logits.grad.norm() > 0
-    assert metrics["weighted/spectral_separation"] == (
-        0.5 * weights.spectral_separation * metrics["loss/spectral_separation"]
+    assert metrics["weighted/optical_spectral_separation"] == (
+        0.5
+        * weights.optical_spectral_separation
+        * metrics["loss/optical_spectral_separation"]
     )
-    assert metrics["weighted/depth_separation"] == (
-        0.5 * weights.depth_separation * metrics["loss/depth_separation"]
+    assert metrics["weighted/optical_depth_separation"] == (
+        0.5
+        * weights.optical_depth_separation
+        * metrics["loss/optical_depth_separation"]
     )
+    assert metrics["loss/full_total"] > metrics["loss/train_total"]
+
+
+def test_optical_shape_loss_is_scale_invariant_and_rewards_shape_change():
+    identical = torch.ones(2, 5, 4, 4, requires_grad=True)
+    scale = torch.linspace(0.5, 2.5, 5).reshape(1, 5, 1, 1)
+    scaled_loss, _ = optical_psf_shape_separation_loss(
+        identical * scale,
+        dimension="spectral",
+        margin=0.9,
+        offsets=(1, 2),
+    )
+    reference_loss, reference_stats = optical_psf_shape_separation_loss(
+        identical,
+        dimension="spectral",
+        margin=0.9,
+        offsets=(1, 2),
+    )
+
+    distinct = torch.zeros(2, 5, 4, 4)
+    for wavelength in range(5):
+        distinct[:, wavelength, wavelength // 4, wavelength % 4] = 1.0
+    distinct_loss, distinct_stats = optical_psf_shape_separation_loss(
+        distinct,
+        dimension="spectral",
+        margin=0.9,
+        offsets=(1, 2),
+    )
+
+    torch.testing.assert_close(scaled_loss, reference_loss)
+    assert distinct_loss < reference_loss
+    assert distinct_stats["cosine_mean"] < reference_stats["cosine_mean"]
+    reference_loss.backward()
+    assert identical.grad is not None
+    assert torch.isfinite(identical.grad).all()
+
+
+def test_rms_constrained_adam_removes_outward_boundary_step():
+    doe = DOELayer(
+        doe_type="New",
+        trainable=True,
+        basis_mode="orthogonal_rms",
+        basis_rank=9,
+        basis_rms_m=3e-6,
+        init_coeff_norm=0.2,
+    )
+    generator = torch.Generator().manual_seed(31)
+    maximum_rms = 0.75e-6
+    initialize_doe_height_(doe, target_rms_m=maximum_rms, generator=generator)
+    optimizer = torch.optim.Adam([doe.zernike_coeffs], lr=1e-2)
+
+    # Minimizing negative RMS proposes a purely outward update.
+    loss = -doe.pupil_rms(doe.heightmap())
+    loss.backward()
+    stats = rms_constrained_optimizer_step_(
+        doe,
+        optimizer,
+        maximum_rms_m=maximum_rms,
+    )
+
+    assert stats["tangent_correction"] == 1.0
+    assert stats["rms_after_m"] <= maximum_rms * (1.0 + 1e-5)
+    assert stats["retraction_scale"] > 0.995
 
 
 def test_fisher_a_optimality_preserves_signal_strength_and_gradients():
@@ -132,12 +203,8 @@ def test_fisher_task_weights_keep_full_nuisance_inverse():
     torch.testing.assert_close(
         full_stats["a_optimality_mean"], task_stats["a_optimality_mean"]
     )
-    torch.testing.assert_close(
-        full_loss, 1e-6 * full_stats["a_optimality_mean"]
-    )
-    torch.testing.assert_close(
-        task_loss, 2e-6 * task_stats["task_a_optimality_mean"]
-    )
+    torch.testing.assert_close(full_loss, 1e-6 * full_stats["a_optimality_mean"])
+    torch.testing.assert_close(task_loss, 2e-6 * task_stats["task_a_optimality_mean"])
     assert task_stats["crlb_depth_mean"] > 0
     assert task_stats["crlb_wavelength_mean"] > 0
 
