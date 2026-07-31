@@ -16,6 +16,7 @@ from util.doe_preoptimization import (
     doe_preoptimization_objective,
     initialize_doe_height_,
     load_preoptimized_doe_,
+    psf_fisher_a_optimality_loss,
 )
 
 
@@ -85,6 +86,27 @@ def test_preoptimization_objective_is_finite_and_differentiable():
     assert metrics["weighted/depth_separation"] == (
         0.5 * weights.depth_separation * metrics["loss/depth_separation"]
     )
+
+
+def test_fisher_a_optimality_preserves_signal_strength_and_gradients():
+    torch.manual_seed(23)
+    psf = torch.rand(3, 4, 9, 9, requires_grad=True)
+    response = torch.rand(3, 4)
+
+    loss, stats = psf_fisher_a_optimality_loss(
+        psf, response, ridge=1e-6, loss_scale=1e-6
+    )
+    stronger_loss, _ = psf_fisher_a_optimality_loss(
+        2.0 * psf, response, ridge=1e-6, loss_scale=1e-6
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert stronger_loss < loss
+    assert stats["minimum_eigenvalue_mean"] >= 0
+    assert psf.grad is not None
+    assert torch.isfinite(psf.grad).all()
+    assert psf.grad.norm() > 0
 
 
 def test_rank9_cpu_smoke_writes_reusable_best_doe(tmp_path):

@@ -3,8 +3,8 @@
 
 The reconstruction network and dataset are deliberately absent.  Rank-9 and
 free-150 Zernike DOEs receive the same pupil-height RMS budget and are judged
-only by sensor-visible PSF bandwidth, wavelength/depth separation, and a loose
-energy-spread guard.
+by point-source Fisher information, sensor-visible PSF bandwidth,
+wavelength/depth separation, and a loose energy-spread guard.
 """
 
 import argparse
@@ -182,12 +182,15 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
     )
     response = _sensor_response(model, device)
     weights = DOEPreoptimizationWeights(
+        fisher=args.fisher_weight,
         mtf=args.mtf_weight,
         spectral_separation=args.spectral_weight,
         depth_separation=args.depth_weight,
         energy_guard=args.energy_weight,
     )
     targets = DOEPreoptimizationTargets(
+        fisher_ridge=args.fisher_ridge,
+        fisher_loss_scale=args.fisher_loss_scale,
         mtf_min_frequency=args.mtf_min_frequency,
         mtf_max_frequency=args.mtf_max_frequency,
         mtf_at_005=args.mtf_target_005,
@@ -281,6 +284,7 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
                 print(
                     f"[{mode} seed={seed} step={step:04d}] "
                     f"loss={metrics_float['loss/total']:.6f} "
+                    f"FisherA={metrics_float['fisher/a_optimality_mean']:.3e} "
                     f"MTF005(p10/mean)={metrics_float['mtf/005_p10']:.4f}/"
                     f"{metrics_float['mtf/005_mean']:.4f} "
                     f"spec_cos={metrics_float['spectral/adjacent_cosine_mean']:.4f} "
@@ -339,8 +343,18 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
         "best": best_metrics,
         "improvement": {
             "loss_total": initial_metrics["loss/total"] - best_metrics["loss/total"],
-            "mtf_005_p10": best_metrics["mtf/005_p10"] - initial_metrics["mtf/005_p10"],
-            "mtf_005_mean": best_metrics["mtf/005_mean"] - initial_metrics["mtf/005_mean"],
+            "fisher_a_optimality": initial_metrics[
+                "fisher/a_optimality_mean"
+            ] - best_metrics["fisher/a_optimality_mean"],
+            "fisher_minimum_eigenvalue": best_metrics[
+                "fisher/minimum_eigenvalue_mean"
+            ] - initial_metrics["fisher/minimum_eigenvalue_mean"],
+            "mtf_005_p10": (
+                best_metrics["mtf/005_p10"] - initial_metrics["mtf/005_p10"]
+            ),
+            "mtf_005_mean": (
+                best_metrics["mtf/005_mean"] - initial_metrics["mtf/005_mean"]
+            ),
             "spectral_cosine_mean": initial_metrics[
                 "spectral/adjacent_cosine_mean"
             ] - best_metrics["spectral/adjacent_cosine_mean"],
@@ -349,6 +363,10 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
             ] - best_metrics["depth/adjacent_cosine_mean"],
         },
         "feasibility": {
+            "fisher_a_optimality_improved": (
+                best_metrics["fisher/a_optimality_mean"]
+                < initial_metrics["fisher/a_optimality_mean"]
+            ),
             "mtf_floor_satisfied": best_metrics["loss/mtf"] <= 1e-6,
             "spectral_margin_satisfied": (
                 best_metrics["loss/spectral_separation"] <= 1e-6
@@ -357,7 +375,9 @@ def _run_one(args, mode: str, seed: int, output_dir: Path) -> Dict:
                 best_metrics["loss/depth_separation"] <= 1e-6
             ),
             "all_information_targets_satisfied": (
-                best_metrics["loss/mtf"] <= 1e-6
+                best_metrics["fisher/a_optimality_mean"]
+                < initial_metrics["fisher/a_optimality_mean"]
+                and best_metrics["loss/mtf"] <= 1e-6
                 and best_metrics["loss/spectral_separation"] <= 1e-6
                 and best_metrics["loss/depth_separation"] <= 1e-6
             ),
@@ -391,6 +411,9 @@ def _parse_args(argv: Iterable[str] = None):
     parser.add_argument("--initial_height_rms_um", type=float, default=0.6)
     parser.add_argument("--maximum_height_rms_um", type=float, default=3.0)
 
+    parser.add_argument("--fisher_weight", type=float, default=1.0)
+    parser.add_argument("--fisher_ridge", type=float, default=1e-8)
+    parser.add_argument("--fisher_loss_scale", type=float, default=1e-7)
     parser.add_argument("--mtf_weight", type=float, default=20.0)
     parser.add_argument("--spectral_weight", type=float, default=1.0)
     parser.add_argument("--depth_weight", type=float, default=1.0)
@@ -418,6 +441,10 @@ def _parse_args(argv: Iterable[str] = None):
         parser.error("--separation_warmup_steps must be >= 0")
     if args.separation_warmup_steps > args.steps:
         parser.error("--separation_warmup_steps cannot exceed --steps")
+    if args.lr <= 0.0 or args.final_lr_ratio <= 0.0:
+        parser.error("learning rate and final_lr_ratio must be > 0")
+    if args.fisher_ridge <= 0.0 or args.fisher_loss_scale <= 0.0:
+        parser.error("Fisher ridge and loss scale must be > 0")
     if args.initial_height_rms_um > args.maximum_height_rms_um:
         parser.error("initial DOE height RMS cannot exceed the maximum")
     if args.device.startswith("cuda") and not torch.cuda.is_available():

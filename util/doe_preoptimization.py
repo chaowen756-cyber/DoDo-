@@ -18,6 +18,7 @@ from util.psf_regularization import (
 class DOEPreoptimizationWeights:
     """Relative weights for the dimensionless PSF feasibility objectives."""
 
+    fisher: float = 1.0
     mtf: float = 20.0
     spectral_separation: float = 1.0
     depth_separation: float = 1.0
@@ -28,6 +29,8 @@ class DOEPreoptimizationWeights:
 class DOEPreoptimizationTargets:
     """Conservative targets shared by rank-9 and higher-capacity searches."""
 
+    fisher_ridge: float = 1e-8
+    fisher_loss_scale: float = 1e-7
     mtf_min_frequency: float = 0.02
     mtf_max_frequency: float = 0.15
     mtf_at_005: float = 0.12
@@ -116,6 +119,135 @@ def load_preoptimized_doe_(
     return checkpoint
 
 
+def _unit_grid_finite_difference(value: torch.Tensor, dim: int) -> torch.Tensor:
+    """Differentiate on a unit-spaced discrete grid with one-sided edges."""
+    dim = dim % value.ndim
+    if value.shape[dim] < 2:
+        raise ValueError("finite differences require at least two samples")
+    result = torch.empty_like(value)
+    index = [slice(None)] * value.ndim
+
+    first = index.copy()
+    first[dim] = 0
+    second = index.copy()
+    second[dim] = 1
+    result[tuple(first)] = value[tuple(second)] - value[tuple(first)]
+
+    last = index.copy()
+    last[dim] = -1
+    penultimate = index.copy()
+    penultimate[dim] = -2
+    result[tuple(last)] = value[tuple(last)] - value[tuple(penultimate)]
+
+    if value.shape[dim] > 2:
+        middle = index.copy()
+        middle[dim] = slice(1, -1)
+        following = index.copy()
+        following[dim] = slice(2, None)
+        preceding = index.copy()
+        preceding[dim] = slice(None, -2)
+        result[tuple(middle)] = 0.5 * (
+            value[tuple(following)] - value[tuple(preceding)]
+        )
+    return result
+
+
+def psf_fisher_a_optimality_loss(
+    psf_bank: torch.Tensor,
+    sensor_response: torch.Tensor,
+    *,
+    ridge: float = 1e-8,
+    loss_scale: float = 1e-7,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """A-optimal Fisher loss for monochromatic RGB point-source PSFs.
+
+    This is the discrete counterpart of the DOE initialization objective in
+    Baek et al., ICCV 2021.  The four source coordinates are x pixel, y pixel,
+    one depth-bin step, and one wavelength-bin step.  Expressing every
+    derivative per sampling bin makes the A-optimal trace independent of the
+    arbitrary choice of metre versus nanometre units.
+
+    The PSFs deliberately retain their captured-energy scale: normalizing each
+    PSF here would incorrectly make a low-throughput design look informative.
+    """
+    if psf_bank.ndim != 4:
+        raise ValueError(
+            "psf_bank must have shape [depth,wavelength,H,W], "
+            f"got {tuple(psf_bank.shape)}"
+        )
+    if psf_bank.shape[0] < 2 or psf_bank.shape[1] < 2:
+        raise ValueError(
+            "Fisher loss requires at least two depths and wavelengths"
+        )
+    if (
+        sensor_response.ndim != 2
+        or sensor_response.shape[1] != psf_bank.shape[1]
+    ):
+        raise ValueError(
+            "sensor_response must have shape [sensor_channel,wavelength]"
+        )
+    ridge = float(ridge)
+    loss_scale = float(loss_scale)
+    if ridge <= 0.0 or loss_scale <= 0.0:
+        raise ValueError("Fisher ridge and loss_scale must both be > 0")
+    if (
+        not torch.isfinite(psf_bank).all()
+        or not torch.isfinite(sensor_response).all()
+    ):
+        raise ValueError("PSF bank and sensor response must be finite")
+
+    psf = psf_bank.to(torch.float32)
+    response = sensor_response.to(
+        device=psf.device, dtype=psf.dtype
+    ).transpose(0, 1)
+    response_power = response.square().sum(dim=-1)
+    dx = _unit_grid_finite_difference(psf, -1)
+    dy = _unit_grid_finite_difference(psf, -2)
+    dz = _unit_grid_finite_difference(psf, 0)
+
+    # Wavelength differentiation must include the RGB spectral response, not
+    # only the optical PSF, because the camera observes their product.
+    observed = psf.unsqueeze(2) * response[None, :, :, None, None]
+    dlambda = _unit_grid_finite_difference(observed, 1)
+    spatial_depth_derivatives = (dx, dy, dz)
+
+    entries = [[None for _ in range(4)] for _ in range(4)]
+    for row, first in enumerate(spatial_depth_derivatives):
+        for column, second in enumerate(spatial_depth_derivatives):
+            entries[row][column] = (
+                (first * second).sum(dim=(-2, -1)) * response_power[None, :]
+            )
+        cross = torch.einsum("dlhw,dlchw,lc->dl", first, dlambda, response)
+        entries[row][3] = cross
+        entries[3][row] = cross
+    entries[3][3] = dlambda.square().sum(dim=(2, 3, 4))
+    fisher = torch.stack([torch.stack(row, dim=-1) for row in entries], dim=-2)
+
+    identity = torch.eye(4, device=psf.device, dtype=psf.dtype)
+    regularized = fisher + ridge * identity
+    inverse = torch.linalg.solve(regularized, identity.expand_as(regularized))
+    a_optimality = inverse.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    loss = loss_scale * a_optimality.mean()
+
+    with torch.no_grad():
+        eigenvalues = torch.linalg.eigvalsh(fisher.detach()).clamp_min(0.0)
+        minimum = eigenvalues[..., 0]
+        maximum = eigenvalues[..., -1]
+        condition = (maximum + ridge) / (minimum + ridge)
+        stats = {
+            "a_optimality_mean": a_optimality.mean().detach(),
+            "a_optimality_p90": torch.quantile(a_optimality.flatten(), 0.9),
+            "a_optimality_max": a_optimality.max().detach(),
+            "minimum_eigenvalue_mean": minimum.mean().detach(),
+            "minimum_eigenvalue_p10": torch.quantile(minimum.flatten(), 0.1),
+            "minimum_eigenvalue_min": minimum.min().detach(),
+            "condition_mean": condition.mean().detach(),
+            "condition_p90": torch.quantile(condition.flatten(), 0.9),
+            "trace_mean": eigenvalues.sum(dim=-1).mean().detach(),
+        }
+    return loss, stats
+
+
 def doe_preoptimization_objective(
     psf_bank: torch.Tensor,
     sensor_response: torch.Tensor,
@@ -135,6 +267,12 @@ def doe_preoptimization_objective(
     if not 0.0 <= separation_scale <= 1.0:
         raise ValueError("separation_scale must lie in [0,1]")
 
+    fisher_loss, fisher_stats = psf_fisher_a_optimality_loss(
+        psf_bank,
+        sensor_response,
+        ridge=targets.fisher_ridge,
+        loss_scale=targets.fisher_loss_scale,
+    )
     mtf_loss, mtf_stats = psf_mtf_floor_loss(
         psf_bank,
         min_frequency=targets.mtf_min_frequency,
@@ -173,6 +311,7 @@ def doe_preoptimization_objective(
         energy_reference=energy_reference,
     )
 
+    weighted_fisher = float(weights.fisher) * fisher_loss
     weighted_mtf = float(weights.mtf) * mtf_loss
     weighted_spectral = (
         separation_scale * float(weights.spectral_separation) * spectral_loss
@@ -181,14 +320,22 @@ def doe_preoptimization_objective(
         separation_scale * float(weights.depth_separation) * depth_loss
     )
     weighted_energy = float(weights.energy_guard) * energy_loss
-    total = weighted_mtf + weighted_spectral + weighted_depth + weighted_energy
+    total = (
+        weighted_fisher
+        + weighted_mtf
+        + weighted_spectral
+        + weighted_depth
+        + weighted_energy
+    )
 
     metrics: Dict[str, torch.Tensor] = {
         "loss/total": total.detach(),
+        "loss/fisher_a_optimality": fisher_loss.detach(),
         "loss/mtf": mtf_loss.detach(),
         "loss/spectral_separation": spectral_loss.detach(),
         "loss/depth_separation": depth_loss.detach(),
         "loss/energy_guard": energy_loss.detach(),
+        "weighted/fisher_a_optimality": weighted_fisher.detach(),
         "weighted/mtf": weighted_mtf.detach(),
         "weighted/spectral_separation": weighted_spectral.detach(),
         "weighted/depth_separation": weighted_depth.detach(),
@@ -208,6 +355,8 @@ def doe_preoptimization_objective(
         "depth/adjacent_cosine_p90": depth_stats["adjacent_cosine_p90"],
         "depth/adjacent_cosine_max": depth_stats["adjacent_cosine_max"],
     }
+    for name, value in fisher_stats.items():
+        metrics[f"fisher/{name}"] = value
     for name in (
         "captured_mean",
         "captured_min",
