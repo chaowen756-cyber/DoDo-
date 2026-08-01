@@ -4,8 +4,36 @@ set -euo pipefail
 REPO_ROOT="/home/wenchao/autodl-tmp"
 PYTHON_BIN="${PYTHON_BIN:-/home/wenchao/conda_envs/ld_clean/bin/python}"
 CUDA_DEVICES="${CUDA_DEVICES:-1,3}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-psfconv_baek_fixed_doe_frozen_stageA_20ep}"
-MAX_EPOCHS="${MAX_EPOCHS:-20}"
+TRAIN_STAGE="${TRAIN_STAGE:-stage_a}"
+INIT_CKPT="${INIT_CKPT:-}"
+case "${TRAIN_STAGE}" in
+  stage_a)
+    DEFAULT_EXPERIMENT_NAME="psfconv_baek_fixed_doe_frozen_stageA_20ep"
+    DEFAULT_MAX_EPOCHS=20
+    DEFAULT_LR_WARMUP_STEPS=0
+    DEFAULT_LR_DECAY_STRATEGY=none
+    stage_args=(--no-isolate_hs_decoder_gradients)
+    ;;
+  stage_b)
+    DEFAULT_EXPERIMENT_NAME="psfconv_baek_fixed_doe_frozen_stageB_30ep"
+    DEFAULT_MAX_EPOCHS=30
+    DEFAULT_LR_WARMUP_STEPS=54
+    DEFAULT_LR_DECAY_STRATEGY=baek
+    stage_args=(--init_ckpt_path "${INIT_CKPT}" --isolate_hs_decoder_gradients)
+    ;;
+  *)
+    echo "TRAIN_STAGE must be stage_a or stage_b, got: ${TRAIN_STAGE}" >&2
+    exit 2
+    ;;
+esac
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_NAME}}"
+MAX_EPOCHS="${MAX_EPOCHS:-${DEFAULT_MAX_EPOCHS}}"
+CNN_LR="${CNN_LR:-1e-4}"
+OPTICS_LR="${OPTICS_LR:-0.0}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-${DEFAULT_LR_WARMUP_STEPS}}"
+LR_DECAY_STRATEGY="${LR_DECAY_STRATEGY:-${DEFAULT_LR_DECAY_STRATEGY}}"
+CNN_LR_DECAY_EPOCHS="${CNN_LR_DECAY_EPOCHS:-20}"
+OPTICS_LR_DECAY_EPOCHS="${OPTICS_LR_DECAY_EPOCHS:-10}"
 DOE_HEIGHT="${DOE_HEIGHT:-${REPO_ROOT}/e2e_HSD_learned_DOE_and_PSF_simulation/e2e_HSD_doe_height.pth}"
 DATA_ROOT="${REPO_ROOT}/Baek数据集"
 EXPERIMENT_BASE="${EXPERIMENT_BASE:-${REPO_ROOT}/论文实验/PSF卷积/baek_psf}"
@@ -31,6 +59,11 @@ for required_file in \
     exit 1
   fi
 done
+
+if [[ "${TRAIN_STAGE}" == "stage_b" && ! -f "${INIT_CKPT}" ]]; then
+  echo "Stage B initial checkpoint not found: ${INIT_CKPT}" >&2
+  exit 1
+fi
 
 if [[ "${RUN_INFERENCE}" != "0" && "${RUN_INFERENCE}" != "1" ]]; then
   echo "RUN_INFERENCE must be 0 or 1, got: ${RUN_INFERENCE}" >&2
@@ -148,9 +181,12 @@ train_args=(
   --sam_loss_weight 0.0
   --mse_loss_weight 0.0
   --spatial_gradient_loss_weight 0.0
-  --cnn_lr 1e-4
-  --lr_warmup_steps 0
-  --lr_decay_strategy none
+  --cnn_lr "${CNN_LR}"
+  --optics_lr "${OPTICS_LR}"
+  --lr_warmup_steps "${LR_WARMUP_STEPS}"
+  --lr_decay_strategy "${LR_DECAY_STRATEGY}"
+  --cnn_lr_decay_epochs "${CNN_LR_DECAY_EPOCHS}"
+  --optics_lr_decay_epochs "${OPTICS_LR_DECAY_EPOCHS}"
   --batch_sz 8
   --accumulate_grad_batches 2
   --num_workers 16
@@ -161,6 +197,7 @@ train_args=(
   --checkpoint_mode min
   --val_check_interval 0.25
   --max_epochs "${MAX_EPOCHS}"
+  "${stage_args[@]}"
 )
 
 if [[ "${FAST_DEV_RUN:-0}" == "1" ]]; then
@@ -190,6 +227,10 @@ fi
 mkdir -p "$(dirname "${CONSOLE_LOG}")"
 cd "${REPO_ROOT}"
 echo "Frozen Baek DOE: ${DOE_HEIGHT}"
+echo "Training stage: ${TRAIN_STAGE}"
+if [[ "${TRAIN_STAGE}" == "stage_b" ]]; then
+  echo "Stage A initialization: ${INIT_CKPT}"
+fi
 echo "Physical GPUs: ${CUDA_DEVICES}"
 echo "Output: ${OUTPUT_ROOT}"
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" \
