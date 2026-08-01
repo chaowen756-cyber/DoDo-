@@ -2,42 +2,34 @@
 
 ## Owner
 
-User / experiment runner
+Implementation / verification
 
 ## Current Change
 
-Baek pretrained fixed-height DOE transfer on native optical sampling.
+Baek pretrained fixed-height DOE native PSF parity.
 
 ## Status
 
-Branch `Baek预训练DOE冻结联合训练` loads the Baek 375x375 physical height,
-right/bottom pads it to 376x376 without interpolation, and uses its 8 µm,
-NOA61, PADO spherical-source/circular-aperture/Fresnel, 50 mm convention. The
-DOE and all optics have zero trainable parameters. Real-file 16x25 PSF
-preflight passed.
+Do not start the 12-epoch network training yet. An independent comparison using
+the actual PADO API over all 25 wavelengths x 20 notebook depths found material
+PSF-shape discrepancies in the current vectorized spherical source. Full-grid
+NRMSE is `0.1504` on average and `1.1062` worst-case.
+
+The DOE, pupil and Fresnel propagation are not the cause: feeding the current
+chain a PADO scalar-semantics spherical source reduces full-grid NRMSE to
+`4.79e-6` mean and `1.62e-5` max.
 
 ## Execute
 
-Run `bash scripts/run_baek_fixed_doe_joint.sh`. Defaults: physical GPUs 1 and
-3, 12 epochs, frozen optics, joint HS/depth network training. Use `DRY_RUN=1`
-to inspect the expanded command first.
+1. Change only `doe_native_grid_v1` spherical-source construction so it is
+   numerically equivalent to PADO's per-wavelength Python-float calculation.
+2. Re-run `scripts/compare_baek_native_psfs.py` against actual PADO.
+3. Require all 500 PSFs to remain near the isolated baseline (target max NRMSE
+   around `2e-5`, cosine near 1) before reconsidering network training.
 
-## Decision
+## Preserve
 
-- Treat native 376x376 as the primary experiment; retain 128x128 area-resampled
-  consistent-grid only as an optional later ablation.
-- Keep halo64/129x129 for the first controlled run. Capture fraction is logged;
-  a larger optical halo is a separate follow-up experiment.
-- Use joint-best by validation loss as the primary result; depth-best and
-  HS-best remain auxiliary ceilings.
-
-## Required Artifact
-
-- `artifacts/command.txt`, `hparams.json`, `metrics.json`
-- joint/depth/HS best checkpoints
-- loss history and quicklooks
-
-## Stop Condition
-
-Stop after the 12-epoch run and compare validation/full-scene metrics before
-changing PSF support, reconstruction architecture, or loss weights.
+- Keep the 376x376/8 µm/NOA61/50 mm DOE-native geometry.
+- Do not change legacy or consistent-grid optical paths.
+- Do not use capture fraction alone as the parity criterion; it stayed nearly
+  equal even when PSF morphology differed.

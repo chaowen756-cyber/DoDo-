@@ -23,3 +23,15 @@
 
 早期 `consistent_grid_v1` 的 128x128 area-downsample 预检仅作为缩放迁移备选，
 不再是主实验口径。
+
+## baek-native-psf-parity-20260801
+
+- 参考端：实际 PADO GitHub `12c57df` API；25 wavelengths x 20 notebook depths。
+- 当前 full-grid：cosine mean/min `0.974696/0.537816`；NRMSE
+  mean/median/max `0.150379/0.097317/1.106150`。
+- PADO scalar-source 隔离：保持当前 DOE/pupil/propagator，只替换球面波标量计算；
+  NRMSE mean/max `4.79e-6/1.62e-5`，cosine 约 1。
+- 根因：当前 vectorized float32 wavelength tensor 对数百万至数千万弧度球面相位
+  的舍入/取模误差；远距离更明显。
+- 决策：正式训练暂不启动；先修正 native spherical source，再重复 500-PSF parity。
+- artifacts：`论文实验/PSF卷积/baek_native_psf_parity_20260801/`。
