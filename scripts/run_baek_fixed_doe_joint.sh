@@ -17,7 +17,9 @@ case "${TRAIN_STAGE}" in
   stage_b)
     DEFAULT_EXPERIMENT_NAME="psfconv_baek_fixed_doe_frozen_stageB_30ep"
     DEFAULT_MAX_EPOCHS=30
-    DEFAULT_LR_WARMUP_STEPS=54
+    # Keep warmup unchanged from this experiment's Stage A. Historical
+    # number18C/18D also kept the same warmup across the stage transition.
+    DEFAULT_LR_WARMUP_STEPS=0
     DEFAULT_LR_DECAY_STRATEGY=baek
     stage_args=(--init_ckpt_path "${INIT_CKPT}" --isolate_hs_decoder_gradients)
     ;;
@@ -167,6 +169,7 @@ train_args=(
   --no-preinverse
   --decoder_norm group
   --no-decoder_use_depth_input
+  --no-detach_depth_guidance_for_hs
   --decoder_use_rgb_pinv_prior
   --decoder_rgb_pinv_lambda 1e-3
   --decoder_rgb_pinv_norm per_sample_max
