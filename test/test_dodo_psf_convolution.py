@@ -267,6 +267,19 @@ def test_baek_native_grid_uses_exact_height_and_pado_sampling(tmp_path):
     )
     assert isinstance(model.prop3, PadoFresnelPropagationLayer)
     assert model.prop3.z.item() == pytest.approx(50e-3)
+    notebook_wavelengths = torch.linspace(
+        420e-9, 660e-9, 25, dtype=torch.float32
+    )
+    torch.testing.assert_close(
+        model.prop3.wave_lengths, notebook_wavelengths, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        model.doe1.wave_lengths, notebook_wavelengths, atol=0, rtol=0
+    )
+    for layer in model.prop1_layers:
+        torch.testing.assert_close(
+            layer.wave_lengths, notebook_wavelengths, atol=0, rtol=0
+        )
     assert model.doe1.pupil_convention == "pado_integer_centered"
     assert model.doe1.spiral_p.sum().item() == 111007
     expected_height = torch.nn.functional.pad(source[0, 0], (0, 1, 0, 1))
@@ -274,6 +287,27 @@ def test_baek_native_grid_uses_exact_height_and_pado_sampling(tmp_path):
 
     field = model._prop1_impulse_field_bank(376, 376, torch.device("cpu"))
     assert field.shape == (1, 25, 376, 376)
+    coordinates = torch.arange(-188, 188, dtype=torch.float32) * 8e-6
+    yy, xx = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    radius_grid = torch.sqrt(
+        xx.square() + yy.square() + float(model.z_centers[0]) ** 2
+    )
+    # PADO creates one Light object per wavelength and receives wavelength as
+    # a Python scalar.  Comparing complete fields catches the float32
+    # broadcast/modulo phase error that a single central sample misses.
+    for wavelength_index, wavelength_value in enumerate(
+        model.prop3.wave_lengths.detach().cpu().tolist()
+    ):
+        expected_field = torch.exp(
+            1j
+            * torch.remainder(
+                (2.0 * torch.pi * radius_grid) / float(wavelength_value),
+                2.0 * torch.pi,
+            ).to(torch.complex64)
+        )
+        torch.testing.assert_close(
+            field[0, wavelength_index], expected_field, atol=0, rtol=0
+        )
     coordinate = -188 * 8e-6
     radius = (2.0 * coordinate**2 + float(model.z_centers[0]) ** 2) ** 0.5
     expected_corner = torch.exp(
@@ -285,8 +319,17 @@ def test_baek_native_grid_uses_exact_height_and_pado_sampling(tmp_path):
     )
     torch.testing.assert_close(field[0, 0, 0, 0], expected_corner, atol=2e-5, rtol=2e-5)
 
-    with torch.no_grad():
-        psf = model.psf_bank(use_cache=False)
+    # Fixed-height optics must cache in training mode even while autograd is
+    # globally enabled.  The associated frequency-domain kernel is cached too.
+    model.train()
+    assert model._optics_are_frozen()
+    psf = model.psf_bank(use_cache=True)
+    cached_psf = model.psf_bank(use_cache=True)
+    assert not psf.requires_grad
+    assert cached_psf.data_ptr() == psf.data_ptr()
+    psf_fft = model._psf_frequency_bank(psf, (256, 256))
+    cached_psf_fft = model._psf_frequency_bank(psf, (256, 256))
+    assert cached_psf_fft.data_ptr() == psf_fft.data_ptr()
     assert psf.shape == (1, 25, 129, 129)
     assert torch.isfinite(psf).all()
     torch.testing.assert_close(

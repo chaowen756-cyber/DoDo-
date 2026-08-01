@@ -2,18 +2,17 @@
 
 ## 先回答核心问题
 
-是的，在相同的波长 `lambda`、物距 `z`、376x376/8 µm 网格和相同裁剪口径下，
-只要把 DOE 前的球面波生成改成与 Baek/PADO 完全一致，当前模型生成的 PSF 就会
-非常接近 `e2e_HSD.ipynb` 的结果。
+是的。在相同的波长 `lambda`、物距 `z`、376x376/8 µm 网格和相同裁剪口径下，
+当前模型生成的 PSF 已经在 float32 数值精度内复现 `e2e_HSD.ipynb`。
 
 这里的“第一段传播”需要准确理解为：
 
 - 旧前向：在场景平面放一个离散 impulse，再通过 `Prop1` 传播到 DOE。
 - Baek 前向：不执行这次离散传播，而是在 DOE 平面直接调用
   `Light.set_spherical_light(z)` 构造点光源球面波。
-- 当前 `doe_native_grid_v1`：结构上已经绕过 `Prop1`，直接在 DOE 面生成球面波；
-  但当前 25 波长 float32 向量化除法的数值语义还没有与 PADO 的逐波长 Python
-  float 完全对齐。这是当前唯一需要修正的主要差异。
+- 当前 `doe_native_grid_v1`：结构上绕过 `Prop1`，直接在 DOE 面生成球面波；
+  深度和波长均采用 PADO 的 Python 标量数值语义，并统一使用 notebook 的
+  `torch.linspace(420e-9, 660e-9, 25)` 波长网格。
 
 ## 一致性实验到底比较了什么
 
@@ -22,19 +21,20 @@
 | 路径 | DOE 前球面波 | DOE、圆孔、50 mm 传播 | 用途 |
 |---|---|---|---|
 | A. Baek/PADO reference | PADO 每次单独计算一个 `wvl_val` | PADO 原生 API | 参考答案 |
-| B. 当前 native | 25 波长 float32 tensor 一次向量化 | 当前 PADO-compatible 实现 | 检查当前代码整体结果 |
-| C. 根因隔离 | PADO 逐波长标量语义 | 与 B 完全相同 | 判断差异是否只来自球面波 |
+| B. 修复前 native | 25 波长 float32 tensor 一次向量化 | 当前 PADO-compatible 实现 | 历史问题基线 |
+| C. 当前 native | PADO 逐深度、逐波长标量语义 | 与 B 完全相同 | 修复后的部署前向 |
 
 结果为：
 
-- B 对 A：full-grid NRMSE mean `0.150379`，max `1.106150`。
-- C 对 A：full-grid NRMSE mean `4.79e-6`，max `1.62e-5`；cosine 基本为 1。
+- 修复前 B 对 A：full-grid NRMSE mean `0.150379`，max `1.106150`。
+- 当前 C 对 A：full-grid NRMSE mean `2.81e-6`，max `1.14e-5`；全部 500 个
+  source coherence 为 `1.0`，peak shift 为 `0`。
+- 当前 129×129 crop 对 A：NRMSE mean `1.12e-6`，max `3.27e-6`。
 
 因此可以得出严格结论：
 
-> 当前 DOE 高度、NOA61 相位、PADO 圆孔和 DOE 后 50 mm Fresnel 传播已经正确；
-> 只要修正 DOE 前球面波的数值计算，当前前向在对应 `(lambda, z)` 上就能复现
-> Baek notebook PSF。
+> 当前 DOE 面球面波、DOE 高度、NOA61 相位、PADO 圆孔和 DOE 后 50 mm
+> Fresnel 传播均已对齐；当前前向在对应 `(lambda, z)` 上复现 Baek notebook PSF。
 
 ## 修正后的 PSF 生成总架构
 
@@ -251,20 +251,24 @@ depth map [B,1,H,W]
 | PADO integer-centered pupil | 已完成 |
 | 50 mm PADO Fresnel linear convolution | 已完成 |
 | 结构上绕过旧 Prop1、在 DOE 面直接生成球面波 | 已完成 |
-| 球面波逐波长标量数值语义 | **尚待修正** |
+| notebook `torch.linspace` 波长网格 | 已完成 |
+| 球面波逐深度、逐波长标量数值语义 | 已完成 |
 | 25x20 PADO parity 脚本与基线 | 已完成 |
-| 正式网络训练 | 未启动；应等待 parity 修正通过 |
+| 冻结 DOE 的 PSF/FFT 缓存 | 已完成并通过训练态复用测试 |
+| 正式网络训练 | 未启动；parity 与最小训练链路均已通过 |
 
-## 修正后的验收标准
+## 修正后的验收结果
 
-修改只应作用于 `doe_native_grid_v1` 的球面波生成，不改变其他光学模式。重新对比
-全部 500 个 `(lambda,z)` 后，目标为：
+修改只作用于 `doe_native_grid_v1` 的波长网格和球面波生成，不改变其他光学模式。
+全部 500 个 `(lambda,z)` 的结果为：
 
 ```text
-full-grid cosine 接近 1
-mean NRMSE ≈ 5e-6
-max NRMSE <= 2e-5
+source complex coherence = 1.0
+full-grid cosine ≈ 1
+mean NRMSE = 2.81e-6
+max NRMSE = 1.14e-5
+peak shift = 0 pixel
 ```
 
-达到该标准后，可以认为当前固定 Baek DOE 的 PSF 生成前向已经在数值上复现
-notebook，再决定是否将这些 PSF 用于当前 16-depth 重建网络实验。
+当前固定 Baek DOE 的 PSF 生成前向已经在数值上复现 notebook，可以用于当前
+16-depth、冻结光学的重建网络实验。

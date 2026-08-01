@@ -4,8 +4,8 @@ set -euo pipefail
 REPO_ROOT="/home/wenchao/autodl-tmp"
 PYTHON_BIN="${PYTHON_BIN:-/home/wenchao/conda_envs/ld_clean/bin/python}"
 CUDA_DEVICES="${CUDA_DEVICES:-1,3}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-psfconv_baek_pretrained_doe_frozen_joint_12ep}"
-MAX_EPOCHS="${MAX_EPOCHS:-12}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-psfconv_baek_fixed_doe_frozen_stageA_20ep}"
+MAX_EPOCHS="${MAX_EPOCHS:-20}"
 DOE_HEIGHT="${DOE_HEIGHT:-${REPO_ROOT}/e2e_HSD_learned_DOE_and_PSF_simulation/e2e_HSD_doe_height.pth}"
 DATA_ROOT="${REPO_ROOT}/Baek数据集"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/论文实验/PSF卷积/${EXPERIMENT_NAME}}"
@@ -125,7 +125,7 @@ train_args=(
   --mse_loss_weight 0.0
   --spatial_gradient_loss_weight 0.0
   --cnn_lr 1e-4
-  --lr_warmup_steps 54
+  --lr_warmup_steps 0
   --lr_decay_strategy none
   --batch_sz 8
   --accumulate_grad_batches 2

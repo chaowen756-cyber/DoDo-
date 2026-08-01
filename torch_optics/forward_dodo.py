@@ -530,6 +530,17 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
         mss = self.optical_grid_size
         minput = self.optical_grid_size
+        # The public Baek notebook constructs its 25 wavelengths with
+        # torch.linspace.  The legacy DoDo default is NumPy-linspace followed
+        # by a float32 cast; nine interior samples differ by one float32 ULP.
+        # That tiny wavelength difference is amplified by spherical-source
+        # phase reduction, so the native path must share the notebook tensor
+        # across every optical element.
+        native_wave_lengths = (
+            torch.linspace(420e-9, 660e-9, 25, dtype=torch.float32)
+            if self.psf_optics_version == "doe_native_grid_v1"
+            else None
+        )
 
         # Compute bin edges and centers
         edges = torch.linspace(depth_min, depth_max, num_depth_layers + 1)
@@ -555,6 +566,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                     Mp=minput,
                     L=self.optical_grid_length_m,
                     zi=float(z_centers[k]),
+                    wave_lengths=native_wave_lengths,
                     trainable_z=False,
                     padding_factor=self.prop1_padding_factor,
                 )
@@ -576,6 +588,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 heightmap_path=doe_height_path,
                 Mdoe=mss,
                 Mesce=minput,
+                wave_lengths=native_wave_lengths,
                 assets_dir=assets_dir,
                 use_pupil_mask=self.uses_full_sensor_grid,
                 source_pad_to_size=doe_height_pad_to_size,
@@ -590,6 +603,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             self.doe1 = DOEPixelPhaseLayer(
                 Mdoe=mss,
                 Mesce=minput,
+                wave_lengths=native_wave_lengths,
                 trainable=train_c,
                 assets_dir=assets_dir,
                 reference_wavelength_m=doe_reference_wavelength_m,
@@ -599,6 +613,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             self.doe1 = DOEFreeLayer(
                 Mdoe=mss,
                 Mesce=minput,
+                wave_lengths=native_wave_lengths,
                 n_terms=n_terms,
                 doe_type=doe_type_a,
                 trainable=train_c,
@@ -611,6 +626,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             self.doe1 = DOELayer(
                 Mdoe=mss,
                 Mesce=minput,
+                wave_lengths=native_wave_lengths,
                 doe_type=doe_type_a,
                 trainable=train_c,
                 assets_dir=assets_dir,
@@ -638,11 +654,13 @@ class DepthAwareDoDoForwardModel(nn.Module):
             Mp=mss,
             L=intermediate_length,
             zi=0.05,
+            wave_lengths=native_wave_lengths,
             trainable_z=False,
         )
         self.doe2 = DOELayer(
             Mdoe=mss,
             Mesce=mss,
+            wave_lengths=native_wave_lengths,
             doe_type="Spiral",
             trainable=False,
             assets_dir=assets_dir,
@@ -654,6 +672,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 Mp=mss,
                 L=sensor_length,
                 zi=self.sensor_propagation_distance_m,
+                wave_lengths=native_wave_lengths,
             )
         else:
             self.prop3 = PropagationLayer(
@@ -1085,7 +1104,12 @@ class DepthAwareDoDoForwardModel(nn.Module):
             # Match PADO Light.set_spherical_light exactly. Baek's learned DOE
             # was illuminated directly at the DOE plane; propagating a sampled
             # scene-plane impulse here would introduce a different discrete
-            # source model before the transplanted height map.
+            # source model before the transplanted height map.  Keep depth and
+            # wavelength values as Python scalars here: broadcasting a float32
+            # wavelength tensor changes the rounding of the very large
+            # 2*pi*r/lambda phase before modulo reduction and produces visibly
+            # different PSFs.  This bank is built only once when the fixed DOE
+            # is frozen, then reused by both the PSF and PSF-FFT caches.
             coordinates = torch.arange(
                 -height // 2,
                 height // 2,
@@ -1094,19 +1118,32 @@ class DepthAwareDoDoForwardModel(nn.Module):
             ) * (self.optical_grid_length_m / self.optical_grid_size)
             yy, xx = torch.meshgrid(coordinates, coordinates, indexing="ij")
             radial_squared = xx.square() + yy.square()
-            depths = self.z_centers.to(device=device, dtype=torch.float32)
-            radii = torch.sqrt(
-                radial_squared[None] + depths[:, None, None].square()
+            depth_values = self.z_centers.detach().cpu().tolist()
+            wavelength_values = (
+                self.prop3.wave_lengths.detach().cpu().tolist()
             )
-            wavelengths = self.prop3.wave_lengths.to(
-                device=device, dtype=torch.float32
-            )
-            phase = torch.remainder(
-                (2.0 * torch.pi * radii[:, None])
-                / wavelengths[None, :, None, None],
-                2.0 * torch.pi,
-            )
-            field_bank = torch.exp(1j * phase.to(torch.complex64)).detach()
+            depth_fields = []
+            for depth_value in depth_values:
+                radius = torch.sqrt(
+                    radial_squared + float(depth_value) ** 2
+                )
+                wavelength_fields = []
+                for wavelength_value in wavelength_values:
+                    phase = torch.remainder(
+                        (2.0 * torch.pi * radius) / float(wavelength_value),
+                        2.0 * torch.pi,
+                    )
+                    wavelength_fields.append(
+                        torch.exp(1j * phase.to(torch.complex64))
+                    )
+                depth_fields.append(torch.stack(wavelength_fields, dim=0))
+            field_bank = torch.stack(depth_fields, dim=0).detach()
+            if field_bank.shape[1] != bands:
+                raise RuntimeError(
+                    "Baek-native spherical source wavelength count changed "
+                    f"during construction: expected {bands}, got "
+                    f"{field_bank.shape[1]}"
+                )
             self._cached_prop1_field_bank = field_bank
             self._cached_prop1_field_key = cache_key
             return field_bank
