@@ -8,10 +8,16 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-psfconv_baek_fixed_doe_frozen_stageA_20ep}"
 MAX_EPOCHS="${MAX_EPOCHS:-20}"
 DOE_HEIGHT="${DOE_HEIGHT:-${REPO_ROOT}/e2e_HSD_learned_DOE_and_PSF_simulation/e2e_HSD_doe_height.pth}"
 DATA_ROOT="${REPO_ROOT}/Baek数据集"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/论文实验/PSF卷积/${EXPERIMENT_NAME}}"
-CONSOLE_LOG="${CONSOLE_LOG:-${REPO_ROOT}/论文实验/PSF卷积/pipeline_logs/${EXPERIMENT_NAME}.log}"
+EXPERIMENT_BASE="${EXPERIMENT_BASE:-${REPO_ROOT}/论文实验/PSF卷积/baek_psf}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${EXPERIMENT_BASE}/${EXPERIMENT_NAME}}"
+CONSOLE_LOG="${CONSOLE_LOG:-${EXPERIMENT_BASE}/pipeline_logs/${EXPERIMENT_NAME}.log}"
 TRAIN_INDEX="${DATA_ROOT}/.patch_index/train_patch128_halo64_scene01_13_blockval10_nooverlap_depthbalanced16_v2.npz"
 VAL_INDEX="${DATA_ROOT}/.patch_index/val_patch128_stride32_valid20_range000_center10_foreground_scene01_13_seed123_block5x5_val10_v1.npz"
+RUN_INFERENCE="${RUN_INFERENCE:-1}"
+INFERENCE_GPUS="${INFERENCE_GPUS:-${CUDA_DEVICES}}"
+INFERENCE_SCENES="${INFERENCE_SCENES:-14,15,16,17,18}"
+INFERENCE_CHECKPOINT_KIND="${INFERENCE_CHECKPOINT_KIND:-hs-best}"
+INFERENCE_LOG_DIR="${INFERENCE_LOG_DIR:-${EXPERIMENT_BASE}/pipeline_logs/${EXPERIMENT_NAME}_inference}"
 
 for required_file in \
   "${PYTHON_BIN}" \
@@ -23,6 +29,22 @@ for required_file in \
     exit 1
   fi
 done
+
+if [[ "${RUN_INFERENCE}" != "0" && "${RUN_INFERENCE}" != "1" ]]; then
+  echo "RUN_INFERENCE must be 0 or 1, got: ${RUN_INFERENCE}" >&2
+  exit 2
+fi
+if [[ "${RUN_INFERENCE}" == "1" && ! -f "${REPO_ROOT}/infer_contect.py" ]]; then
+  echo "Inference program not found: ${REPO_ROOT}/infer_contect.py" >&2
+  exit 1
+fi
+case "${INFERENCE_CHECKPOINT_KIND}" in
+  hs-best|joint-best|depth-best) ;;
+  *)
+    echo "INFERENCE_CHECKPOINT_KIND must be hs-best, joint-best, or depth-best; got: ${INFERENCE_CHECKPOINT_KIND}" >&2
+    exit 2
+    ;;
+esac
 
 if [[ -e "${OUTPUT_ROOT}/artifacts/command.txt" ]]; then
   echo "Experiment already exists: ${OUTPUT_ROOT}" >&2
@@ -156,6 +178,10 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
     "${CUDA_DEVICES}" "${PYTHON_BIN}" "${REPO_ROOT}/snapshotdepth_trainer_hs.py"
   printf ' %q' "${train_args[@]}"
   printf '\n'
+  if [[ "${RUN_INFERENCE}" == "1" ]]; then
+    echo "# Automatic inference after successful training:"
+    echo "# checkpoint=${INFERENCE_CHECKPOINT_KIND}, GPUs=${INFERENCE_GPUS}, scenes=${INFERENCE_SCENES}"
+  fi
   exit 0
 fi
 
@@ -167,3 +193,91 @@ echo "Output: ${OUTPUT_ROOT}"
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" \
   "${PYTHON_BIN}" snapshotdepth_trainer_hs.py "${train_args[@]}" \
   2>&1 | tee "${CONSOLE_LOG}"
+
+if [[ "${RUN_INFERENCE}" == "0" ]]; then
+  echo "Automatic inference disabled (RUN_INFERENCE=0)."
+  exit 0
+fi
+
+CHECKPOINT_DIR="${OUTPUT_ROOT}/artifacts/checkpoints"
+BEST_CHECKPOINT="$({
+  find "${CHECKPOINT_DIR}" -maxdepth 1 -type f \
+    -name "${INFERENCE_CHECKPOINT_KIND}-epoch=*.ckpt" \
+    -printf '%T@ %p\n' 2>/dev/null || true
+} | sort -n | tail -n 1 | cut -d' ' -f2-)"
+if [[ -z "${BEST_CHECKPOINT}" || ! -f "${BEST_CHECKPOINT}" ]]; then
+  echo "Training completed, but no ${INFERENCE_CHECKPOINT_KIND} checkpoint was found in ${CHECKPOINT_DIR}" >&2
+  exit 1
+fi
+
+IFS=',' read -r -a inference_gpu_list <<<"${INFERENCE_GPUS}"
+IFS=',' read -r -a inference_scene_list <<<"${INFERENCE_SCENES}"
+if [[ "${#inference_gpu_list[@]}" -eq 0 || "${#inference_scene_list[@]}" -eq 0 ]]; then
+  echo "INFERENCE_GPUS and INFERENCE_SCENES must not be empty." >&2
+  exit 2
+fi
+
+CHECKPOINT_NAME="$(basename "${BEST_CHECKPOINT}" .ckpt)"
+mkdir -p "${INFERENCE_LOG_DIR}"
+echo "Training completed successfully."
+echo "Automatic inference checkpoint: ${BEST_CHECKPOINT}"
+echo "Inference GPUs: ${INFERENCE_GPUS}; scenes: ${INFERENCE_SCENES}"
+
+run_inference_scene() {
+  local gpu="$1"
+  local scene="$2"
+  local output_dir="${OUTPUT_ROOT}/inference/${CHECKPOINT_NAME}_deploy_${scene}_nonorm_clean"
+
+  if [[ -e "${output_dir}/.inference_complete" || -s "${output_dir}/aggregate_metrics.json" ]]; then
+    echo "[GPU ${gpu}] deploy ${scene} already completed; skipping."
+    return 0
+  fi
+
+  mkdir -p "${output_dir}"
+  echo "[GPU ${gpu}] starting deploy ${scene}: ${output_dir}"
+  CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON_BIN}" "${REPO_ROOT}/infer_contect.py" \
+    --input_folder "${DATA_ROOT}/deploy ${scene}" \
+    --ckpt_path "${BEST_CHECKPOINT}" \
+    --output_dir "${output_dir}" \
+    --patch_size 128 \
+    --stride 64 \
+    --depth_min 0.4 \
+    --depth_max 2.0 \
+    --device cuda \
+    --measurement_norm_override none \
+    --depth_background black
+  touch "${output_dir}/.inference_complete"
+  echo "[GPU ${gpu}] finished deploy ${scene}."
+}
+
+run_inference_worker() {
+  local worker_index="$1"
+  local gpu="${inference_gpu_list[worker_index]}"
+  local scene_index
+  for ((scene_index = worker_index; scene_index < ${#inference_scene_list[@]}; scene_index += ${#inference_gpu_list[@]})); do
+    run_inference_scene "${gpu}" "${inference_scene_list[scene_index]}" || return 1
+  done
+}
+
+declare -a inference_worker_pids=()
+for worker_index in "${!inference_gpu_list[@]}"; do
+  gpu="${inference_gpu_list[worker_index]}"
+  run_inference_worker "${worker_index}" \
+    >"${INFERENCE_LOG_DIR}/gpu${gpu}.log" 2>&1 &
+  inference_worker_pids+=("$!")
+done
+
+inference_status=0
+for worker_index in "${!inference_worker_pids[@]}"; do
+  if ! wait "${inference_worker_pids[worker_index]}"; then
+    echo "Inference worker on GPU ${inference_gpu_list[worker_index]} failed; see ${INFERENCE_LOG_DIR}/gpu${inference_gpu_list[worker_index]}.log" >&2
+    inference_status=1
+  fi
+done
+if [[ "${inference_status}" -ne 0 ]]; then
+  exit "${inference_status}"
+fi
+
+echo "Automatic inference completed successfully."
+echo "Inference outputs: ${OUTPUT_ROOT}/inference"
+echo "Inference logs: ${INFERENCE_LOG_DIR}"
