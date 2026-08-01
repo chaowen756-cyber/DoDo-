@@ -4,8 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_optics.doe import DOELayer, DOEFreeLayer, DOEPixelPhaseLayer
-from torch_optics.propagation import PropagationLayer
+from torch_optics.doe import (
+    DOELayer,
+    DOEFreeLayer,
+    DOEFixedHeightLayer,
+    DOEPixelPhaseLayer,
+)
+from torch_optics.propagation import PadoFresnelPropagationLayer, PropagationLayer
 from torch_optics.sensing import SensingLayer
 
 
@@ -56,8 +61,8 @@ _DEPTH_LAYERING_MODES = {"hard_depth", "hard_meter", "soft_diopter"}
 _IMAGE_FORMATION_MODES = {"whole_field", "psf_convolution"}
 _PSF_LAYER_MASK_MODES = {"current", "baek_hard"}
 _PSF_BOUNDARY_MODES = {"linear_zero", "circular"}
-_PSF_OPTICS_VERSIONS = {"legacy", "consistent_grid_v1"}
-_DOE_PARAMETERIZATIONS = {"zernike", "pixel_phase"}
+_PSF_OPTICS_VERSIONS = {"legacy", "consistent_grid_v1", "doe_native_grid_v1"}
+_DOE_PARAMETERIZATIONS = {"zernike", "pixel_phase", "fixed_height"}
 
 
 def _next_fast_fft_length(target: int) -> int:
@@ -327,6 +332,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
         doe_init_coeff_norm: float = 0.2,
         doe_parameterization: str = "zernike",
         doe_reference_wavelength_m: float = 550e-9,
+        doe_height_path: Optional[str] = None,
+        doe_height_pad_to_size: int = 0,
+        doe_height_resize_mode: str = "area",
         psf_optics_version: str = "legacy",
     ):
         super().__init__()
@@ -345,27 +353,54 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 f"{_DOE_PARAMETERIZATIONS}, got '{doe_parameterization}'"
             )
         self.doe_parameterization = doe_parameterization
-        self.optical_grid_size = 128
-        self.optical_grid_length_m = 0.01
-        if self.psf_optics_version == "consistent_grid_v1":
+        if self.psf_optics_version == "doe_native_grid_v1":
+            # Native sampling used by the supplied Baek e2e_HSD DOE:
+            # 376 samples (375 learned + right/bottom zero pad), 8 um pitch,
+            # followed by 50 mm Fresnel propagation to the sensor.
+            self.optical_grid_size = 376
+            self.optical_grid_length_m = 376 * 8e-6
+            self.sensor_propagation_distance_m = 50e-3
+        else:
+            self.optical_grid_size = 128
+            self.optical_grid_length_m = 0.01
+            self.sensor_propagation_distance_m = 0.01
+        self.uses_full_sensor_grid = self.psf_optics_version in (
+            "consistent_grid_v1",
+            "doe_native_grid_v1",
+        )
+        if self.uses_full_sensor_grid:
             self.sensor_padding_factor = 2
             self.psf_kernel_size = 129
-            self.psf_energy_reference = "full_field"
+            self.psf_energy_reference = (
+                "full_field"
+                if self.psf_optics_version == "consistent_grid_v1"
+                else "crop"
+            )
         else:
             self.sensor_padding_factor = 1
             self.psf_kernel_size = 128
             self.psf_energy_reference = "crop"
-        if self.psf_optics_version == "consistent_grid_v1":
+        if self.uses_full_sensor_grid:
             if not self.skip_prop2:
                 raise ValueError(
-                    "consistent_grid_v1 currently requires skip_prop2=True; "
+                    f"{self.psf_optics_version} currently requires "
+                    "skip_prop2=True; "
                     "the intermediate propagation chain has not been "
                     "validated for this PSF model"
                 )
             if use_second_doe:
                 raise ValueError(
-                    "consistent_grid_v1 currently requires " "use_second_doe=False"
+                    f"{self.psf_optics_version} currently requires "
+                    "use_second_doe=False"
                 )
+        if (
+            self.psf_optics_version == "doe_native_grid_v1"
+            and self.doe_parameterization != "fixed_height"
+        ):
+            raise ValueError(
+                "doe_native_grid_v1 is defined for "
+                "doe_parameterization='fixed_height'"
+            )
         if isinstance(prop1_padding_factor, bool) or not isinstance(
             prop1_padding_factor, int
         ):
@@ -407,12 +442,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 f"image_formation_mode must be one of {_IMAGE_FORMATION_MODES}, "
                 f"got '{image_formation_mode}'"
             )
-        if (
-            self.psf_optics_version == "consistent_grid_v1"
-            and image_formation_mode != "psf_convolution"
-        ):
+        if self.uses_full_sensor_grid and image_formation_mode != "psf_convolution":
             raise ValueError(
-                "consistent_grid_v1 is defined only for "
+                f"{self.psf_optics_version} is defined only for "
                 "image_formation_mode='psf_convolution'"
             )
         psf_layer_mask_mode = psf_layer_mask_mode.lower()
@@ -427,12 +459,9 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 f"psf_boundary_mode must be one of {_PSF_BOUNDARY_MODES}, "
                 f"got '{psf_boundary_mode}'"
             )
-        if (
-            self.psf_optics_version == "consistent_grid_v1"
-            and psf_boundary_mode != "linear_zero"
-        ):
+        if self.uses_full_sensor_grid and psf_boundary_mode != "linear_zero":
             raise ValueError(
-                "consistent_grid_v1 requires "
+                f"{self.psf_optics_version} requires "
                 "psf_boundary_mode='linear_zero': its centered 129x129 PSF "
                 "must not be truncated to the 128x128 scene FFT grid"
             )
@@ -499,8 +528,8 @@ class DepthAwareDoDoForwardModel(nn.Module):
             persistent=False,
         )
 
-        mss = 128
-        minput = 128
+        mss = self.optical_grid_size
+        minput = self.optical_grid_size
 
         # Compute bin edges and centers
         edges = torch.linspace(depth_min, depth_max, num_depth_layers + 1)
@@ -533,14 +562,38 @@ class DepthAwareDoDoForwardModel(nn.Module):
             ]
         )
 
-        if self.doe_parameterization == "pixel_phase":
+        if self.doe_parameterization == "fixed_height":
+            if not doe_height_path:
+                raise ValueError(
+                    "doe_height_path is required when "
+                    "doe_parameterization='fixed_height'"
+                )
+            if train_c:
+                raise ValueError(
+                    "fixed_height DOE is frozen; construct it with train_c=False"
+                )
+            self.doe1 = DOEFixedHeightLayer(
+                heightmap_path=doe_height_path,
+                Mdoe=mss,
+                Mesce=minput,
+                assets_dir=assets_dir,
+                use_pupil_mask=self.uses_full_sensor_grid,
+                source_pad_to_size=doe_height_pad_to_size,
+                resize_mode=doe_height_resize_mode,
+                pupil_convention=(
+                    "pado_integer_centered"
+                    if self.psf_optics_version == "doe_native_grid_v1"
+                    else "legacy_pixel_centered"
+                ),
+            )
+        elif self.doe_parameterization == "pixel_phase":
             self.doe1 = DOEPixelPhaseLayer(
                 Mdoe=mss,
                 Mesce=minput,
                 trainable=train_c,
                 assets_dir=assets_dir,
                 reference_wavelength_m=doe_reference_wavelength_m,
-                use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
+                use_pupil_mask=self.uses_full_sensor_grid,
             )
         elif free:
             self.doe1 = DOEFreeLayer(
@@ -552,7 +605,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 assets_dir=assets_dir,
                 basis_path=zernike_basis_path,
                 phase_scale_mode="legacy_free",
-                use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
+                use_pupil_mask=self.uses_full_sensor_grid,
             )
         else:
             self.doe1 = DOELayer(
@@ -562,7 +615,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
                 trainable=train_c,
                 assets_dir=assets_dir,
                 phase_scale_mode="legacy_doe",
-                use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
+                use_pupil_mask=self.uses_full_sensor_grid,
                 basis_mode=doe_basis_mode,
                 basis_rank=doe_basis_rank,
                 basis_rank_rtol=doe_basis_rank_rtol,
@@ -573,12 +626,12 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
         intermediate_length = (
             self.optical_grid_length_m
-            if self.psf_optics_version == "consistent_grid_v1"
+            if self.uses_full_sensor_grid
             else 0.006
         )
         sensor_length = (
             self.optical_grid_length_m
-            if self.psf_optics_version == "consistent_grid_v1"
+            if self.uses_full_sensor_grid
             else 0.0048
         )
         self.prop2 = PropagationLayer(
@@ -594,15 +647,22 @@ class DepthAwareDoDoForwardModel(nn.Module):
             trainable=False,
             assets_dir=assets_dir,
             phase_scale_mode="legacy_doe",
-            use_pupil_mask=(self.psf_optics_version == "consistent_grid_v1"),
+            use_pupil_mask=self.uses_full_sensor_grid,
         )
-        self.prop3 = PropagationLayer(
-            Mp=mss,
-            L=sensor_length,
-            zi=0.01,
-            trainable_z=False,
-            padding_factor=self.sensor_padding_factor,
-        )
+        if self.psf_optics_version == "doe_native_grid_v1":
+            self.prop3 = PadoFresnelPropagationLayer(
+                Mp=mss,
+                L=sensor_length,
+                zi=self.sensor_propagation_distance_m,
+            )
+        else:
+            self.prop3 = PropagationLayer(
+                Mp=mss,
+                L=sensor_length,
+                zi=self.sensor_propagation_distance_m,
+                trainable_z=False,
+                padding_factor=self.sensor_padding_factor,
+            )
         self.sensing_unnorm = SensingLayer(
             Ms=mss,
             assets_dir=assets_dir,
@@ -611,7 +671,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
             measurement_channels=measurement_channels,
             sensor_measurement=sensor_measurement,
         )
-        if self.psf_optics_version == "consistent_grid_v1":
+        if self.uses_full_sensor_grid:
             self._assert_consistent_optical_sampling()
         # Frozen-optics inference/Stage-B training can reuse this bank.  It is
         # intentionally a plain attribute, not a persistent buffer, so the new
@@ -628,7 +688,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
     def _assert_consistent_optical_sampling(self):
         """Verify that every represented plane uses one physical sample pitch."""
-        if self.psf_optics_version != "consistent_grid_v1":
+        if not self.uses_full_sensor_grid:
             return
 
         expected_size = self.optical_grid_size
@@ -642,44 +702,54 @@ class DepthAwareDoDoForwardModel(nn.Module):
         for layer in propagation_layers:
             if layer.Mp != expected_size:
                 raise ValueError(
-                    "consistent_grid_v1 requires every propagation plane to "
+                    f"{self.psf_optics_version} requires every propagation plane to "
                     f"use Mp={expected_size}, got {layer.Mp}"
                 )
             pitch = layer.L / layer.Mp
             if abs(pitch - expected_pitch) > 1e-12:
                 raise ValueError(
-                    "consistent_grid_v1 requires equal sampling pitch across "
+                    f"{self.psf_optics_version} requires equal sampling pitch across "
                     f"all planes: expected {expected_pitch:g}m, got {pitch:g}m"
                 )
 
-        for name, doe in (("doe1", self.doe1), ("doe2", self.doe2)):
+        active_does = [("doe1", self.doe1)]
+        if self.use_second_doe:
+            active_does.append(("doe2", self.doe2))
+        for name, doe in active_does:
             if doe.Mesce != expected_size or doe.Mdoe != expected_size:
                 raise ValueError(
-                    "consistent_grid_v1 requires the DOE sampling grid to "
+                    f"{self.psf_optics_version} requires the DOE sampling grid to "
                     f"remain {expected_size}x{expected_size}; {name} has "
                     f"Mesce={doe.Mesce}, Mdoe={doe.Mdoe}"
                 )
             if not doe.use_pupil_mask:
                 raise ValueError(
-                    f"consistent_grid_v1 requires {name} to apply its pupil "
+                    f"{self.psf_optics_version} requires {name} to apply its pupil "
                     "as an amplitude-domain validity mask"
                 )
 
         if self.prop3.padding_factor != 2:
-            raise ValueError("consistent_grid_v1 requires Prop3 padding_factor=2")
-        if self.prop3.work_Mp != 256 or abs(self.prop3.work_L - 0.02) > 1e-12:
             raise ValueError(
-                "consistent_grid_v1 requires the Prop3 work grid to be "
-                "256x256 over 0.02m"
+                f"{self.psf_optics_version} requires Prop3 padding_factor=2"
+            )
+        if (
+            self.prop3.work_Mp != 2 * expected_size
+            or abs(self.prop3.work_L - 2 * expected_length) > 1e-12
+        ):
+            raise ValueError(
+                f"{self.psf_optics_version} requires the Prop3 work grid to be "
+                f"{2 * expected_size}x{2 * expected_size} over "
+                f"{2 * expected_length:g}m"
             )
         if self.psf_kernel_size != 129:
             raise ValueError(
-                "consistent_grid_v1 requires a centered 129x129 PSF kernel"
+                f"{self.psf_optics_version} requires a centered 129x129 PSF kernel"
             )
 
     def _psf_config_signature(self):
         return (
             self.psf_optics_version,
+            self.doe_parameterization,
             self.optical_grid_size,
             self.optical_grid_length_m,
             self.sensor_padding_factor,
@@ -705,7 +775,7 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
     @property
     def psf_capture_fraction(self) -> Optional[torch.Tensor]:
-        """Energy fraction retained by the latest consistent-grid PSF crop."""
+        """Energy fraction retained by the latest finite PSF center crop."""
         return self._last_psf_capture_fraction
 
     def clamp_parameters_(self):
@@ -1011,6 +1081,36 @@ class DepthAwareDoDoForwardModel(nn.Module):
             return self._cached_prop1_field_bank
 
         bands = int(self.prop3.wave_lengths.numel())
+        if self.psf_optics_version == "doe_native_grid_v1":
+            # Match PADO Light.set_spherical_light exactly. Baek's learned DOE
+            # was illuminated directly at the DOE plane; propagating a sampled
+            # scene-plane impulse here would introduce a different discrete
+            # source model before the transplanted height map.
+            coordinates = torch.arange(
+                -height // 2,
+                height // 2,
+                device=device,
+                dtype=torch.float32,
+            ) * (self.optical_grid_length_m / self.optical_grid_size)
+            yy, xx = torch.meshgrid(coordinates, coordinates, indexing="ij")
+            radial_squared = xx.square() + yy.square()
+            depths = self.z_centers.to(device=device, dtype=torch.float32)
+            radii = torch.sqrt(
+                radial_squared[None] + depths[:, None, None].square()
+            )
+            wavelengths = self.prop3.wave_lengths.to(
+                device=device, dtype=torch.float32
+            )
+            phase = torch.remainder(
+                (2.0 * torch.pi * radii[:, None])
+                / wavelengths[None, :, None, None],
+                2.0 * torch.pi,
+            )
+            field_bank = torch.exp(1j * phase.to(torch.complex64)).detach()
+            self._cached_prop1_field_bank = field_bank
+            self._cached_prop1_field_key = cache_key
+            return field_bank
+
         impulse = torch.zeros(
             (1, bands, height, width),
             device=device,
@@ -1071,7 +1171,30 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # Depth is represented as the batch dimension, so DOE phase generation
         # and all downstream propagations execute once as batched operations.
         prop1_fields = self._prop1_impulse_field_bank(height, width, device)
-        if self.psf_optics_version == "consistent_grid_v1":
+        if self.psf_optics_version == "doe_native_grid_v1":
+            self._assert_consistent_optical_sampling()
+            sensor_field = self._propagate_after_prop1(prop1_fields)
+            full_intensity = torch.abs(sensor_field).to(torch.float32).square()
+            normalized_full = full_intensity / full_intensity.sum(
+                dim=(-2, -1), keepdim=True
+            ).clamp_min(1e-8)
+            full_height, full_width = normalized_full.shape[-2:]
+            half_kernel = self.psf_kernel_size // 2
+            crop_top = full_height // 2 - half_kernel
+            crop_left = full_width // 2 - half_kernel
+            psf_bank = normalized_full[
+                ...,
+                crop_top : crop_top + self.psf_kernel_size,
+                crop_left : crop_left + self.psf_kernel_size,
+            ]
+            self._last_psf_capture_fraction = psf_bank.detach().sum(dim=(-2, -1))
+            # The notebook consumes a finite center crop. For convolution in
+            # this repository, calibrate that finite kernel to unit throughput
+            # while retaining the pre-calibration fraction for diagnostics.
+            psf_bank = psf_bank / psf_bank.sum(
+                dim=(-2, -1), keepdim=True
+            ).clamp_min(1e-8)
+        elif self.uses_full_sensor_grid:
             self._assert_consistent_optical_sampling()
             sensor_field = self._propagate_after_prop1(
                 prop1_fields,
@@ -1124,12 +1247,14 @@ class DepthAwareDoDoForwardModel(nn.Module):
 
     def psf_bank(
         self,
-        spatial_size: Tuple[int, int] = (128, 128),
+        spatial_size: Optional[Tuple[int, int]] = None,
         device: Optional[torch.device] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         if device is None:
             device = self.z_centers.device
+        if spatial_size is None:
+            spatial_size = (self.optical_grid_size, self.optical_grid_size)
         return self._generate_psf_bank(
             int(spatial_size[0]),
             int(spatial_size[1]),
@@ -1296,10 +1421,10 @@ class DepthAwareDoDoForwardModel(nn.Module):
         # incoherent intensity model: spectral radiance is convolved directly
         # with normalized intensity PSFs. Do not apply the field-amplitude
         # square root here.
-        # The optical input grid remains 128x128. Legacy mode also returns a
-        # 128x128 kernel, whereas consistent_grid_v1 retains a centered
-        # 129x129 kernel from its complete padded sensor field. Scene tiles may
-        # be larger (for example, a 256x256 tile with a 64-pixel halo).
+        # PSF generation uses its own physical grid (128x128 for historical
+        # modes, 376x376 for the Baek-native mode), independent of the scene
+        # tile size. The resulting kernel is then convolved over scene tiles,
+        # which may be larger (for example 256x256 with a 64-pixel halo).
         optical_input_size = int(self.prop1_layers[0].Mp)
         psf_bank = self._generate_psf_bank(
             optical_input_size,

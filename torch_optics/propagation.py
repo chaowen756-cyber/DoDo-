@@ -218,3 +218,152 @@ class PropagationLayer(nn.Module):
             spectrum * torch.conj(self._kernel(x.device)), dim=(-2, -1)
         )
         return self._crop_from_work_grid(backpropagated, crop_offset)
+
+
+class PadoFresnelPropagationLayer(nn.Module):
+    """PADO-compatible spatial-domain Fresnel linear convolution.
+
+    This layer intentionally mirrors the discretization used by PADO's
+    ``Propagator('Fresnel')`` with ``linear=True``: the input is symmetrically
+    zero-padded to twice its native size, convolved with a sampled positive-
+    phase Fresnel impulse response, and cropped back to the native grid.
+    It is kept separate from :class:`PropagationLayer` so existing optical
+    forward modes retain their historical transfer-function semantics.
+    """
+
+    def __init__(
+        self,
+        Mp: int,
+        L: float,
+        zi: float,
+        wave_lengths: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.Mp = int(Mp)
+        self.L = float(L)
+        if self.Mp < 1 or self.L <= 0.0:
+            raise ValueError("Mp and L must be positive")
+        if self.Mp % 2 != 0:
+            raise ValueError("PADO-compatible linear padding requires even Mp")
+        self.padding_factor = 2
+        self.work_Mp = 2 * self.Mp
+        self.work_L = 2.0 * self.L
+
+        if wave_lengths is None:
+            wave_lengths = torch.from_numpy(
+                np.linspace(420, 660, 25).astype(np.float32) * 1e-9
+            )
+        else:
+            wave_lengths = torch.as_tensor(wave_lengths, dtype=torch.float32)
+        self.register_buffer("wave_lengths", wave_lengths)
+        self.register_buffer("z", torch.tensor([float(zi)], dtype=torch.float32))
+        self._fixed_kernel_fft_cache: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _fft2(x: torch.Tensor) -> torch.Tensor:
+        shifted = torch.fft.ifftshift(x, dim=(-2, -1))
+        return torch.fft.fftshift(
+            torch.fft.fft2(shifted, dim=(-2, -1)), dim=(-2, -1)
+        )
+
+    @staticmethod
+    def _ifft2(x: torch.Tensor) -> torch.Tensor:
+        shifted = torch.fft.ifftshift(x, dim=(-2, -1))
+        return torch.fft.fftshift(
+            torch.fft.ifft2(shifted, dim=(-2, -1)), dim=(-2, -1)
+        )
+
+    def _build_kernel_fft(self, device: torch.device) -> torch.Tensor:
+        pitch = self.L / self.Mp
+        coordinates = torch.arange(
+            -self.Mp,
+            self.Mp,
+            device=device,
+            dtype=torch.float32,
+        )
+        yy, xx = torch.meshgrid(coordinates, coordinates, indexing="ij")
+        radius_squared = (xx * pitch).square() + (yy * pitch).square()
+        wavelengths = self.wave_lengths.to(device=device, dtype=torch.float32)
+        z = self.z.to(device=device, dtype=torch.float32).clamp_min(0.0)
+        if not bool(torch.all(z > 0.0)):
+            raise ValueError("PADO Fresnel propagation distance must be positive")
+
+        phase = (
+            (2.0 * m.pi / wavelengths[:, None, None])
+            * radius_squared[None]
+            / (2.0 * z)
+        )
+        # PADO wraps to [-pi, pi] before taking the complex exponential.
+        phase = torch.remainder(phase, 2.0 * m.pi)
+        phase = torch.where(phase > m.pi, phase - 2.0 * m.pi, phase)
+        amplitude = torch.ones_like(phase) / z / wavelengths[:, None, None]
+        kernel = amplitude.to(torch.complex64) * torch.exp(
+            1j * phase.to(torch.complex64)
+        )
+        kernel = kernel / kernel.abs().sum(dim=(-2, -1), keepdim=True)
+        return self._fft2(kernel).unsqueeze(0)
+
+    def _kernel_fft(self, device: torch.device) -> torch.Tensor:
+        expected = (
+            1,
+            int(self.wave_lengths.numel()),
+            self.work_Mp,
+            self.work_Mp,
+        )
+        cached = self._fixed_kernel_fft_cache
+        if cached is None or cached.device != device or tuple(cached.shape) != expected:
+            self._fixed_kernel_fft_cache = self._build_kernel_fft(device).detach()
+        return self._fixed_kernel_fft_cache
+
+    def _apply(self, fn):
+        self._fixed_kernel_fft_cache = None
+        return super()._apply(fn)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self._fixed_kernel_fft_cache = None
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def _validate(self, x: torch.Tensor) -> None:
+        if x.ndim != 4:
+            raise ValueError(
+                "PadoFresnelPropagationLayer expects [B,C,H,W], "
+                f"got {tuple(x.shape)}"
+            )
+        if x.shape[-2:] != (self.Mp, self.Mp):
+            raise ValueError(
+                f"Expected spatial size {self.Mp}x{self.Mp}, "
+                f"got {tuple(x.shape[-2:])}"
+            )
+        if x.shape[1] != int(self.wave_lengths.numel()):
+            raise ValueError(
+                f"Expected {self.wave_lengths.numel()} wavelengths, "
+                f"got {x.shape[1]}"
+            )
+
+    def forward_work_grid(self, x: torch.Tensor) -> torch.Tensor:
+        self._validate(x)
+        half = self.Mp // 2
+        padded = F.pad(x.to(torch.complex64), (half, half, half, half))
+        return self._ifft2(self._fft2(padded) * self._kernel_fft(x.device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = self.forward_work_grid(x)
+        half = self.Mp // 2
+        return output[..., half:-half, half:-half]

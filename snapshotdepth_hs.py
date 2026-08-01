@@ -1121,6 +1121,14 @@ class SnapshotDepthHS(pl.LightningModule):
                 raise ValueError(f'dodo_depth_layers must be >= 1, got {n_depth_layers}')
             use_second_doe = getattr(hparams, 'dodo_use_second_doe', False)
             dodo_doe_type = getattr(hparams, 'dodo_doe_type', 'Zeros')
+            dodo_doe_parameterization = str(getattr(
+                hparams, 'dodo_doe_parameterization', 'zernike')).lower()
+            dodo_doe_height_path = str(getattr(
+                hparams, 'dodo_doe_height_path', '') or '')
+            dodo_doe_height_pad_to_size = int(getattr(
+                hparams, 'dodo_doe_height_pad_to_size', 0))
+            dodo_doe_height_resize_mode = str(getattr(
+                hparams, 'dodo_doe_height_resize_mode', 'area')).lower()
             dodo_zernike_mode = getattr(hparams, 'dodo_zernike_mode', 'legacy12')
             dodo_zernike_terms = int(getattr(hparams, 'dodo_zernike_terms', 150))
             dodo_zernike_basis_path = getattr(
@@ -1137,6 +1145,31 @@ class SnapshotDepthHS(pl.LightningModule):
                 getattr(hparams, 'dodo_doe_coeff_norm_limit', 1.0))
             dodo_doe_init_coeff_norm = float(
                 getattr(hparams, 'dodo_doe_init_coeff_norm', 0.2))
+            if dodo_doe_parameterization not in (
+                    'zernike', 'pixel_phase', 'fixed_height'):
+                raise ValueError(
+                    'dodo_doe_parameterization must be zernike, pixel_phase, '
+                    f'or fixed_height, got {dodo_doe_parameterization!r}')
+            if dodo_doe_height_pad_to_size < 0:
+                raise ValueError('dodo_doe_height_pad_to_size must be >= 0')
+            if dodo_doe_height_resize_mode not in (
+                    'area', 'bilinear', 'bicubic'):
+                raise ValueError(
+                    'dodo_doe_height_resize_mode must be area, bilinear, or '
+                    f'bicubic, got {dodo_doe_height_resize_mode!r}')
+            if dodo_doe_parameterization == 'fixed_height':
+                if not dodo_doe_height_path:
+                    raise ValueError(
+                        '--dodo_doe_height_path is required for '
+                        '--dodo_doe_parameterization fixed_height')
+                if hparams.optimize_optics:
+                    raise ValueError(
+                        'fixed_height DOE must remain frozen; use '
+                        '--no-optimize_optics')
+            elif dodo_doe_height_path:
+                raise ValueError(
+                    '--dodo_doe_height_path is only valid with '
+                    '--dodo_doe_parameterization fixed_height')
             if dodo_zernike_mode not in ('legacy12', 'free'):
                 raise ValueError(
                     'dodo_zernike_mode must be legacy12 or free, got '
@@ -1145,7 +1178,8 @@ class SnapshotDepthHS(pl.LightningModule):
                 raise ValueError(
                     'dodo_doe_basis_mode must be legacy_raw12 or '
                     f'orthogonal_rms, got {dodo_doe_basis_mode!r}')
-            if (dodo_zernike_mode == 'free'
+            if (dodo_doe_parameterization == 'zernike'
+                    and dodo_zernike_mode == 'free'
                     and dodo_doe_basis_mode != 'legacy_raw12'):
                 raise ValueError(
                     'orthogonal_rms applies only to '
@@ -1153,11 +1187,16 @@ class SnapshotDepthHS(pl.LightningModule):
             if dodo_zernike_terms < 1:
                 raise ValueError(
                     f'dodo_zernike_terms must be >= 1, got {dodo_zernike_terms}')
-            if dodo_zernike_basis_path and dodo_zernike_mode != 'free':
+            if (dodo_zernike_basis_path
+                    and (dodo_doe_parameterization != 'zernike'
+                         or dodo_zernike_mode != 'free')):
                 raise ValueError(
-                    'dodo_zernike_basis_path is only valid when '
-                    '--dodo_zernike_mode free is selected')
-            dodo_use_free_zernike = dodo_zernike_mode == 'free'
+                    'dodo_zernike_basis_path is only valid for '
+                    '--dodo_doe_parameterization zernike '
+                    '--dodo_zernike_mode free')
+            dodo_use_free_zernike = (
+                dodo_doe_parameterization == 'zernike'
+                and dodo_zernike_mode == 'free')
             dodo_forward_norm = getattr(hparams, 'dodo_forward_norm', 'legacy_max')
             dodo_forward_scale = float(getattr(hparams, 'dodo_forward_scale', 1.0))
             dodo_sensing_mode = getattr(hparams, 'dodo_sensing_mode', 'rgb')
@@ -1381,6 +1420,10 @@ class SnapshotDepthHS(pl.LightningModule):
                 doe_basis_rms_m=dodo_doe_basis_rms_m,
                 doe_coeff_norm_limit=dodo_doe_coeff_norm_limit,
                 doe_init_coeff_norm=dodo_doe_init_coeff_norm,
+                doe_parameterization=dodo_doe_parameterization,
+                doe_height_path=dodo_doe_height_path or None,
+                doe_height_pad_to_size=dodo_doe_height_pad_to_size,
+                doe_height_resize_mode=dodo_doe_height_resize_mode,
                 psf_optics_version=dodo_psf_optics_version,
             )
             if hasattr(self.camera.doe1, 'coefficient_limit'):
@@ -1390,8 +1433,22 @@ class SnapshotDepthHS(pl.LightningModule):
                 setattr(
                     self.camera.doe1, 'coefficient_limit',
                     dodo_zernike_coefficient_limit)
-            if dodo_use_free_zernike:
+            if dodo_doe_parameterization == 'fixed_height':
+                fixed_height = self.camera.doe1.heightmap().detach()
+                dodo_basis_summary = (
+                    f'doe_height_path={self.camera.doe1.heightmap_path}, '
+                    f'doe_height_source_shape={self.camera.doe1.source_shape}, '
+                    f'doe_height_pad_to_size={dodo_doe_height_pad_to_size}, '
+                    f'doe_height_resize_mode={dodo_doe_height_resize_mode}, '
+                    f'doe_height_range=['
+                    f'{float(fixed_height.min()):.6g},'
+                    f'{float(fixed_height.max()):.6g}]m, '
+                )
+                dodo_term_summary = 'zernike_terms=n/a, '
+            elif dodo_use_free_zernike:
                 dodo_basis_summary = 'doe_basis_mode=n/a(free), '
+                dodo_term_summary = (
+                    f'zernike_terms={self.camera.doe1.zernike_basis.shape[0]}, ')
             else:
                 dodo_basis_summary = (
                     f'doe_basis_mode={dodo_doe_basis_mode}, '
@@ -1400,9 +1457,16 @@ class SnapshotDepthHS(pl.LightningModule):
                     f'doe_coeff_norm_limit={dodo_doe_coeff_norm_limit:g}, '
                     f'doe_init_coeff_norm={dodo_doe_init_coeff_norm:g}, '
                 )
+                dodo_term_summary = (
+                    f'zernike_terms={self.camera.doe1.zernike_basis.shape[0]}, ')
+            doe_parameter = getattr(self.camera.doe1, 'zernike_coeffs', None)
+            doe_requires_grad = bool(
+                isinstance(doe_parameter, nn.Parameter)
+                and doe_parameter.requires_grad)
             print(f'[dodo_depth] doe_type_a={dodo_doe_type}, train_c={hparams.optimize_optics}, '
+                  f'doe_parameterization={dodo_doe_parameterization}, '
                   f'zernike_mode={dodo_zernike_mode}, '
-                  f'zernike_terms={self.camera.doe1.zernike_basis.shape[0]}, '
+                  f'{dodo_term_summary}'
                   f'zernike_basis={dodo_zernike_basis_path or "auto"}, '
                   f'{dodo_basis_summary}'
                   f'forward_norm={dodo_forward_norm}, '
@@ -1454,7 +1518,7 @@ class SnapshotDepthHS(pl.LightningModule):
                   f'sensor_measurement={dodo_sensor_measurement}, '
                   f'sensing={dodo_sensing_mode} ch={int(hparams.measurement_channels)}, '
                   f'doe1.zernike_coeffs.requires_grad='
-                  f'{self.camera.doe1.zernike_coeffs.requires_grad}')
+                  f'{doe_requires_grad}')
             # measurement_channels = 3 (RGB sensing output)
             if not hasattr(hparams, 'measurement_channels') or hparams.measurement_channels is None:
                 hparams.measurement_channels = 3
@@ -2566,11 +2630,12 @@ class SnapshotDepthHS(pl.LightningModule):
             '--dodo_psf_optics_version',
             type=str,
             default='legacy',
-            choices=['legacy', 'consistent_grid_v1'],
+            choices=['legacy', 'consistent_grid_v1', 'doe_native_grid_v1'],
             help=(
                 'PSF 光学离散化版本；legacy 保持旧 checkpoint 语义，'
                 'consistent_grid_v1 使用统一采样、完整传感器工作网格'
-                '与中心 129x129 PSF'
+                '与中心 129x129 PSF；doe_native_grid_v1 使用 Baek DOE 的'
+                '376x376、8um 原生采样和 50mm 传感器距离'
             ),
         )
         parser.add_argument('--dodo_psf_layer_mask', type=str, default='baek_hard',
@@ -2592,6 +2657,37 @@ class SnapshotDepthHS(pl.LightningModule):
         )
         parser.add_argument('--dodo_doe_type', type=str, default='Zeros',
                             help='DoDo DOE 类型（Zeros=frozen, New=trainable Zernike）')
+        parser.add_argument(
+            '--dodo_doe_parameterization',
+            type=str,
+            default='zernike',
+            choices=['zernike', 'pixel_phase', 'fixed_height'],
+            help=(
+                'DOE representation. fixed_height loads a physical height '
+                'map in metres and requires --no-optimize_optics.'),
+        )
+        parser.add_argument(
+            '--dodo_doe_height_path',
+            type=str,
+            default='',
+            help='PyTorch tensor artifact used by fixed_height DOE mode.',
+        )
+        parser.add_argument(
+            '--dodo_doe_height_pad_to_size',
+            type=int,
+            default=0,
+            help=(
+                'Optional source grid size reached by zero-padding only the '
+                'right/bottom edges before DOE-grid resampling; 376 matches '
+                'the Baek 375x375 notebook convention.'),
+        )
+        parser.add_argument(
+            '--dodo_doe_height_resize_mode',
+            type=str,
+            default='area',
+            choices=['area', 'bilinear', 'bicubic'],
+            help='Spatial resampling used to map an external height to the active DOE grid.',
+        )
         parser.add_argument('--dodo_zernike_mode', type=str, default='legacy12',
                             choices=['legacy12', 'free'],
                             help='Zernike basis: legacy12 loads the original 12-term MAT; '

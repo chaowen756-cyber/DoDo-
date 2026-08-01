@@ -4,12 +4,13 @@ import types
 import pytest
 import torch
 
-from torch_optics.doe import DOELayer, DOEFreeLayer
+from torch_optics.doe import DOELayer, DOEFreeLayer, DOEFixedHeightLayer
 from torch_optics.forward_dodo import (
     DepthAwareDoDoForwardModel,
     Forward_DM_Spiral_Depth,
     _next_fast_fft_length,
 )
+from torch_optics.propagation import PadoFresnelPropagationLayer
 from util.psf_regularization import psf_energy_concentration_loss
 from util.psf_regularization import sensor_weighted_spectral_psf_separation_loss
 
@@ -36,6 +37,10 @@ def _make_model(
     doe_basis_rms_m=3e-6,
     doe_coeff_norm_limit=1.0,
     doe_init_coeff_norm=1.0,
+    doe_parameterization="zernike",
+    doe_height_path=None,
+    doe_height_pad_to_size=0,
+    doe_height_resize_mode="area",
     psf_optics_version="legacy",
 ):
     return DepthAwareDoDoForwardModel(
@@ -69,6 +74,10 @@ def _make_model(
         doe_basis_rms_m=doe_basis_rms_m,
         doe_coeff_norm_limit=doe_coeff_norm_limit,
         doe_init_coeff_norm=doe_init_coeff_norm,
+        doe_parameterization=doe_parameterization,
+        doe_height_path=doe_height_path,
+        doe_height_pad_to_size=doe_height_pad_to_size,
+        doe_height_resize_mode=doe_height_resize_mode,
         psf_optics_version=psf_optics_version,
     )
 
@@ -184,6 +193,113 @@ def test_orthogonal_rms_mode_is_used_by_psf_model():
 def test_free_zernike_rejects_legacy12_orthogonal_mode():
     with pytest.raises(ValueError, match="legacy 12-term DOE"):
         _make_model(free=True, doe_basis_mode="orthogonal_rms")
+
+
+def test_fixed_height_doe_reproduces_source_padding_and_is_frozen(tmp_path):
+    source = torch.linspace(0.0, 1.0e-6, 127 * 127).reshape(1, 1, 127, 127)
+    height_path = tmp_path / "height.pth"
+    torch.save(source, height_path)
+
+    doe = DOEFixedHeightLayer(
+        heightmap_path=str(height_path),
+        source_pad_to_size=128,
+        resize_mode="area",
+        use_pupil_mask=True,
+    )
+
+    expected = torch.nn.functional.pad(source[0, 0], (0, 1, 0, 1))
+    assert doe.source_shape == (127, 127)
+    torch.testing.assert_close(doe.heightmap(), expected)
+    assert list(doe.parameters()) == []
+    assert doe.zernike_coeffs is None
+
+
+def test_fixed_height_doe_integrates_with_consistent_psf_forward(tmp_path):
+    source = torch.linspace(0.0, 1.0e-6, 128 * 128).reshape(128, 128)
+    height_path = tmp_path / "height.pth"
+    torch.save(source, height_path)
+
+    model = _make_model(
+        train_c=False,
+        doe_parameterization="fixed_height",
+        doe_height_path=str(height_path),
+        psf_optics_version="consistent_grid_v1",
+    )
+    assert isinstance(model.doe1, DOEFixedHeightLayer)
+    assert model._optics_are_frozen()
+    psf = model.psf_bank(use_cache=False)
+    assert psf.shape == (1, 25, 129, 129)
+    assert torch.isfinite(psf).all()
+    captured = psf.sum(dim=(-2, -1))
+    assert torch.all(captured <= 1.0 + 2e-6)
+    assert torch.all(captured > 0.99)
+
+
+def test_fixed_height_doe_rejects_optical_optimization(tmp_path):
+    height_path = tmp_path / "height.pth"
+    torch.save(torch.zeros(128, 128), height_path)
+
+    with pytest.raises(ValueError, match="fixed_height DOE is frozen"):
+        _make_model(
+            train_c=True,
+            doe_parameterization="fixed_height",
+            doe_height_path=str(height_path),
+        )
+
+
+def test_baek_native_grid_uses_exact_height_and_pado_sampling(tmp_path):
+    source = torch.linspace(0.0, 1.0e-6, 375 * 375).reshape(1, 1, 375, 375)
+    height_path = tmp_path / "baek_height.pth"
+    torch.save(source, height_path)
+
+    model = _make_model(
+        train_c=False,
+        doe_parameterization="fixed_height",
+        doe_height_path=str(height_path),
+        doe_height_pad_to_size=376,
+        psf_optics_version="doe_native_grid_v1",
+    ).eval()
+
+    assert model.optical_grid_size == 376
+    assert model.optical_grid_length_m == pytest.approx(376 * 8e-6)
+    assert model.optical_grid_length_m / model.optical_grid_size == pytest.approx(
+        8e-6
+    )
+    assert isinstance(model.prop3, PadoFresnelPropagationLayer)
+    assert model.prop3.z.item() == pytest.approx(50e-3)
+    assert model.doe1.pupil_convention == "pado_integer_centered"
+    assert model.doe1.spiral_p.sum().item() == 111007
+    expected_height = torch.nn.functional.pad(source[0, 0], (0, 1, 0, 1))
+    torch.testing.assert_close(model.doe1.heightmap(), expected_height)
+
+    field = model._prop1_impulse_field_bank(376, 376, torch.device("cpu"))
+    assert field.shape == (1, 25, 376, 376)
+    coordinate = -188 * 8e-6
+    radius = (2.0 * coordinate**2 + float(model.z_centers[0]) ** 2) ** 0.5
+    expected_corner = torch.exp(
+        1j
+        * torch.remainder(
+            torch.tensor(2.0 * torch.pi * radius / 420e-9),
+            torch.tensor(2.0 * torch.pi),
+        ).to(torch.complex64)
+    )
+    torch.testing.assert_close(field[0, 0, 0, 0], expected_corner, atol=2e-5, rtol=2e-5)
+
+    with torch.no_grad():
+        psf = model.psf_bank(use_cache=False)
+    assert psf.shape == (1, 25, 129, 129)
+    assert torch.isfinite(psf).all()
+    torch.testing.assert_close(
+        psf.sum(dim=(-2, -1)), torch.ones((1, 25)), atol=2e-6, rtol=2e-6
+    )
+    assert torch.all(model.psf_capture_fraction > 0.0)
+    assert torch.all(model.psf_capture_fraction < 1.0)
+    assert list(model.doe1.parameters()) == []
+
+
+def test_baek_native_grid_rejects_nonfixed_doe():
+    with pytest.raises(ValueError, match="defined for doe_parameterization='fixed_height'"):
+        _make_model(psf_optics_version="doe_native_grid_v1")
 
 
 @pytest.fixture(scope="module")

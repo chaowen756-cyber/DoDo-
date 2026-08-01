@@ -6,43 +6,38 @@ User / experiment runner
 
 ## Current Change
 
-Pixel-wise wrapped-phase DOE feasibility experiment
+Baek pretrained fixed-height DOE transfer on native optical sampling.
 
 ## Status
 
-The free-150 Zernike parameterization failed consistently after two 3000-step
-runs. Branch `DOE可编码性预优化实验` now provides a 128x128 pixel-wise
-unwrapped phase variable whose optical forward is always converted to a
-single-period wrapped physical height at 550 nm. Initialization uses the exact
-discrete Prop1/Prop3 operators and their adjoint to focus the approximately
-1 m, 550 nm reference point without external camera parameters.
+Branch `Baek预训练DOE冻结联合训练` loads the Baek 375x375 physical height,
+right/bottom pads it to 376x376 without interpolation, and uses its 8 µm,
+NOA61, PADO spherical-source/circular-aperture/Fresnel, 50 mm convention. The
+DOE and all optics have zero trainable parameters. Real-file 16x25 PSF
+preflight passed.
 
 ## Execute
 
-Run pixelphase seed 123 on GPU 2 and seed 456 on GPU 3 for 1000 steps with
-Adam lr 0.1, optical spectral offsets 1/2/4 and the balanced weights in the
-final handoff commands. Use separate output directories.
+Run `bash scripts/run_baek_fixed_doe_joint.sh`. Defaults: physical GPUs 1 and
+3, 12 epochs, frozen optics, joint HS/depth network training. Use `DRY_RUN=1`
+to inspect the expanded command first.
 
 ## Decision
 
-- Compare against the free-150 3000-step ceiling, not only against the new
-  random initialization.
-- Primary success metrics remain optical adjacent/offset-2/offset-4 cosine,
-  task Fisher depth/wavelength CRLB and MTF p10.
-- The exported `best_heightmap_m.npy` is the physical wrapped height actually
-  used by the wideband forward; do not evaluate only the unwrapped phase.
-- If both seeds preserve the strong 200-step improvement, use the better
-  pixelphase checkpoint for the next controlled joint-CNN experiment.
-- If MTF p10 remains near 0.011 despite better coding, treat propagation/sensor
-  sampling—not DOE capacity—as the next bottleneck.
+- Treat native 376x376 as the primary experiment; retain 128x128 area-resampled
+  consistent-grid only as an optional later ablation.
+- Keep halo64/129x129 for the first controlled run. Capture fraction is logged;
+  a larger optical halo is a separate follow-up experiment.
+- Use joint-best by validation loss as the primary result; depth-best and
+  HS-best remain auxiliary ceilings.
 
 ## Required Artifact
 
-- `comparison.json`, `summary.json`, `history.jsonl`
-- `best_doe.pt`, `best_psf_bank.pt`, PSF montage
-- wrapped physical height and unwrapped phase artifacts
+- `artifacts/command.txt`, `hparams.json`, `metrics.json`
+- joint/depth/HS best checkpoints
+- loss history and quicklooks
 
 ## Stop Condition
 
-Stop after the two 1000-step pixelphase runs and inspect both summaries before
-changing the propagation grid or starting joint reconstruction training.
+Stop after the 12-epoch run and compare validation/full-scene metrics before
+changing PSF support, reconstruction architecture, or loss weights.

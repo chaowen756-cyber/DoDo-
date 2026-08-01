@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.io import loadmat
 
 
@@ -46,6 +47,24 @@ def _idlens_from_lambda(lambda_m: torch.Tensor) -> torch.Tensor:
         1.5375 + 0.00829045 * (lambda_um**-2) - 0.000211046 * (lambda_um**-4)
     )
     return refr_index - 1.0
+
+
+def _circular_pupil(size: int) -> torch.Tensor:
+    """Return the pixel-centered circular pupil used by the legacy 128 MAT."""
+    coordinates = torch.arange(size, dtype=torch.float32)
+    yy, xx = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    center = (size - 1.0) / 2.0
+    radius = center
+    return (((xx - center) ** 2 + (yy - center) ** 2) <= radius**2).to(
+        torch.float32
+    )
+
+
+def _pado_circular_pupil(size: int) -> torch.Tensor:
+    """Return PADO's integer-centered full-diameter circular aperture."""
+    coordinates = torch.arange(-size // 2, size // 2, dtype=torch.float32)
+    yy, xx = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    return ((xx.square() + yy.square()) <= (size / 2.0) ** 2).to(torch.float32)
 
 
 def _build_orthogonal_rms_basis(
@@ -538,6 +557,160 @@ class DOEPixelPhaseLayer(_BaseDOE):
         if x.ndim != 4:
             raise ValueError(
                 "DOEPixelPhaseLayer expects 4D tensor [B,C,H,W], "
+                f"got {tuple(x.shape)}"
+            )
+        return self._phase_modulation(x, self._compute_hm(x.device))
+
+
+class DOEFixedHeightLayer(_BaseDOE):
+    """Frozen physical-height DOE loaded from an external PyTorch artifact.
+
+    The source is interpreted directly in metres.  Optional right/bottom
+    zero-padding reproduces the source simulator's grid convention before the
+    height map is resampled onto the active DoDo DOE grid.  Only the DOE height
+    is transplanted; the current material dispersion, pupil, propagation and
+    sensor model remain unchanged.
+    """
+
+    _HEIGHT_KEYS = ("heightmap", "height_map", "height", "doe_height")
+    _RESIZE_MODES = ("area", "bilinear", "bicubic")
+    _PUPIL_CONVENTIONS = ("legacy_pixel_centered", "pado_integer_centered")
+
+    def __init__(
+        self,
+        heightmap_path: str,
+        Mdoe: int = 128,
+        Mesce: int = 128,
+        wave_lengths: Optional[torch.Tensor] = None,
+        assets_dir: str = "torch_optics/assets",
+        use_pupil_mask: bool = False,
+        source_pad_to_size: int = 0,
+        resize_mode: str = "area",
+        pupil_convention: str = "legacy_pixel_centered",
+    ):
+        super().__init__()
+        self.Mdoe = int(Mdoe)
+        self.Mesce = int(Mesce)
+        self.trainable = False
+        self.phase_scale_mode = "legacy_free"
+        self.use_pupil_mask = bool(use_pupil_mask)
+        self.source_pad_to_size = int(source_pad_to_size)
+        self.resize_mode = str(resize_mode).lower()
+        self.pupil_convention = str(pupil_convention).lower()
+        if self.Mdoe < 1 or self.Mesce < 1:
+            raise ValueError("Mdoe and Mesce must be positive")
+        if self.source_pad_to_size < 0:
+            raise ValueError("source_pad_to_size must be >= 0")
+        if self.resize_mode not in self._RESIZE_MODES:
+            raise ValueError(
+                f"resize_mode must be one of {self._RESIZE_MODES}, "
+                f"got '{resize_mode}'"
+            )
+        if self.pupil_convention not in self._PUPIL_CONVENTIONS:
+            raise ValueError(
+                f"pupil_convention must be one of {self._PUPIL_CONVENTIONS}, "
+                f"got '{pupil_convention}'"
+            )
+
+        self.register_buffer("wave_lengths", _build_wave_lengths(wave_lengths))
+        assets = _resolve_assets_dir(assets_dir)
+        spiral_mat = loadmat(assets / "Spiral_128x128_nopadd.mat")
+        spiral_p = np.asarray(spiral_mat["P"], dtype=np.float32)
+        if self.pupil_convention == "pado_integer_centered":
+            pupil = _pado_circular_pupil(self.Mdoe)
+        elif spiral_p.shape == (self.Mdoe, self.Mdoe):
+            pupil = torch.from_numpy(spiral_p)
+        else:
+            pupil = _circular_pupil(self.Mdoe)
+        self.register_buffer("spiral_p", pupil)
+
+        resolved_path = Path(heightmap_path).expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = (Path.cwd() / resolved_path).resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(
+                f"Fixed DOE height-map file does not exist: '{resolved_path}'"
+            )
+        self.heightmap_path = str(resolved_path)
+        source = self._load_height_tensor(resolved_path)
+        self.source_shape = tuple(source.shape)
+        prepared = self._prepare_heightmap(source)
+        self.register_buffer("spiral_hm", prepared)
+        # Keep the historical attribute available for diagnostics without
+        # registering a trainable parameter.
+        self.zernike_coeffs = None
+
+    @classmethod
+    def _load_height_tensor(cls, path: Path) -> torch.Tensor:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        if isinstance(payload, dict):
+            matching = [key for key in cls._HEIGHT_KEYS if key in payload]
+            if len(matching) != 1:
+                raise ValueError(
+                    "Fixed DOE dictionary must contain exactly one of "
+                    f"{cls._HEIGHT_KEYS}; found {matching}"
+                )
+            payload = payload[matching[0]]
+        if not torch.is_tensor(payload):
+            raise TypeError(
+                "Fixed DOE artifact must contain a tensor or a supported "
+                f"height dictionary, got {type(payload).__name__}"
+            )
+        height = payload.detach().to(device="cpu", dtype=torch.float32)
+        while height.ndim > 2 and height.shape[0] == 1:
+            height = height.squeeze(0)
+        if height.ndim != 2:
+            raise ValueError(
+                "Fixed DOE height must reduce to [H,W] after removing leading "
+                f"singleton dimensions, got {tuple(payload.shape)}"
+            )
+        if height.shape[0] < 1 or height.shape[1] < 1:
+            raise ValueError(f"Fixed DOE height is empty: {tuple(height.shape)}")
+        if not torch.isfinite(height).all():
+            raise ValueError("Fixed DOE height contains non-finite values")
+        return height.contiguous()
+
+    def _prepare_heightmap(self, height: torch.Tensor) -> torch.Tensor:
+        if self.source_pad_to_size:
+            pad_h = self.source_pad_to_size - int(height.shape[0])
+            pad_w = self.source_pad_to_size - int(height.shape[1])
+            if pad_h < 0 or pad_w < 0:
+                raise ValueError(
+                    "source_pad_to_size cannot be smaller than the loaded "
+                    f"height map {tuple(height.shape)}, got "
+                    f"{self.source_pad_to_size}"
+                )
+            height = F.pad(height, (0, pad_w, 0, pad_h))
+
+        if height.shape != (self.Mdoe, self.Mdoe):
+            height_4d = height[None, None]
+            if self.resize_mode == "area":
+                height_4d = F.interpolate(
+                    height_4d, size=(self.Mdoe, self.Mdoe), mode="area"
+                )
+            else:
+                height_4d = F.interpolate(
+                    height_4d,
+                    size=(self.Mdoe, self.Mdoe),
+                    mode=self.resize_mode,
+                    align_corners=False,
+                )
+            height = height_4d[0, 0]
+        return height.contiguous()
+
+    def _compute_hm(self, device: torch.device) -> torch.Tensor:
+        return self.spiral_hm.to(device=device, dtype=torch.float32)
+
+    def clamp_parameters_(self):
+        return None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "DOEFixedHeightLayer expects 4D tensor [B,C,H,W], "
                 f"got {tuple(x.shape)}"
             )
         return self._phase_modulation(x, self._compute_hm(x.device))
