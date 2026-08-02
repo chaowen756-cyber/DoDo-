@@ -159,12 +159,12 @@ class SnapshotDepthHS(pl.LightningModule):
             f'protected_terms={protected_terms}, unlock_epoch={unlock_epoch}, '
             f'lr_ratio_after_unlock={high_order_lr_ratio:g}')
 
-    def _build_rgb_pinv_prior_matrix(self, ridge_lambda):
+    def _get_rgb_sensor_response(self):
         sensing = getattr(self.camera, 'sensing_unnorm', None)
         if sensing is None or getattr(sensing, 'sensing_mode', None) != 'rgb':
-            raise ValueError('decoder RGB pinv prior requires dodo_sensing_mode="rgb"')
+            raise ValueError('RGB sensor response requires dodo_sensing_mode="rgb"')
         if not all(hasattr(sensing, name) for name in ('sensor_r', 'sensor_g', 'sensor_b')):
-            raise ValueError('RGB sensor response buffers are missing; cannot build pinv prior')
+            raise ValueError('RGB sensor response buffers are missing')
 
         response = torch.stack([
             sensing.sensor_r.to(dtype=torch.float32),
@@ -176,7 +176,10 @@ class SnapshotDepthHS(pl.LightningModule):
                 f'RGB response shape {tuple(response.shape)} is incompatible with '
                 f'hs_channels={self.hparams.hs_channels}'
             )
+        return response
 
+    def _build_rgb_pinv_prior_matrix(self, ridge_lambda):
+        response = self._get_rgb_sensor_response()
         ridge = float(ridge_lambda)
         if ridge < 0:
             raise ValueError(f'decoder_rgb_pinv_lambda must be >= 0, got {ridge}')
@@ -1559,6 +1562,7 @@ class SnapshotDepthHS(pl.LightningModule):
         hs_residual_prior_eps = getattr(hparams, 'hs_residual_prior_eps', 1e-4)
         detach_depth_guidance_for_hs = getattr(hparams, 'detach_depth_guidance_for_hs', False)
         isolate_hs_decoder_gradients = getattr(hparams, 'isolate_hs_decoder_gradients', False)
+        encoder_variant = str(getattr(hparams, 'encoder_variant', 'legacy'))
         hparams.decoder_use_depth_input = bool(decoder_use_depth_input)
         hparams.decoder_depth_input_mode = str(decoder_depth_input_mode)
         hparams.decoder_use_rgb_pinv_prior = bool(decoder_use_rgb_pinv_prior)
@@ -1569,6 +1573,10 @@ class SnapshotDepthHS(pl.LightningModule):
         hparams.hs_residual_prior_eps = float(hs_residual_prior_eps)
         hparams.detach_depth_guidance_for_hs = bool(detach_depth_guidance_for_hs)
         hparams.isolate_hs_decoder_gradients = bool(isolate_hs_decoder_gradients)
+        hparams.encoder_variant = encoder_variant
+
+        if hparams.encoder_variant not in ('legacy', 'eb4'):
+            raise ValueError(f'Unknown encoder_variant={hparams.encoder_variant}')
 
         if hparams.hs_residual_prior and not hparams.decoder_use_rgb_pinv_prior:
             raise ValueError('hs_residual_prior requires decoder_use_rgb_pinv_prior')
@@ -1596,6 +1604,19 @@ class SnapshotDepthHS(pl.LightningModule):
         else:
             self.register_buffer('rgb_pinv_prior_matrix', torch.empty(0), persistent=False)
 
+        if hparams.encoder_variant == 'eb4':
+            if self.optical_model_type != 'dodo_depth':
+                raise ValueError('EB4 requires optical_model=dodo_depth')
+            if hparams.preinverse:
+                raise ValueError('EB4 requires --no-preinverse')
+            if not hparams.decoder_use_rgb_pinv_prior:
+                raise ValueError('EB4 requires --decoder_use_rgb_pinv_prior')
+            if int(hparams.hs_channels) != 25:
+                raise ValueError(f'EB4 currently requires hs_channels=25, got {hparams.hs_channels}')
+            eb4_sensor_response = self._get_rgb_sensor_response().detach().clone()
+        else:
+            eb4_sensor_response = None
+
         decoder_extra_channels = 0
         if hparams.decoder_use_depth_input:
             decoder_extra_channels += 1
@@ -1603,10 +1624,11 @@ class SnapshotDepthHS(pl.LightningModule):
             decoder_extra_channels += int(hparams.hs_channels)
         hparams.decoder_in_channels = int(hparams.measurement_channels) + decoder_extra_channels
 
-        self.decoder = SimpleModel(hparams)
+        self.decoder = SimpleModel(hparams, sensor_response=eb4_sensor_response)
         decoder_norm = getattr(hparams, 'decoder_norm', 'batch')
         dodo_meas_norm = getattr(hparams, 'dodo_measurement_norm', 'none')
         print(f'[decoder] decoder_norm={decoder_norm}, dodo_measurement_norm={dodo_meas_norm}, '
+              f'encoder_variant={hparams.encoder_variant}, '
               f'decoder_use_depth_input={hparams.decoder_use_depth_input}, '
               f'decoder_depth_input_mode={hparams.decoder_depth_input_mode}, '
               f'decoder_use_rgb_pinv_prior={hparams.decoder_use_rgb_pinv_prior}, '
@@ -2982,6 +3004,9 @@ class SnapshotDepthHS(pl.LightningModule):
         parser.add_argument('--crop_width', type=int, default=32)
         parser.add_argument('--reg_tikhonov', type=float, default=1.0)
         parser.add_argument('--model_base_ch', type=int, default=32)
+        parser.add_argument('--encoder_variant', type=str, default='legacy',
+                    choices=['legacy', 'eb4'],
+                    help='E2-E4编码器模块：Number18原始Mamba或完整EB4')
         # [ARCH-MOD-20260403] 深度分支浅层 skip 解耦模式。
         # 可选: lowpass / drop / full
         parser.add_argument('--depth_shallow_skip_mode', type=str, default='lowpass',

@@ -10,7 +10,7 @@ class SimpleModelHS(nn.Module):
     修改后的SimpleModelHS，集成了 Mamba 结构的 DualHeadUNet。
     """
 
-    def __init__(self, hparams, *args, **kargs):
+    def __init__(self, hparams, *args, sensor_response=None, **kargs):
         super().__init__()
         self.preinverse = hparams.preinverse
 
@@ -21,6 +21,7 @@ class SimpleModelHS(nn.Module):
         decoder_norm = getattr(hparams, 'decoder_norm', 'batch')
         detach_depth_guidance_for_hs = bool(getattr(hparams, 'detach_depth_guidance_for_hs', False))
         isolate_hs_decoder_gradients = bool(getattr(hparams, 'isolate_hs_decoder_gradients', False))
+        self.encoder_variant = str(getattr(hparams, 'encoder_variant', 'legacy'))
         self.hs_residual_prior = bool(getattr(hparams, 'hs_residual_prior', False))
         self.hs_residual_prior_eps = float(getattr(hparams, 'hs_residual_prior_eps', 1e-4))
         if not (0.0 < self.hs_residual_prior_eps < 0.5):
@@ -37,6 +38,23 @@ class SimpleModelHS(nn.Module):
         base_ch = hparams.model_base_ch # 32
         n_depths = hparams.n_depths
         depth_bins = int(getattr(hparams, 'dodo_depth_layers', n_depths) or n_depths)
+        if self.encoder_variant == 'eb4':
+            if self.preinverse:
+                raise ValueError('EB4 is only defined for the Number18 --no-preinverse path')
+            if int(measurement_channels) != 3:
+                raise ValueError('EB4 requires a three-channel RGB measurement')
+            if not bool(getattr(hparams, 'decoder_use_rgb_pinv_prior', False)):
+                raise ValueError('EB4 requires --decoder_use_rgb_pinv_prior')
+            if sensor_response is None:
+                raise ValueError('EB4 requires the optical RGB sensor response')
+            wavelengths = torch.linspace(
+                float(getattr(hparams, 'start_wl', 420e-9)),
+                float(getattr(hparams, 'end_wl', 660e-9)),
+                steps=hs_channels,
+                dtype=torch.float32,
+            )
+        else:
+            wavelengths = None
         # For preinverse=False: captimgs may carry extra depth channel
         # For preinverse=True: decoder depth input is not supported, captimgs unchanged
         self._expected_measurement_channels = (
@@ -78,6 +96,7 @@ class SimpleModelHS(nn.Module):
         print(
             f"Building Backbone with Scheme: {mamba_scheme} (Mamba), "
             f"decoder_norm={decoder_norm}, "
+            f"encoder_variant={self.encoder_variant}, "
             f"detach_depth_guidance_for_hs={detach_depth_guidance_for_hs}, "
             f"isolate_hs_decoder_gradients={isolate_hs_decoder_gradients}, "
             f"hs_residual_prior={self.hs_residual_prior}"
@@ -92,6 +111,9 @@ class SimpleModelHS(nn.Module):
             depth_bins=depth_bins,
             detach_depth_guidance_for_hs=detach_depth_guidance_for_hs,
             isolate_hs_decoder_gradients=isolate_hs_decoder_gradients,
+            encoder_variant=self.encoder_variant,
+            sensor_response=sensor_response,
+            wavelengths=wavelengths,
         )
 
         # ================= 3. 激活函数 =================
@@ -101,6 +123,8 @@ class SimpleModelHS(nn.Module):
         self._init_weights()
         if hasattr(self.backbone, 'init_depth_conditioning_identity'):
             self.backbone.init_depth_conditioning_identity()
+        if hasattr(self.backbone, 'init_eb4_stable'):
+            self.backbone.init_eb4_stable()
         if self.hs_residual_prior:
             self._init_hs_residual_head_identity()
 
@@ -150,7 +174,17 @@ class SimpleModelHS(nn.Module):
         x = self.input_adapter(inputs)
 
         # --- 3. Mamba 双头处理 ---
-        depth_logits, hs_logits = self.backbone(x)
+        if self.encoder_variant == 'eb4':
+            if rgb_pinv_prior is None:
+                raise ValueError('EB4 forward requires rgb_pinv_prior')
+            rgb_measurement = captimgs[:, :3, :, :]
+            depth_logits, hs_logits = self.backbone(
+                x,
+                rgb_measurement=rgb_measurement,
+                spectral_prior=rgb_pinv_prior,
+            )
+        else:
+            depth_logits, hs_logits = self.backbone(x)
 
         # --- 4. 激活 ---
         # Depth is represented internally as a distribution over IPS depth bins
